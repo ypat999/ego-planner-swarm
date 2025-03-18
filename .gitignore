@@ -7,3 +7,13 @@ src/CMakeLists.txt
 benchmark_haha.zip
 rebound_planner_BB.zip
 
+# Colcon build directories
+install/
+log/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
