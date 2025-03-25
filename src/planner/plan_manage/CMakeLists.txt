@@ -79,9 +79,18 @@ ament_target_dependencies(traj_server
                           path_searching bspline_opt 
                           traj_utils cv_bridge pcl_conversions)
 
+add_executable(xtd2_traj_server src/xtd2_traj_server.cpp)
+
+ament_target_dependencies(xtd2_traj_server 
+                          rclcpp nav_msgs 
+                          visualization_msgs geometry_msgs 
+                          quadrotor_msgs plan_env 
+                          path_searching bspline_opt 
+                          traj_utils cv_bridge pcl_conversions)
+
 # Install targets
 install(
-  TARGETS ego_planner_node traj_server
+  TARGETS ego_planner_node traj_server xtd2_traj_server
   DESTINATION lib/${PROJECT_NAME}
 )
 
