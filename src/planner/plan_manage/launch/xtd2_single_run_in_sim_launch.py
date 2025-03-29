@@ -1,23 +1,26 @@
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution, PythonExpression
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
-from launch.substitutions import PythonExpression
-from launch.conditions import IfCondition, UnlessCondition
 
 def generate_launch_description():
     # 定义参数的 LaunchConfiguration
+    world_name_arg = DeclareLaunchArgument('world_name', default_value='aruco', description='Name of the world to launch (without .sdf)')
+    model_name_arg = DeclareLaunchArgument('model_name', default_value='gz_x500', description='Name of the model to spawn')
+    id_arg = DeclareLaunchArgument('id', default_value='0', description='ID of the model to spawn')
+    name_space_arg = DeclareLaunchArgument('namespace', default_value='x500_0', description='ROS namespace for the model')
+
     obj_num = LaunchConfiguration('obj_num', default=10)
     drone_id = LaunchConfiguration('drone_id', default=0)
     
     map_size_x = LaunchConfiguration('map_size_x', default = 50.0)
     map_size_y = LaunchConfiguration('map_size_y', default = 25.0)
     map_size_z = LaunchConfiguration('map_size_z', default = 2.0)
-    odom_topic = LaunchConfiguration('odom_topic', default = 'visual_slam/odom')
+    odom_topic = LaunchConfiguration('odom_topic', default = 'odometry')
     
     
     # 声明全局参数
@@ -37,64 +40,59 @@ def generate_launch_description():
     use_dynamic = LaunchConfiguration('use_dynamic', default=False)  
     use_dynamic_cmd = DeclareLaunchArgument('use_dynamic', default_value=use_dynamic, description='Use Drone Simulation Considering Dynamics or Not')
     
-    # map
-    map_generator_node = Node(
-        package='map_generator',
-        executable='random_forest',
-        name='random_forest',
-        output='screen',
-        parameters=[
-            {'map/x_size': 26.0},
-            {'map/y_size': 20.0},
-            {'map/z_size': 3.0},
-            {'map/resolution': 0.1},
-            {'ObstacleShape/seed': 1.0},
-            {'map/obs_num': 250},
-            {'ObstacleShape/lower_rad': 0.5},
-            {'ObstacleShape/upper_rad': 0.7},
-            {'ObstacleShape/lower_hei': 0.0},
-            {'ObstacleShape/upper_hei': 3.0},
-            {'map/circle_num': 250},
-            {'ObstacleShape/radius_l': 0.7},
-            {'ObstacleShape/radius_h': 0.5},
-            {'ObstacleShape/z_l': 0.7},
-            {'ObstacleShape/z_h': 0.8},
-            {'ObstacleShape/theta': 0.5},
-            {'pub_rate': 1.0},
-            {'min_distance': 0.8}
-        ],
-        condition = UnlessCondition(use_mockamap)
+
+    #####################
+    # Gazebo Simulation #
+    #####################
+    world_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([
+                FindPackageShare("xtd2_launch"),
+                "launch",
+                "gz_launch.py"
+            ])
+        ]),
+        launch_arguments={
+            "world": LaunchConfiguration('world_name'),
+        }.items()
     )
 
-    mockamap_node = Node(
-        package='mockamap',
-        executable='mockamap_node',
-        name='mockamap_node',
+    ##################
+    # XRCE-DDS Agent #
+    ##################
+    xrce_dds_process = ExecuteProcess(
+        cmd=["MicroXRCEAgent udp4 -p 8888"],
         output='screen',
-        remappings=[
-            ('/mock_map', '/map_generator/global_cloud')
-        ],
-        parameters=[
-            {'seed': 127},
-            {'update_freq': 0.5},
-            {'resolution': 0.1},
-            {'x_length': PythonExpression(['int(', map_size_x, ')'])},
-            {'y_length': PythonExpression(['int(', map_size_y, ')'])},
-            {'z_length': PythonExpression(['int(', map_size_z, ')'])},
-            {'type': 1},
-            {'complexity': 0.05},
-            {'fill': 0.12},
-            {'fractal': 1},
-            {'attenuation': 0.1}
-        ],
-        condition = IfCondition(use_mockamap)
+        name='microxrceagent',
+        shell=True
     )
+
+    ###################################################################
+    # Spawn vehicles, including Model, PX4 SITL and ROS-Gazebo bridge #
+    ###################################################################
+    spawn = IncludeLaunchDescription(
+            PythonLaunchDescriptionSource([
+                PathJoinSubstitution([
+                    FindPackageShare('xtd2_launch'),
+                    'launch',
+                    'xtd2_vehicle_spawn_launch.py'
+                ])
+            ]),
+            launch_arguments={
+                'world_name': LaunchConfiguration('world_name'),
+                'model': 'gz_x500_depth',
+                'id': '0',
+                'namespace': 'x500_depth_0',
+            }.items()
+        )
     
     # Include advanced parameters
     advanced_param_include = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
-            get_package_share_directory('ego_planner'), 'launch', 'advanced_param.launch.py')),
+            get_package_share_directory('ego_planner'), 'launch', 'xtd2_advanced_param_launch.py')),
         launch_arguments={
+            'xtd_ns': 'x500_depth_0',
+
             'drone_id': drone_id,
             'map_size_x_': map_size_x,
             'map_size_y_': map_size_y,
@@ -104,7 +102,7 @@ def generate_launch_description():
             
             'camera_pose_topic': 'pcl_render_node/camera_pose',
             'depth_topic': 'pcl_render_node/depth',
-            'cloud_topic': 'pcl_render_node/cloud',
+            'cloud_topic': 'StereoOV7251/pointcloud',
             
             'cx': str(321.04638671875),
             'cy': str(243.44969177246094),
@@ -114,7 +112,7 @@ def generate_launch_description():
             'max_acc': str(6.0),
             'planning_horizon': str(7.5),
             'use_distinctive_trajs': 'True',
-            'flight_type': str(2),
+            'flight_type': str(1),  # Use MANUAL TARGET as move_base_simple/goal
             'point_num': str(4),
             'point0_x': str(15.0),
             'point0_y': str(0.0),
@@ -145,7 +143,7 @@ def generate_launch_description():
         name=['drone_', drone_id, '_traj_server'],
         output='screen',
         remappings=[
-            ('/xtdrone2/planning/cmd_pose_local_ned', ['/xtdrone2/', 'x500_0', '/planning/cmd_pose_local_ned']),
+            ('/xtdrone2/planning/cmd_pose_local_ned', ['/xtdrone2/', 'x500_depth_0', '/planning/cmd_pose_local_ned']),
             ('planning/bspline', ['drone_', drone_id, '_planning/bspline'])
         ],
         parameters=[
@@ -153,24 +151,14 @@ def generate_launch_description():
         ]
     )
     
-    # Include simulator 
-    simulator_include = IncludeLaunchDescription(PythonLaunchDescriptionSource(
-        os.path.join(get_package_share_directory('ego_planner'), 'launch', 'simulator.launch.py')),
-        launch_arguments={
-            'use_dynamic': use_dynamic,
-            'drone_id': drone_id,
-            'map_size_x_': map_size_x,
-            'map_size_y_': map_size_y,
-            'map_size_z_': map_size_z,
-            'init_x_': str(-15.0),
-            'init_y_': str(0.0),
-            'init_z_': str(0.1),
-            'odometry_topic': odom_topic
-        }.items()
-    )
     
     ld = LaunchDescription()
-        
+    
+    ld.add_action(world_name_arg)
+    ld.add_action(model_name_arg)
+    ld.add_action(id_arg)
+    ld.add_action(name_space_arg)
+
     ld.add_action(map_size_x_cmd)
     ld.add_action(map_size_y_cmd)
     ld.add_action(map_size_z_cmd)
@@ -180,11 +168,11 @@ def generate_launch_description():
     ld.add_action(use_dynamic_cmd)
     ld.add_action(use_mockamap_cmd)
 
-    # 添加 Map Generator 节点
-    ld.add_action(map_generator_node)
-    ld.add_action(mockamap_node)
+    ld.add_action(world_launch) 
+    ld.add_action(xrce_dds_process)
+    ld.add_action(spawn)
     ld.add_action(advanced_param_include)
     ld.add_action(traj_server_node)
-    ld.add_action(simulator_include)
+
 
     return ld
