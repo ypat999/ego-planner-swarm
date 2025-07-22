@@ -112,27 +112,7 @@ def generate_launch_description():
             'max_acc': str(6.0),
             'planning_horizon': str(7.5),
             'use_distinctive_trajs': 'True',
-            'flight_type': str(1),  # Use MANUAL TARGET as move_base_simple/goal
-            'point_num': str(4),
-            'point0_x': str(15.0),
-            'point0_y': str(0.0),
-            'point0_z': str(1.0),
-            
-            'point1_x': str(-15.0),
-            'point1_y': str(0.0),
-            'point1_z': str(1.0),
-            
-            'point2_x': str(15.0),
-            'point2_y': str(0.0),
-            'point2_z': str(1.0),
-            
-            'point3_x': str(-15.0),
-            'point3_y': str(0.0),
-            'point3_z': str(1.0),
-            
-            'point4_x': str(15.0),
-            'point4_y': str(0.0),
-            'point4_z': str(1.0),
+            'flight_type': str(1),  # Use MANUAL TARGET as /goal_point
         }.items()
     )
     

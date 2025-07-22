@@ -113,7 +113,9 @@ def generate_launch_description():
             ('grid_map/cloud', [xtd_ns, '/', cloud_topic]),
             ('grid_map/pose', [xtd_ns, '/', camera_pose_topic]),
             ('grid_map/depth', [xtd_ns, '/', depth_topic]),
-            ('grid_map/occupancy_inflate', [xtd_ns, '/grid/grid_map/occupancy_inflate'])
+            ('grid_map/occupancy_inflate', [xtd_ns, '/grid/grid_map/occupancy_inflate']),
+
+            ('/move_base_simple/goal', '/goal_pose')
         ],
         parameters=[
             {'fsm/flight_type': flight_type},
