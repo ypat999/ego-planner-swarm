@@ -476,7 +476,7 @@ namespace ego_planner
 
     init_pt_ = odom_pos_;
 
-    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, 1.0);
+    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
 
     planNextWaypoint(end_wp);
   }
@@ -488,6 +488,7 @@ namespace ego_planner
     static double total_position_error = 0.0;
     static double total_velocity_error = 0.0;
     
+    // 检查odom数据的完整性和有效性
     // 检查odom数据的完整性和有效性
     bool data_valid = true;
     std::vector<std::string> error_messages;

@@ -24,7 +24,7 @@ double time_forward_;
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
-  // parse pos traj
+  // parse _ traj
 
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
 
@@ -46,12 +46,12 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 
   // parse yaw traj
 
-  // Eigen::MatrixXd yaw_pts(msg->yaw_pts.size(), 1);
-  // for (int i = 0; i < msg->yaw_pts.size(); ++i) {
-  //   yaw_pts(i, 0) = msg->yaw_pts[i];
-  // }
+  Eigen::MatrixXd yaw_pts(msg->yaw_pts.size(), 1);
+  for (int i = 0; i < msg->yaw_pts.size(); ++i) {
+    yaw_pts(i, 0) = msg->yaw_pts[i];
+  }
 
-  // UniformBspline yaw_traj(yaw_pts, msg->order, msg->yaw_dt);
+  UniformBspline yaw_traj(yaw_pts, msg->order, msg->yaw_dt);
 
   start_time_ = msg->start_time;
   traj_id_ = msg->traj_id;
@@ -66,7 +66,7 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   receive_traj_ = true;
 }
 
-std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclcpp::Time &time_now, rclcpp::Time &time_last)
+std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &_, rclcpp::Time &time_now, rclcpp::Time &time_last)
 {
   constexpr double PI = 3.1415926;
   constexpr double YAW_DOT_MAX_PER_SEC = PI;
@@ -75,7 +75,7 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
   double yaw = 0;
   double yawdot = 0;
 
-  Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_ ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
+  Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_ ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - _ : traj_[0].evaluateDeBoorT(traj_duration_) - _;
   double yaw_temp = dir.norm() > 0.1 ? atan2(dir(1), dir(0)) : last_yaw_;
   double max_yaw_change = YAW_DOT_MAX_PER_SEC * (time_now - time_last).seconds();
   if (yaw_temp - last_yaw_ > PI)
@@ -169,18 +169,18 @@ void cmdCallback()
   rclcpp::Time time_now = clock.now();
   double t_cur = (time_now - start_time_).seconds();
 
-  Eigen::Vector3d pos(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
+  Eigen::Vector3d pos_enu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
   std::pair<double, double> yaw_yawdot(0, 0);
 
   static rclcpp::Time time_last = clock.now();
   if (t_cur < traj_duration_ && t_cur >= 0.0)
   {
-    pos = traj_[0].evaluateDeBoorT(t_cur);
+    pos_enu = traj_[0].evaluateDeBoorT(t_cur);
     vel = traj_[1].evaluateDeBoorT(t_cur);
     acc = traj_[2].evaluateDeBoorT(t_cur);
 
     /*** calculate yaw ***/
-    yaw_yawdot = calculate_yaw(t_cur, pos, time_now, time_last);
+    yaw_yawdot = calculate_yaw(t_cur, pos_enu, time_now, time_last);
     /*** calculate yaw ***/
 
     double tf = min(traj_duration_, t_cur + 2.0);
@@ -189,14 +189,14 @@ void cmdCallback()
   else if (t_cur >= traj_duration_)
   {
     /* hover when finish traj_ */
-    pos = traj_[0].evaluateDeBoorT(traj_duration_);
+    pos_enu = traj_[0].evaluateDeBoorT(traj_duration_);
     vel.setZero();
     acc.setZero();
 
     yaw_yawdot.first = last_yaw_;
     yaw_yawdot.second = 0;
 
-    pos_f = pos;
+    pos_f = pos_enu;
   }
   else
   {
@@ -205,16 +205,19 @@ void cmdCallback()
   time_last = time_now;
 
   // 将偏航角转换为四元数
-  Eigen::Quaterniond q;
-  q = Eigen::Quaterniond(Eigen::AngleAxisd(yaw_yawdot.first, Eigen::Vector3d::UnitZ()));
+  Eigen::Quaterniond q_ned;
+  Eigen::AngleAxisd yaw_angle_ned(yaw_yawdot.first + M_PI/2, Eigen::Vector3d::UnitX());
+  q_ned = Eigen::Quaterniond(yaw_angle_ned);
 
-  cmd.position.x = pos(0);
-  cmd.position.y = pos(1);
-  cmd.position.z = pos(2);
-  cmd.orientation.x = q.x();
-  cmd.orientation.y = q.y();
-  cmd.orientation.z = q.z();
-  cmd.orientation.w = q.w();
+  cmd.position.x = pos_enu(1);      // FLU Y左 -> NED X北
+  cmd.position.y = pos_enu(0);      // FLU X前 -> NED Y东
+  cmd.position.z = -pos_enu(2);     // FLU Z上 -> NED Z地（取反）
+
+  
+  cmd.orientation.x = q_ned.x();
+  cmd.orientation.y = q_ned.y();
+  cmd.orientation.z = q_ned.z();
+  cmd.orientation.w = q_ned.w();
 
   last_yaw_ = yaw_yawdot.first;
 
