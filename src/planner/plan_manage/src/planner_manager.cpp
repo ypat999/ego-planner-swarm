@@ -24,11 +24,46 @@ namespace ego_planner
     node->get_parameter("manager/max_vel", pp_.max_vel_);
     node->get_parameter("manager/max_acc", pp_.max_acc_);
     node->get_parameter("manager/max_jerk", pp_.max_jerk_);
+    // Validate critical physical limits to avoid invalid planning results
+    if (pp_.max_vel_ <= 0.0)
+    {
+      RCLCPP_WARN(node->get_logger(), "Invalid manager/max_vel (<=0): %f. Setting to default 2.0 m/s.", pp_.max_vel_);
+      pp_.max_vel_ = 2.0;
+    }
+    if (pp_.max_acc_ <= 0.0)
+    {
+      RCLCPP_WARN(node->get_logger(), "Invalid manager/max_acc (<=0): %f. Setting to default 3.0 m/s^2.", pp_.max_acc_);
+      pp_.max_acc_ = 3.0;
+    }
+    if (pp_.ctrl_pt_dist <= 0.0)
+    {
+      RCLCPP_WARN(node->get_logger(), "Invalid manager/control_points_distance (<=0): %f. Setting to default 0.5 m.", pp_.ctrl_pt_dist);
+      pp_.ctrl_pt_dist = 0.5;
+    }
     node->get_parameter("manager/feasibility_tolerance", pp_.feasibility_tolerance_);
     node->get_parameter("manager/control_points_distance", pp_.ctrl_pt_dist);
     node->get_parameter("manager/planning_horizon", pp_.planning_horizen_);
     node->get_parameter("manager/use_distinctive_trajs", pp_.use_distinctive_trajs);
     node->get_parameter("manager/drone_id", pp_.drone_id);
+    
+    // 验证无人机ID
+    if (pp_.drone_id < 0)
+    {
+      RCLCPP_WARN(node->get_logger(), "无人机ID为负值(%d)，设置为单机模式(ID=0)", pp_.drone_id);
+      pp_.drone_id = 0;
+    }
+
+    // 输出重要参数配置
+    RCLCPP_INFO(node->get_logger(), "=== EGO Planner 参数配置 ===");
+    RCLCPP_INFO(node->get_logger(), "最大速度: %.2f m/s", pp_.max_vel_);
+    RCLCPP_INFO(node->get_logger(), "最大加速度: %.2f m/s^2", pp_.max_acc_);
+    RCLCPP_INFO(node->get_logger(), "最大加加速度: %.2f m/s^3", pp_.max_jerk_);
+    RCLCPP_INFO(node->get_logger(), "控制点距离: %.2f m", pp_.ctrl_pt_dist);
+    RCLCPP_INFO(node->get_logger(), "规划时域: %.2f s", pp_.planning_horizen_);
+    RCLCPP_INFO(node->get_logger(), "可行性容差: %.3f", pp_.feasibility_tolerance_);
+    RCLCPP_INFO(node->get_logger(), "使用独特轨迹: %s", pp_.use_distinctive_trajs ? "是" : "否");
+    RCLCPP_INFO(node->get_logger(), "无人机ID: %d", pp_.drone_id);
+    RCLCPP_INFO(node->get_logger(), "================================");
 
     local_data_.traj_id_ = 0;
     grid_map_.reset(new GridMap);

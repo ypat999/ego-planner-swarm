@@ -1,4 +1,3 @@
-
 #include <ego_planner/ego_replan_fsm.h>
 
 namespace ego_planner
@@ -152,6 +151,171 @@ namespace ego_planner
     }
     else
       cout << "Wrong target_type_ value! target_type_=" << target_type_ << endl;
+
+    // 启动话题数据检查
+    checkTopicData();
+    
+    // 输出启动诊断信息
+    printStartupDiagnostics();
+  }
+
+  void EGOReplanFSM::printStartupDiagnostics()
+  {
+    RCLCPP_INFO(node_->get_logger(), "=== EGO Planner 启动诊断信息 ===");
+    RCLCPP_INFO(node_->get_logger(), "目标类型: %s", 
+                target_type_ == TARGET_TYPE::MANUAL_TARGET ? "手动目标" : 
+                target_type_ == TARGET_TYPE::PRESET_TARGET ? "预设目标" : "参考路径");
+    RCLCPP_INFO(node_->get_logger(), "规划时域: %.2f 米", planning_horizen_);
+    RCLCPP_INFO(node_->get_logger(), "规划时域时间: %.2f 秒", planning_horizen_time_);
+    RCLCPP_INFO(node_->get_logger(), "重规划阈值: %.2f 秒", replan_thresh_);
+    RCLCPP_INFO(node_->get_logger(), "无重规划阈值: %.2f 米", no_replan_thresh_);
+    RCLCPP_INFO(node_->get_logger(), "紧急时间: %.2f 秒", emergency_time_);
+    RCLCPP_INFO(node_->get_logger(), "真实世界实验: %s", flag_realworld_experiment_ ? "是" : "否");
+    RCLCPP_INFO(node_->get_logger(), "故障安全: %s", enable_fail_safe_ ? "启用" : "禁用");
+    RCLCPP_INFO(node_->get_logger(), "预设航点数量: %d", waypoint_num_);
+    
+    if (waypoint_num_ > 0)
+    {
+      RCLCPP_INFO(node_->get_logger(), "预设航点坐标:");
+      for (int i = 0; i < waypoint_num_; i++)
+      {
+        RCLCPP_INFO(node_->get_logger(), "  航点%d: (%.2f, %.2f, %.2f)", 
+                    i, waypoints_[i][0], waypoints_[i][1], waypoints_[i][2]);
+      }
+    }
+    
+    RCLCPP_INFO(node_->get_logger(), "当前状态: %s", 
+                exec_state_ == INIT ? "初始化" : 
+                exec_state_ == WAIT_TARGET ? "等待目标" : 
+                exec_state_ == GEN_NEW_TRAJ ? "生成新轨迹" : 
+                exec_state_ == REPLAN_TRAJ ? "重规划轨迹" : 
+                exec_state_ == EXEC_TRAJ ? "执行轨迹" : 
+                exec_state_ == EMERGENCY_STOP ? "紧急停止" : "顺序启动");
+    
+    RCLCPP_INFO(node_->get_logger(), "数据状态: odom=%s, target=%s, trigger=%s", 
+                have_odom_ ? "已接收" : "未接收", 
+                have_target_ ? "已设置" : "未设置", 
+                have_trigger_ ? "已触发" : "未触发");
+    
+    RCLCPP_INFO(node_->get_logger(), "================================");
+  }
+
+  void EGOReplanFSM::checkTopicData()
+  {
+    RCLCPP_INFO(node_->get_logger(), "=== EGO Planner 外部输入状态检查 ===");
+    
+    // 检查关键传感器数据话题
+    RCLCPP_INFO(node_->get_logger(), "--- 关键传感器数据 ---");
+    
+    // 检查odom话题 - 最重要的状态数据
+    if (odom_sub_)
+    {
+      RCLCPP_INFO(node_->get_logger(), "✓ Odom状态数据: odom_world");
+      RCLCPP_INFO(node_->get_logger(), "  接收状态: %s", have_odom_ ? "已接收" : "等待中");
+      if (have_odom_)
+      {
+        RCLCPP_INFO(node_->get_logger(), "  当前位置: (%.2f, %.2f, %.2f)", 
+                    odom_pos_(0), odom_pos_(1), odom_pos_(2));
+        RCLCPP_INFO(node_->get_logger(), "  当前速度: (%.2f, %.2f, %.2f) m/s", 
+                    odom_vel_(0), odom_vel_(1), odom_vel_(2));
+      }
+    }
+    else
+    {
+      RCLCPP_ERROR(node_->get_logger(), "✗ Odom状态数据缺失: odom_world");
+    }
+
+    // 检查点云数据 - 环境感知数据
+    if (planner_manager_->grid_map_)
+    {
+      // bool has_cloud = planner_manager_->grid_map_->hasCloudObservation();
+      bool has_depth = planner_manager_->grid_map_->hasDepthObservation();
+      bool has_odom = planner_manager_->grid_map_->odomValid();
+      
+      RCLCPP_INFO(node_->get_logger(), "--- 环境感知数据 ---");
+      // RCLCPP_INFO(node_->get_logger(), "  点云数据: %s", has_cloud ? "已接收" : "等待中");
+      RCLCPP_INFO(node_->get_logger(), "  深度数据: %s", has_depth ? "已接收" : "等待中");
+      RCLCPP_INFO(node_->get_logger(), "  地图odom: %s", has_odom ? "有效" : "无效");
+      
+      // 检查数据同步状态
+      bool odom_timeout = planner_manager_->grid_map_->getOdomDepthTimeout();
+      
+      // 检查传感器数据同步性
+      bool sensors_synced = true;
+      std::string sync_status = "正常";
+      
+      if (have_odom_)
+      {
+        sensors_synced = false;
+        sync_status = "odom已接收";
+      }
+      else if (!have_odom_)
+      {
+        sensors_synced = false;
+        sync_status = "odom缺失";
+      }
+      else if (odom_timeout)
+      {
+        sensors_synced = false;
+        sync_status = "数据同步超时";
+      }
+      
+      RCLCPP_INFO(node_->get_logger(), "  数据同步: %s", sync_status.c_str());
+      
+      if (!sensors_synced)
+      {
+        RCLCPP_WARN(node_->get_logger(), "  ⚠ 传感器数据不同步，可能影响规划性能");
+      }
+    }
+    else
+    {
+      RCLCPP_WARN(node_->get_logger(), "✗ 环境感知模块未初始化");
+    }
+
+    // 检查目标话题
+    RCLCPP_INFO(node_->get_logger(), "--- 任务目标数据 ---");
+    if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
+    {
+      if (waypoint_sub_)
+      {
+        RCLCPP_INFO(node_->get_logger(), "✓ 手动目标: /move_base_simple/goal");
+        RCLCPP_INFO(node_->get_logger(), "  目标状态: %s", have_target_ ? "已设置" : "等待中");
+      }
+      else
+      {
+        RCLCPP_ERROR(node_->get_logger(), "✗ 手动目标话题缺失");
+      }
+    }
+    else if (target_type_ == TARGET_TYPE::PRESET_TARGET)
+    {
+      if (trigger_sub_)
+      {
+        RCLCPP_INFO(node_->get_logger(), "✓ 预设目标: /traj_start_trigger");
+        RCLCPP_INFO(node_->get_logger(), "  触发状态: %s", have_trigger_ ? "已触发" : "等待中");
+      }
+      else
+      {
+        RCLCPP_ERROR(node_->get_logger(), "✗ 预设目标话题缺失");
+      }
+    }
+
+    // 检查多机通信数据
+    if (planner_manager_->pp_.drone_id >= 1)
+    {
+      RCLCPP_INFO(node_->get_logger(), "--- 多机通信数据 ---");
+      string sub_topic_name = string("/drone_") + std::to_string(planner_manager_->pp_.drone_id - 1) + string("_planning/swarm_trajs");
+      if (swarm_trajs_sub_)
+      {
+        RCLCPP_INFO(node_->get_logger(), "✓ 邻居轨迹: %s", sub_topic_name.c_str());
+        RCLCPP_INFO(node_->get_logger(), "  接收状态: %s", have_recv_pre_agent_ ? "已接收" : "等待中");
+      }
+      else
+      {
+        RCLCPP_WARN(node_->get_logger(), "✗ 邻居轨迹话题缺失");
+      }
+    }
+
+    RCLCPP_INFO(node_->get_logger(), "================================");
   }
 
   void EGOReplanFSM::readGivenWps()
@@ -194,6 +358,16 @@ namespace ego_planner
 
       constexpr double step_size_t = 0.1;
       int i_end = floor(planner_manager_->global_data_.global_duration_ / step_size_t);
+      if (planner_manager_->global_data_.global_duration_ <= 0.0)
+      {
+        RCLCPP_ERROR(node_->get_logger(), "Invalid global trajectory duration: %f", planner_manager_->global_data_.global_duration_);
+        return;
+      }
+      if (i_end <= 0 || i_end > 1000000) // sanity cap
+      {
+        RCLCPP_ERROR(node_->get_logger(), "Unreasonable trajectory steps: %d, duration: %f", i_end, planner_manager_->global_data_.global_duration_);
+        return;
+      }
       vector<Eigen::Vector3d> gloabl_traj(i_end);
       for (int i = 0; i < i_end; i++)
       {
@@ -227,17 +401,78 @@ namespace ego_planner
 
   void EGOReplanFSM::triggerCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
   {
+    // 检查触发数据的有效性
+    bool data_valid = true;
+    
+    // 检查位置数据
+    if (!std::isfinite(msg->pose.position.x) || !std::isfinite(msg->pose.position.y) || !std::isfinite(msg->pose.position.z))
+    {
+      RCLCPP_WARN(node_->get_logger(), "收到无效的触发位置数据: x=%f, y=%f, z=%f", 
+                  msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+      data_valid = false;
+    }
+    
+    // 检查姿态数据
+    double quat_norm = sqrt(msg->pose.orientation.w * msg->pose.orientation.w +
+                           msg->pose.orientation.x * msg->pose.orientation.x +
+                           msg->pose.orientation.y * msg->pose.orientation.y +
+                           msg->pose.orientation.z * msg->pose.orientation.z);
+    if (fabs(quat_norm - 1.0) > 0.01)
+    {
+      RCLCPP_WARN(node_->get_logger(), "收到无效的触发姿态数据: 四元数范数=%f (期望1.0)", quat_norm);
+      data_valid = false;
+    }
+    
+    if (!data_valid)
+    {
+      RCLCPP_ERROR(node_->get_logger(), "触发数据无效，跳过本次触发");
+      return;
+    }
+
     have_trigger_ = true;
-    cout << "Triggered!" << endl;
+    RCLCPP_INFO(node_->get_logger(), "✓ 收到有效触发信号: 位置(%.2f, %.2f, %.2f)", 
+                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
     init_pt_ = odom_pos_;
   }
 
   void EGOReplanFSM::waypointCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
   {
-    if (msg->pose.position.z < -0.1)
+    // 检查目标点数据的有效性
+    bool data_valid = true;
+    
+    // 检查位置数据
+    if (!std::isfinite(msg->pose.position.x) || !std::isfinite(msg->pose.position.y) || !std::isfinite(msg->pose.position.z))
+    {
+      RCLCPP_WARN(node_->get_logger(), "收到无效的目标点位置数据: x=%f, y=%f, z=%f", 
+                  msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+      data_valid = false;
+    }
+    
+    // 检查姿态数据
+    double quat_norm = sqrt(msg->pose.orientation.w * msg->pose.orientation.w +
+                           msg->pose.orientation.x * msg->pose.orientation.x +
+                           msg->pose.orientation.y * msg->pose.orientation.y +
+                           msg->pose.orientation.z * msg->pose.orientation.z);
+    if (fabs(quat_norm - 1.0) > 0.01)
+    {
+      RCLCPP_WARN(node_->get_logger(), "收到无效的目标点姿态数据: 四元数范数=%f (期望1.0)", quat_norm);
+      data_valid = false;
+    }
+    
+    if (!data_valid)
+    {
+      RCLCPP_ERROR(node_->get_logger(), "目标点数据无效，跳过本次规划");
       return;
+    }
 
-    cout << "Triggered!" << endl;
+    if (msg->pose.position.z < -0.1)
+    {
+      RCLCPP_WARN(node_->get_logger(), "目标点z坐标无效: %f (小于-0.1)", msg->pose.position.z);
+      return;
+    }
+
+    RCLCPP_INFO(node_->get_logger(), "✓ 收到有效目标点: 位置(%.2f, %.2f, %.2f)", 
+                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
 
     init_pt_ = odom_pos_;
 
@@ -248,6 +483,99 @@ namespace ego_planner
 
   void EGOReplanFSM::odometryCallback(const std::shared_ptr<const nav_msgs::msg::Odometry> &msg)
   {
+    static rclcpp::Time last_odom_time;
+    static int odom_count = 0;
+    static double total_position_error = 0.0;
+    static double total_velocity_error = 0.0;
+    
+    // 检查odom数据的完整性和有效性
+    bool data_valid = true;
+    std::vector<std::string> error_messages;
+    
+    // 检查时间戳连续性
+    rclcpp::Time current_time = msg->header.stamp;
+    if (last_odom_time.nanoseconds() > 0)
+    {
+      double time_diff = (current_time - last_odom_time).seconds();
+      if (time_diff > 1.0) // 超过1000ms的间隔可能有问题
+      {
+        RCLCPP_WARN(node_->get_logger(), "odom数据间隔异常: %.3f秒", time_diff);
+      }
+    }
+    last_odom_time = current_time;
+    
+    // 检查位置数据
+    if (!std::isfinite(msg->pose.pose.position.x) || !std::isfinite(msg->pose.pose.position.y) || !std::isfinite(msg->pose.pose.position.z))
+    {
+      error_messages.push_back("位置数据包含非数值");
+      data_valid = false;
+    }
+    else
+    {
+      // 检查位置数据合理性
+      double pos_norm = sqrt(msg->pose.pose.position.x * msg->pose.pose.position.x +
+                            msg->pose.pose.position.y * msg->pose.pose.position.y +
+                            msg->pose.pose.position.z * msg->pose.pose.position.z);
+      if (pos_norm > 1000.0) // 位置数据过大
+      {
+        error_messages.push_back("位置数据异常过大");
+        data_valid = false;
+      }
+    }
+    
+    // 检查速度数据
+    if (!std::isfinite(msg->twist.twist.linear.x) || !std::isfinite(msg->twist.twist.linear.y) || !std::isfinite(msg->twist.twist.linear.z))
+    {
+      error_messages.push_back("速度数据包含非数值");
+      data_valid = false;
+    }
+    else
+    {
+      // 检查速度数据合理性
+      double vel_norm = sqrt(msg->twist.twist.linear.x * msg->twist.twist.linear.x +
+                            msg->twist.twist.linear.y * msg->twist.twist.linear.y +
+                            msg->twist.twist.linear.z * msg->twist.twist.linear.z);
+      if (vel_norm > 50.0) // 速度过大（超过50m/s）
+      {
+        error_messages.push_back("速度数据异常过大");
+        data_valid = false;
+      }
+    }
+    
+    // 检查姿态数据
+    double quat_norm = sqrt(msg->pose.pose.orientation.w * msg->pose.pose.orientation.w +
+                           msg->pose.pose.orientation.x * msg->pose.pose.orientation.x +
+                           msg->pose.pose.orientation.y * msg->pose.pose.orientation.y +
+                           msg->pose.pose.orientation.z * msg->pose.pose.orientation.z);
+    if (fabs(quat_norm - 1.0) > 0.01)
+    {
+      error_messages.push_back("姿态四元数不规范");
+      data_valid = false;
+    }
+    
+    // 检查协方差数据
+    if (msg->pose.covariance[0] < 0 || msg->twist.covariance[0] < 0)
+    {
+      error_messages.push_back("协方差数据异常");
+      // 协方差异常不一定是致命错误，只警告
+      RCLCPP_WARN(node_->get_logger(), "odom协方差数据异常");
+    }
+    
+    if (!data_valid)
+    {
+      std::string error_summary = "odom数据无效: ";
+      for (const auto& err : error_messages)
+      {
+        error_summary += err + "; ";
+      }
+      RCLCPP_ERROR(node_->get_logger(), "%s", error_summary.c_str());
+      return;
+    }
+
+    // 更新状态数据
+    Eigen::Vector3d prev_pos = odom_pos_;
+    Eigen::Vector3d prev_vel = odom_vel_;
+    
     odom_pos_(0) = msg->pose.pose.position.x;
     odom_pos_(1) = msg->pose.pose.position.y;
     odom_pos_(2) = msg->pose.pose.position.z;
@@ -256,14 +584,41 @@ namespace ego_planner
     odom_vel_(1) = msg->twist.twist.linear.y;
     odom_vel_(2) = msg->twist.twist.linear.z;
 
-    // odom_acc_ = estimateAcc( msg );
-
     odom_orient_.w() = msg->pose.pose.orientation.w;
     odom_orient_.x() = msg->pose.pose.orientation.x;
     odom_orient_.y() = msg->pose.pose.orientation.y;
     odom_orient_.z() = msg->pose.pose.orientation.z;
 
     have_odom_ = true;
+    odom_count++;
+    
+    // 计算数据变化统计
+    if (have_odom_ && odom_count > 1)
+    {
+      double pos_change = (odom_pos_ - prev_pos).norm();
+      double vel_change = (odom_vel_ - prev_vel).norm();
+      total_position_error += pos_change;
+      total_velocity_error += vel_change;
+    }
+    
+    static bool first_odom_received = false;
+    if (!first_odom_received)
+    {
+      RCLCPP_INFO(node_->get_logger(), "✓ 首次收到有效的odom数据: 位置(%.2f, %.2f, %.2f), 速度(%.2f, %.2f, %.2f) m/s", 
+                  odom_pos_(0), odom_pos_(1), odom_pos_(2), 
+                  odom_vel_(0), odom_vel_(1), odom_vel_(2));
+      first_odom_received = true;
+    }
+    
+    // 定期输出数据质量统计
+    if (odom_count % 1000 == 0 && odom_count > 1)
+    {
+      double avg_pos_error = total_position_error / (odom_count - 1);
+      double avg_vel_error = total_velocity_error / (odom_count - 1);
+      
+      RCLCPP_INFO(node_->get_logger(), "odom数据质量统计: 接收%d帧, 平均位置变化%.4fm, 平均速度变化%.4fm/s", 
+                  odom_count, avg_pos_error, avg_vel_error);
+    }
   }
 
   void EGOReplanFSM::BroadcastBsplineCallback(const std::shared_ptr<const traj_utils::msg::Bspline> &msg)

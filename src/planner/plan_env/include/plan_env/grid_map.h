@@ -3,7 +3,7 @@
 
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
-#include <cv_bridge/cv_bridge.hpp>
+#include <cv_bridge/cv_bridge.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>
 #include <random>
@@ -23,6 +23,12 @@
 #include <message_filters/time_synchronizer.h>
 
 #include <plan_env/raycast.h>
+
+// 前向声明TF2相关类
+namespace tf2_ros {
+class Buffer;
+class TransformListener;
+}
 
 #define logit(x) (log((x) / (1 - (x))))
 
@@ -147,7 +153,7 @@ struct MappingData
 class GridMap
 {
 public:
-  GridMap() {}
+  GridMap() : tf_buffer_(nullptr), tf_listener_(nullptr) {}
   ~GridMap() {}
 
   enum
@@ -188,6 +194,7 @@ public:
   void publishDepth();
 
   bool hasDepthObservation();
+  bool hasCloudObservation();
   bool odomValid();
   void getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size);
   inline double getResolution();
@@ -251,6 +258,10 @@ private:
 
   rclcpp::TimerBase::SharedPtr occ_timer_;
   rclcpp::TimerBase::SharedPtr vis_timer_;
+
+  // TF2缓冲区缓存（全局变量，避免重复创建）
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   //
   uniform_real_distribution<double> rand_noise_;

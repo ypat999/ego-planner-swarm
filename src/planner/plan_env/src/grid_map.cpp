@@ -1,4 +1,10 @@
 #include "plan_env/grid_map.h"
+#include <limits>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <pcl/common/transforms.h>
 
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
@@ -6,6 +12,13 @@
 void GridMap::initMap(rclcpp::Node::SharedPtr node)
 {
   node_ = node;
+
+  // 初始化TF2缓冲区（全局缓存，避免重复创建）
+  if (!tf_buffer_) {
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+    RCLCPP_INFO(node_->get_logger(), "TF2缓冲区初始化完成");
+  }
 
   /* get parameter */
   double x_size, y_size, z_size;
@@ -166,10 +179,10 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
 
   // 使用独立的里程计和点云订阅
   indep_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "grid_map/cloud", 10, std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
+      "grid_map/cloud", 1, std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
 
   indep_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
-      "grid_map/odom", 10, std::bind(&GridMap::odomCallback, this, std::placeholders::_1));
+      "grid_map/odom", 1, std::bind(&GridMap::odomCallback, this, std::placeholders::_1));
 
   // 定时器
   occ_timer_ = node_->create_wall_timer(
@@ -689,7 +702,7 @@ void GridMap::clearAndInflateLocalMap()
       }
 
   // add virtual ceiling to limit flight height
-  if (mp_.virtual_ceil_height_ > -0.5)
+  if (mp_.virtual_ceil_height_ > -0.05)
   {
     int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
     for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
@@ -805,24 +818,88 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
 
 void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
 {
-
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
-  pcl::fromROSMsg(*img, latest_cloud);
+  
+  // 获取点云的时间戳
+  auto cloud_time = img->header.stamp;
+  
+  try
+  {
+    pcl::fromROSMsg(*img, latest_cloud);
+  }
+  catch (const std::exception& e)
+  {
+    RCLCPP_ERROR(node_->get_logger(), "点云数据转换失败: %s", e.what());
+    return;
+  }
 
   md_.has_cloud_ = true;
 
   if (!md_.has_odom_)
   {
-    std::cout << "no odom!" << std::endl;
+    RCLCPP_WARN(node_->get_logger(), "点云数据接收但odom数据缺失");
     return;
   }
 
   if (latest_cloud.points.size() == 0)
+  {
+    RCLCPP_WARN(node_->get_logger(), "点云数据点数为0");
     return;
+  }
 
   if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2)))
+  {
+    RCLCPP_WARN(node_->get_logger(), "相机位置数据无效");
     return;
-
+  }
+  
+  // 将点云从相机坐标系转换到世界坐标系
+  pcl::PointCloud<pcl::PointXYZ> world_cloud;
+  
+  try
+  {
+    // 使用全局TF2缓冲区（避免重复创建）
+    if (!tf_buffer_) {
+      RCLCPP_ERROR(node_->get_logger(), "TF2缓冲区未初始化，无法进行坐标系转换");
+      return;
+    }
+    
+    // 获取从相机坐标系到世界坐标系的变换
+    rclcpp::Duration timeout(-500000000, 500000000); // 500毫秒超时
+    geometry_msgs::msg::TransformStamped transform;
+    
+    // 根据点云头信息中的frame_id确定源坐标系
+    std::string source_frame = img->header.frame_id;
+    if (source_frame.empty())
+    {
+      source_frame = "x500_depth_0/StereoOV7251"; // 默认相机坐标系
+    }
+    
+    transform = tf_buffer_->lookupTransform(mp_.frame_id_, source_frame, cloud_time, timeout);
+    
+    // 获取变换矩阵
+    Eigen::Isometry3d transform_matrix = tf2::transformToEigen(transform);
+    
+    // 预分配内存避免重复分配
+    world_cloud.points.resize(latest_cloud.points.size());
+    
+    // 使用PCL的高效转换函数（需要将Eigen::Isometry3d转换为Eigen::Affine3d）
+    Eigen::Affine3d affine_transform(transform_matrix);
+    pcl::transformPointCloud(latest_cloud, world_cloud, affine_transform);
+    
+    RCLCPP_DEBUG(node_->get_logger(), "成功将点云从%s转换到world坐标系，点数: %zu", 
+                 source_frame.c_str(), world_cloud.points.size());
+  }
+  catch (tf2::TransformException &ex)
+  {
+    RCLCPP_ERROR(node_->get_logger(), "TF变换失败: %s，无法处理点云数据", ex.what());
+    return;
+  }
+  
+  // 使用转换后的世界坐标系点云
+  latest_cloud = world_cloud;
+  
+  // 在世界坐标系中重置缓冲区
   this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
                     md_.camera_pos_ + mp_.local_update_range_);
 
@@ -907,6 +984,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
   // 添加虚拟天花板控制飞行高度
   if (mp_.virtual_ceil_height_ > -0.5) {
     int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
+    // RCLCPP_INFO(node_->get_logger(), "添加虚拟天花板: 高度=%.2f, 栅格ID=%d", mp_.virtual_ceil_height_, ceil_id);
     for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
       for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y) {
         md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
@@ -916,9 +994,10 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
 
 void GridMap::publishMap()
 {
-
   if (map_pub_->get_subscription_count() <= 0)
+  {
     return;
+  }
 
   pcl::PointXYZ pt;
   pcl::PointCloud<pcl::PointXYZ> cloud;
@@ -954,15 +1033,13 @@ void GridMap::publishMap()
   cloud.width = cloud.points.size();
   cloud.height = 1;
   cloud.is_dense = true;
-  cloud.header.frame_id = mp_.frame_id_;
+  cloud.header.frame_id = mp_.frame_id_;  // 点云已经在世界坐标系中
   sensor_msgs::msg::PointCloud2 cloud_msg;
-
   pcl::toROSMsg(cloud, cloud_msg);
   map_pub_->publish(cloud_msg);
 }
 
-void GridMap::publishMapInflate(bool all_info)
-{
+void GridMap::publishMapInflate(bool all_info){
 
   if (map_inf_pub_->get_subscription_count()<= 0)
     return;
