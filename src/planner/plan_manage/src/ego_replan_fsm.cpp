@@ -1,99 +1,329 @@
-
-#include <plan_manage/ego_replan_fsm.h>
+#include <ego_planner/ego_replan_fsm.h>
 
 namespace ego_planner
 {
 
-  void EGOReplanFSM::init(ros::NodeHandle &nh)
+  void EGOReplanFSM::init(rclcpp::Node::SharedPtr &node)
   {
+    node_ = node;
+    
     current_wp_ = 0;
     exec_state_ = FSM_EXEC_STATE::INIT;
     have_target_ = false;
     have_odom_ = false;
     have_recv_pre_agent_ = false;
 
-    /*  fsm param  */
-    nh.param("fsm/flight_type", target_type_, -1);
-    nh.param("fsm/thresh_replan_time", replan_thresh_, -1.0);
-    nh.param("fsm/thresh_no_replan_meter", no_replan_thresh_, -1.0);
-    nh.param("fsm/planning_horizon", planning_horizen_, -1.0);
-    nh.param("fsm/planning_horizen_time", planning_horizen_time_, -1.0);
-    nh.param("fsm/emergency_time", emergency_time_, 1.0);
-    nh.param("fsm/realworld_experiment", flag_realworld_experiment_, false);
-    nh.param("fsm/fail_safe", enable_fail_safe_, true);
+    node_->declare_parameter("fsm/flight_type", -1);
+    node_->declare_parameter("fsm/thresh_replan_time", -1.0);
+    node_->declare_parameter("fsm/thresh_no_replan_meter", -1.0);
+    node_->declare_parameter("fsm/planning_horizon", -1.0);
+    node_->declare_parameter("fsm/planning_horizen_time", -1.0);
+    node_->declare_parameter("fsm/emergency_time", 1.0);
+    node_->declare_parameter("fsm/realworld_experiment", false);
+    node_->declare_parameter("fsm/fail_safe", true);
+
+    node_->get_parameter("fsm/flight_type", target_type_);
+    node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
+    node_->get_parameter("fsm/thresh_no_replan_meter", no_replan_thresh_);
+    node_->get_parameter("fsm/planning_horizon", planning_horizen_);
+    node_->get_parameter("fsm/planning_horizen_time", planning_horizen_time_);
+    node_->get_parameter("fsm/emergency_time", emergency_time_);
+    node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
+    node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
 
     have_trigger_ = !flag_realworld_experiment_;
 
-    nh.param("fsm/waypoint_num", waypoint_num_, -1);
+    node_->declare_parameter("fsm/waypoint_num", -1);
+    node_->get_parameter("fsm/waypoint_num", waypoint_num_);
+
     for (int i = 0; i < waypoint_num_; i++)
     {
-      nh.param("fsm/waypoint" + to_string(i) + "_x", waypoints_[i][0], -1.0);
-      nh.param("fsm/waypoint" + to_string(i) + "_y", waypoints_[i][1], -1.0);
-      nh.param("fsm/waypoint" + to_string(i) + "_z", waypoints_[i][2], -1.0);
+      node_->declare_parameter("fsm/waypoint" + to_string(i) + "_x", -1.0);
+      node_->declare_parameter("fsm/waypoint" + to_string(i) + "_y", -1.0);
+      node_->declare_parameter("fsm/waypoint" + to_string(i) + "_z", -1.0);
+
+      node_->get_parameter("fsm/waypoint" + to_string(i) + "_x", waypoints_[i][0]);
+      node_->get_parameter("fsm/waypoint" + to_string(i) + "_y", waypoints_[i][1]);
+      node_->get_parameter("fsm/waypoint" + to_string(i) + "_z", waypoints_[i][2]);
     }
 
     /* initialize main modules */
-    visualization_.reset(new PlanningVisualization(nh));
+    visualization_.reset(new PlanningVisualization(node_));
+
     planner_manager_.reset(new EGOPlannerManager);
-    planner_manager_->initPlanModules(nh, visualization_);
+
+    planner_manager_->initPlanModules(node_, visualization_);
+
     planner_manager_->deliverTrajToOptimizer(); // store trajectories
     planner_manager_->setDroneIdtoOpt();
 
-    /* callback */
-    exec_timer_ = nh.createTimer(ros::Duration(0.01), &EGOReplanFSM::execFSMCallback, this);
-    safety_timer_ = nh.createTimer(ros::Duration(0.05), &EGOReplanFSM::checkCollisionCallback, this);
+    /* callback*/
+    exec_timer_ = node_->create_wall_timer(std::chrono::milliseconds(10),
+                                           std::bind(&EGOReplanFSM::execFSMCallback, this));
 
-    odom_sub_ = nh.subscribe("odom_world", 1, &EGOReplanFSM::odometryCallback, this);
+    safety_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
+                                             std::bind(&EGOReplanFSM::checkCollisionCallback, this));
+
+    odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+        "odom_world",
+        1,
+        [this](const std::shared_ptr<const nav_msgs::msg::Odometry> &msg)
+        {
+          this->odometryCallback(msg);
+        });
+    // std::bind(&EGOReplanFSM::odometryCallback, this, std::placeholders::_1));
 
     if (planner_manager_->pp_.drone_id >= 1)
     {
       string sub_topic_name = string("/drone_") + std::to_string(planner_manager_->pp_.drone_id - 1) + string("_planning/swarm_trajs");
-      swarm_trajs_sub_ = nh.subscribe(sub_topic_name.c_str(), 10, &EGOReplanFSM::swarmTrajsCallback, this, ros::TransportHints().tcpNoDelay());
+      swarm_trajs_sub_ = node_->create_subscription<traj_utils::msg::MultiBsplines>(
+          sub_topic_name,
+          10,
+          [this](const std::shared_ptr<const traj_utils::msg::MultiBsplines> &msg)
+          {
+            this->swarmTrajsCallback(msg);
+          });
     }
-    string pub_topic_name = string("/drone_") + std::to_string(planner_manager_->pp_.drone_id) + string("_planning/swarm_trajs");
-    swarm_trajs_pub_ = nh.advertise<traj_utils::MultiBsplines>(pub_topic_name.c_str(), 10);
 
-    broadcast_bspline_pub_ = nh.advertise<traj_utils::Bspline>("planning/broadcast_bspline_from_planner", 10);
-    broadcast_bspline_sub_ = nh.subscribe("planning/broadcast_bspline_to_planner", 100, &EGOReplanFSM::BroadcastBsplineCallback, this, ros::TransportHints().tcpNoDelay());
+    // ros2 中topic名字中不能出现负号，单机id是-1需要处理
+    // string pub_topic_name = string("/drone_") + std::to_string(planner_manager_->pp_.drone_id) + string("_planning/swarm_trajs");
+    string pub_topic_name;
+    if (planner_manager_->pp_.drone_id <= -1)
+    {
+      RCLCPP_INFO(node_->get_logger(), "single drone:%d", planner_manager_->pp_.drone_id);
+      pub_topic_name = string("/drone_") + "single" + string("_planning/swarm_trajs");
+    }else
+    {
+      pub_topic_name = string("/drone_") + std::to_string(planner_manager_->pp_.drone_id) + string("_planning/swarm_trajs");
+    }
+    
+    swarm_trajs_pub_ = node_->create_publisher<traj_utils::msg::MultiBsplines>(pub_topic_name, 10);
 
-    bspline_pub_ = nh.advertise<traj_utils::Bspline>("planning/bspline", 10);
-    data_disp_pub_ = nh.advertise<traj_utils::DataDisp>("planning/data_display", 100);
+    broadcast_bspline_pub_ = node_->create_publisher<traj_utils::msg::Bspline>("planning/broadcast_bspline_from_planner", 10);
+    broadcast_bspline_sub_ = node_->create_subscription<traj_utils::msg::Bspline>(
+        "planning/broadcast_bspline_to_planner",
+        100,
+        [this](const std::shared_ptr<const traj_utils::msg::Bspline> &msg)
+        {
+          this->BroadcastBsplineCallback(msg);
+        });
+
+    bspline_pub_ = node_->create_publisher<traj_utils::msg::Bspline>("planning/bspline", 10);
+    data_disp_pub_ = node_->create_publisher<traj_utils::msg::DataDisp>("planning/data_display", 100);
 
     if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
     {
-      waypoint_sub_ = nh.subscribe("/move_base_simple/goal", 1, &EGOReplanFSM::waypointCallback, this);
+      waypoint_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
+          "/move_base_simple/goal",
+          1,
+          [this](const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
+          {
+            this->waypointCallback(msg);
+          });
     }
     else if (target_type_ == TARGET_TYPE::PRESET_TARGET)
     {
-      trigger_sub_ = nh.subscribe("/traj_start_trigger", 1, &EGOReplanFSM::triggerCallback, this);
+      trigger_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
+          "/traj_start_trigger",
+          1,
+          [this](const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
+          {
+            this->triggerCallback(msg);
+          });
 
-      ROS_INFO("Wait for 1 second.");
+      RCLCPP_INFO(node_->get_logger(), "Wait for 1 second.");
       int count = 0;
-      while (ros::ok() && count++ < 1000)
+      while (rclcpp::ok() && count++ < 1000)
       {
-        ros::spinOnce();
-        ros::Duration(0.001).sleep();
+        rclcpp::spin_some(node_);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
 
-      ROS_WARN("Waiting for trigger from [n3ctrl] from RC");
+      RCLCPP_WARN(node_->get_logger(), "Waiting for trigger from [n3ctrl] from RC");
 
-      while (ros::ok() && (!have_odom_ || !have_trigger_))
+      while (rclcpp::ok() && (!have_odom_ || !have_trigger_))
       {
-        ros::spinOnce();
-        ros::Duration(0.001).sleep();
+        rclcpp::spin_some(node_);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
 
       readGivenWps();
     }
     else
       cout << "Wrong target_type_ value! target_type_=" << target_type_ << endl;
+
+    // 启动话题数据检查
+    checkTopicData();
+    
+    // 输出启动诊断信息
+    printStartupDiagnostics();
+  }
+
+  void EGOReplanFSM::printStartupDiagnostics()
+  {
+    RCLCPP_INFO(node_->get_logger(), "=== EGO Planner 启动诊断信息 ===");
+    RCLCPP_INFO(node_->get_logger(), "目标类型: %s", 
+                target_type_ == TARGET_TYPE::MANUAL_TARGET ? "手动目标" : 
+                target_type_ == TARGET_TYPE::PRESET_TARGET ? "预设目标" : "参考路径");
+    RCLCPP_INFO(node_->get_logger(), "规划时域: %.2f 米", planning_horizen_);
+    RCLCPP_INFO(node_->get_logger(), "规划时域时间: %.2f 秒", planning_horizen_time_);
+    RCLCPP_INFO(node_->get_logger(), "重规划阈值: %.2f 秒", replan_thresh_);
+    RCLCPP_INFO(node_->get_logger(), "无重规划阈值: %.2f 米", no_replan_thresh_);
+    RCLCPP_INFO(node_->get_logger(), "紧急时间: %.2f 秒", emergency_time_);
+    RCLCPP_INFO(node_->get_logger(), "真实世界实验: %s", flag_realworld_experiment_ ? "是" : "否");
+    RCLCPP_INFO(node_->get_logger(), "故障安全: %s", enable_fail_safe_ ? "启用" : "禁用");
+    RCLCPP_INFO(node_->get_logger(), "预设航点数量: %d", waypoint_num_);
+    
+    if (waypoint_num_ > 0)
+    {
+      RCLCPP_INFO(node_->get_logger(), "预设航点坐标:");
+      for (int i = 0; i < waypoint_num_; i++)
+      {
+        RCLCPP_INFO(node_->get_logger(), "  航点%d: (%.2f, %.2f, %.2f)", 
+                    i, waypoints_[i][0], waypoints_[i][1], waypoints_[i][2]);
+      }
+    }
+    
+    RCLCPP_INFO(node_->get_logger(), "当前状态: %s", 
+                exec_state_ == INIT ? "初始化" : 
+                exec_state_ == WAIT_TARGET ? "等待目标" : 
+                exec_state_ == GEN_NEW_TRAJ ? "生成新轨迹" : 
+                exec_state_ == REPLAN_TRAJ ? "重规划轨迹" : 
+                exec_state_ == EXEC_TRAJ ? "执行轨迹" : 
+                exec_state_ == EMERGENCY_STOP ? "紧急停止" : "顺序启动");
+    
+    RCLCPP_INFO(node_->get_logger(), "数据状态: odom=%s, target=%s, trigger=%s", 
+                have_odom_ ? "已接收" : "未接收", 
+                have_target_ ? "已设置" : "未设置", 
+                have_trigger_ ? "已触发" : "未触发");
+    
+    RCLCPP_INFO(node_->get_logger(), "================================");
+  }
+
+  void EGOReplanFSM::checkTopicData()
+  {
+    RCLCPP_INFO(node_->get_logger(), "=== EGO Planner 外部输入状态检查 ===");
+    
+    // 检查关键传感器数据话题
+    RCLCPP_INFO(node_->get_logger(), "--- 关键传感器数据 ---");
+    
+    // 检查odom话题 - 最重要的状态数据
+    if (odom_sub_)
+    {
+      RCLCPP_INFO(node_->get_logger(), "✓ Odom状态数据: odom_world");
+      RCLCPP_INFO(node_->get_logger(), "  接收状态: %s", have_odom_ ? "已接收" : "等待中");
+      if (have_odom_)
+      {
+        RCLCPP_INFO(node_->get_logger(), "  当前位置: (%.2f, %.2f, %.2f)", 
+                    odom_pos_(0), odom_pos_(1), odom_pos_(2));
+        RCLCPP_INFO(node_->get_logger(), "  当前速度: (%.2f, %.2f, %.2f) m/s", 
+                    odom_vel_(0), odom_vel_(1), odom_vel_(2));
+      }
+    }
+    else
+    {
+      RCLCPP_ERROR(node_->get_logger(), "✗ Odom状态数据缺失: odom_world");
+    }
+
+    // 检查点云数据 - 环境感知数据
+    if (planner_manager_->grid_map_)
+    {
+      // bool has_cloud = planner_manager_->grid_map_->hasCloudObservation();
+      bool has_depth = planner_manager_->grid_map_->hasDepthObservation();
+      bool has_odom = planner_manager_->grid_map_->odomValid();
+      
+      RCLCPP_INFO(node_->get_logger(), "--- 环境感知数据 ---");
+      // RCLCPP_INFO(node_->get_logger(), "  点云数据: %s", has_cloud ? "已接收" : "等待中");
+      RCLCPP_INFO(node_->get_logger(), "  深度数据: %s", has_depth ? "已接收" : "等待中");
+      RCLCPP_INFO(node_->get_logger(), "  地图odom: %s", has_odom ? "有效" : "无效");
+      
+      // 检查数据同步状态
+      bool odom_timeout = planner_manager_->grid_map_->getOdomDepthTimeout();
+      
+      // 检查传感器数据同步性
+      bool sensors_synced = true;
+      std::string sync_status = "正常";
+      
+      if (have_odom_)
+      {
+        sensors_synced = false;
+        sync_status = "odom已接收";
+      }
+      else if (!have_odom_)
+      {
+        sensors_synced = false;
+        sync_status = "odom缺失";
+      }
+      else if (odom_timeout)
+      {
+        sensors_synced = false;
+        sync_status = "数据同步超时";
+      }
+      
+      RCLCPP_INFO(node_->get_logger(), "  数据同步: %s", sync_status.c_str());
+      
+      if (!sensors_synced)
+      {
+        RCLCPP_WARN(node_->get_logger(), "  ⚠ 传感器数据不同步，可能影响规划性能");
+      }
+    }
+    else
+    {
+      RCLCPP_WARN(node_->get_logger(), "✗ 环境感知模块未初始化");
+    }
+
+    // 检查目标话题
+    RCLCPP_INFO(node_->get_logger(), "--- 任务目标数据 ---");
+    if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
+    {
+      if (waypoint_sub_)
+      {
+        RCLCPP_INFO(node_->get_logger(), "✓ 手动目标: /move_base_simple/goal");
+        RCLCPP_INFO(node_->get_logger(), "  目标状态: %s", have_target_ ? "已设置" : "等待中");
+      }
+      else
+      {
+        RCLCPP_ERROR(node_->get_logger(), "✗ 手动目标话题缺失");
+      }
+    }
+    else if (target_type_ == TARGET_TYPE::PRESET_TARGET)
+    {
+      if (trigger_sub_)
+      {
+        RCLCPP_INFO(node_->get_logger(), "✓ 预设目标: /traj_start_trigger");
+        RCLCPP_INFO(node_->get_logger(), "  触发状态: %s", have_trigger_ ? "已触发" : "等待中");
+      }
+      else
+      {
+        RCLCPP_ERROR(node_->get_logger(), "✗ 预设目标话题缺失");
+      }
+    }
+
+    // 检查多机通信数据
+    if (planner_manager_->pp_.drone_id >= 1)
+    {
+      RCLCPP_INFO(node_->get_logger(), "--- 多机通信数据 ---");
+      string sub_topic_name = string("/drone_") + std::to_string(planner_manager_->pp_.drone_id - 1) + string("_planning/swarm_trajs");
+      if (swarm_trajs_sub_)
+      {
+        RCLCPP_INFO(node_->get_logger(), "✓ 邻居轨迹: %s", sub_topic_name.c_str());
+        RCLCPP_INFO(node_->get_logger(), "  接收状态: %s", have_recv_pre_agent_ ? "已接收" : "等待中");
+      }
+      else
+      {
+        RCLCPP_WARN(node_->get_logger(), "✗ 邻居轨迹话题缺失");
+      }
+    }
+
+    RCLCPP_INFO(node_->get_logger(), "================================");
   }
 
   void EGOReplanFSM::readGivenWps()
+
   {
     if (waypoint_num_ <= 0)
     {
-      ROS_ERROR("Wrong waypoint_num_ = %d", waypoint_num_);
+      RCLCPP_ERROR(node_->get_logger(), "Wrong waypoint_num_ = %d", waypoint_num_);
       return;
     }
 
@@ -103,56 +333,18 @@ namespace ego_planner
       wps_[i](0) = waypoints_[i][0];
       wps_[i](1) = waypoints_[i][1];
       wps_[i](2) = waypoints_[i][2];
-
-      // end_pt_ = wps_.back();
     }
 
-    // bool success = planner_manager_->planGlobalTrajWaypoints(
-    //   odom_pos_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
-    //   wps_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-
+    // 用 visualization_->displayGoalPoint() 方法对waypoint进行可视化
     for (size_t i = 0; i < (size_t)waypoint_num_; i++)
     {
       visualization_->displayGoalPoint(wps_[i], Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, i);
-      ros::Duration(0.001).sleep();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     // plan first global waypoint
     wp_id_ = 0;
     planNextWaypoint(wps_[wp_id_]);
-
-    // if (success)
-    // {
-
-    //   /*** display ***/
-    //   constexpr double step_size_t = 0.1;
-    //   int i_end = floor(planner_manager_->global_data_.global_duration_ / step_size_t);
-    //   std::vector<Eigen::Vector3d> gloabl_traj(i_end);
-    //   for (int i = 0; i < i_end; i++)
-    //   {
-    //     gloabl_traj[i] = planner_manager_->global_data_.global_traj_.evaluate(i * step_size_t);
-    //   }
-
-    //   end_vel_.setZero();
-    //   have_target_ = true;
-    //   have_new_target_ = true;
-
-    //   /*** FSM ***/
-    //   // if (exec_state_ == WAIT_TARGET)
-    //   //changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
-    //   // trigger_ = true;
-    //   // else if (exec_state_ == EXEC_TRAJ)
-    //   //   changeFSMExecState(REPLAN_TRAJ, "TRIG");
-
-    //   // visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(1, 0, 0, 1), 0.3, 0);
-    //   ros::Duration(0.001).sleep();
-    //   visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
-    //   ros::Duration(0.001).sleep();
-    // }
-    // else
-    // {
-    //   ROS_ERROR("Unable to generate global trajectory!");
-    // }
   }
 
   void EGOReplanFSM::planNextWaypoint(const Eigen::Vector3d next_wp)
@@ -160,15 +352,22 @@ namespace ego_planner
     bool success = false;
     success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), next_wp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
-    // visualization_->displayGoalPoint(next_wp, Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, 0);
-
     if (success)
     {
       end_pt_ = next_wp;
 
-      /*** display ***/
       constexpr double step_size_t = 0.1;
       int i_end = floor(planner_manager_->global_data_.global_duration_ / step_size_t);
+      if (planner_manager_->global_data_.global_duration_ <= 0.0)
+      {
+        RCLCPP_ERROR(node_->get_logger(), "Invalid global trajectory duration: %f", planner_manager_->global_data_.global_duration_);
+        return;
+      }
+      if (i_end <= 0 || i_end > 1000000) // sanity cap
+      {
+        RCLCPP_ERROR(node_->get_logger(), "Unreasonable trajectory steps: %d, duration: %f", i_end, planner_manager_->global_data_.global_duration_);
+        return;
+      }
       vector<Eigen::Vector3d> gloabl_traj(i_end);
       for (int i = 0; i < i_end; i++)
       {
@@ -179,42 +378,102 @@ namespace ego_planner
       have_target_ = true;
       have_new_target_ = true;
 
-      /*** FSM ***/
+      /*** FSM状态转换 ***/
       if (exec_state_ == WAIT_TARGET)
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
       else
       {
         while (exec_state_ != EXEC_TRAJ)
         {
-          ros::spinOnce();
-          ros::Duration(0.001).sleep();
+          rclcpp::spin_some(node_);
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         changeFSMExecState(REPLAN_TRAJ, "TRIG");
       }
 
-      // visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(1, 0, 0, 1), 0.3, 0);
       visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
     }
     else
     {
-      ROS_ERROR("Unable to generate global trajectory!");
+      RCLCPP_ERROR(node_->get_logger(), "Unable to generate global trajectory!");
     }
   }
 
-  void EGOReplanFSM::triggerCallback(const geometry_msgs::PoseStampedPtr &msg)
+  void EGOReplanFSM::triggerCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
   {
+    // 检查触发数据的有效性
+    bool data_valid = true;
+    
+    // 检查位置数据
+    if (!std::isfinite(msg->pose.position.x) || !std::isfinite(msg->pose.position.y) || !std::isfinite(msg->pose.position.z))
+    {
+      RCLCPP_WARN(node_->get_logger(), "收到无效的触发位置数据: x=%f, y=%f, z=%f", 
+                  msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+      data_valid = false;
+    }
+    
+    // 检查姿态数据
+    double quat_norm = sqrt(msg->pose.orientation.w * msg->pose.orientation.w +
+                           msg->pose.orientation.x * msg->pose.orientation.x +
+                           msg->pose.orientation.y * msg->pose.orientation.y +
+                           msg->pose.orientation.z * msg->pose.orientation.z);
+    if (fabs(quat_norm - 1.0) > 0.01)
+    {
+      RCLCPP_WARN(node_->get_logger(), "收到无效的触发姿态数据: 四元数范数=%f (期望1.0)", quat_norm);
+      data_valid = false;
+    }
+    
+    if (!data_valid)
+    {
+      RCLCPP_ERROR(node_->get_logger(), "触发数据无效，跳过本次触发");
+      return;
+    }
+
     have_trigger_ = true;
-    cout << "Triggered!" << endl;
+    RCLCPP_INFO(node_->get_logger(), "✓ 收到有效触发信号: 位置(%.2f, %.2f, %.2f)", 
+                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
     init_pt_ = odom_pos_;
   }
 
-  void EGOReplanFSM::waypointCallback(const geometry_msgs::PoseStampedPtr &msg)
+  void EGOReplanFSM::waypointCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
   {
-    if (msg->pose.position.z < -0.1)
+    // 检查目标点数据的有效性
+    bool data_valid = true;
+    
+    // 检查位置数据
+    if (!std::isfinite(msg->pose.position.x) || !std::isfinite(msg->pose.position.y) || !std::isfinite(msg->pose.position.z))
+    {
+      RCLCPP_WARN(node_->get_logger(), "收到无效的目标点位置数据: x=%f, y=%f, z=%f", 
+                  msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+      data_valid = false;
+    }
+    
+    // 检查姿态数据
+    double quat_norm = sqrt(msg->pose.orientation.w * msg->pose.orientation.w +
+                           msg->pose.orientation.x * msg->pose.orientation.x +
+                           msg->pose.orientation.y * msg->pose.orientation.y +
+                           msg->pose.orientation.z * msg->pose.orientation.z);
+    if (fabs(quat_norm - 1.0) > 0.01)
+    {
+      RCLCPP_WARN(node_->get_logger(), "收到无效的目标点姿态数据: 四元数范数=%f (期望1.0)", quat_norm);
+      data_valid = false;
+    }
+    
+    if (!data_valid)
+    {
+      RCLCPP_ERROR(node_->get_logger(), "目标点数据无效，跳过本次规划");
       return;
+    }
 
-    cout << "Triggered!" << endl;
-    // trigger_ = true;
+    if (msg->pose.position.z < -0.1)
+    {
+      RCLCPP_WARN(node_->get_logger(), "目标点z坐标无效: %f (小于-0.1)", msg->pose.position.z);
+      return;
+    }
+
+    RCLCPP_INFO(node_->get_logger(), "✓ 收到有效目标点: 位置(%.2f, %.2f, %.2f)", 
+                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+
     init_pt_ = odom_pos_;
 
     Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, 1.0);
@@ -222,8 +481,101 @@ namespace ego_planner
     planNextWaypoint(end_wp);
   }
 
-  void EGOReplanFSM::odometryCallback(const nav_msgs::OdometryConstPtr &msg)
+  void EGOReplanFSM::odometryCallback(const std::shared_ptr<const nav_msgs::msg::Odometry> &msg)
   {
+    static rclcpp::Time last_odom_time;
+    static int odom_count = 0;
+    static double total_position_error = 0.0;
+    static double total_velocity_error = 0.0;
+    
+    // 检查odom数据的完整性和有效性
+    bool data_valid = true;
+    std::vector<std::string> error_messages;
+    
+    // 检查时间戳连续性
+    rclcpp::Time current_time = msg->header.stamp;
+    if (last_odom_time.nanoseconds() > 0)
+    {
+      double time_diff = (current_time - last_odom_time).seconds();
+      if (time_diff > 1.0) // 超过1000ms的间隔可能有问题
+      {
+        RCLCPP_WARN(node_->get_logger(), "odom数据间隔异常: %.3f秒", time_diff);
+      }
+    }
+    last_odom_time = current_time;
+    
+    // 检查位置数据
+    if (!std::isfinite(msg->pose.pose.position.x) || !std::isfinite(msg->pose.pose.position.y) || !std::isfinite(msg->pose.pose.position.z))
+    {
+      error_messages.push_back("位置数据包含非数值");
+      data_valid = false;
+    }
+    else
+    {
+      // 检查位置数据合理性
+      double pos_norm = sqrt(msg->pose.pose.position.x * msg->pose.pose.position.x +
+                            msg->pose.pose.position.y * msg->pose.pose.position.y +
+                            msg->pose.pose.position.z * msg->pose.pose.position.z);
+      if (pos_norm > 1000.0) // 位置数据过大
+      {
+        error_messages.push_back("位置数据异常过大");
+        data_valid = false;
+      }
+    }
+    
+    // 检查速度数据
+    if (!std::isfinite(msg->twist.twist.linear.x) || !std::isfinite(msg->twist.twist.linear.y) || !std::isfinite(msg->twist.twist.linear.z))
+    {
+      error_messages.push_back("速度数据包含非数值");
+      data_valid = false;
+    }
+    else
+    {
+      // 检查速度数据合理性
+      double vel_norm = sqrt(msg->twist.twist.linear.x * msg->twist.twist.linear.x +
+                            msg->twist.twist.linear.y * msg->twist.twist.linear.y +
+                            msg->twist.twist.linear.z * msg->twist.twist.linear.z);
+      if (vel_norm > 50.0) // 速度过大（超过50m/s）
+      {
+        error_messages.push_back("速度数据异常过大");
+        data_valid = false;
+      }
+    }
+    
+    // 检查姿态数据
+    double quat_norm = sqrt(msg->pose.pose.orientation.w * msg->pose.pose.orientation.w +
+                           msg->pose.pose.orientation.x * msg->pose.pose.orientation.x +
+                           msg->pose.pose.orientation.y * msg->pose.pose.orientation.y +
+                           msg->pose.pose.orientation.z * msg->pose.pose.orientation.z);
+    if (fabs(quat_norm - 1.0) > 0.01)
+    {
+      error_messages.push_back("姿态四元数不规范");
+      data_valid = false;
+    }
+    
+    // 检查协方差数据
+    if (msg->pose.covariance[0] < 0 || msg->twist.covariance[0] < 0)
+    {
+      error_messages.push_back("协方差数据异常");
+      // 协方差异常不一定是致命错误，只警告
+      RCLCPP_WARN(node_->get_logger(), "odom协方差数据异常");
+    }
+    
+    if (!data_valid)
+    {
+      std::string error_summary = "odom数据无效: ";
+      for (const auto& err : error_messages)
+      {
+        error_summary += err + "; ";
+      }
+      RCLCPP_ERROR(node_->get_logger(), "%s", error_summary.c_str());
+      return;
+    }
+
+    // 更新状态数据
+    Eigen::Vector3d prev_pos = odom_pos_;
+    Eigen::Vector3d prev_vel = odom_vel_;
+    
     odom_pos_(0) = msg->pose.pose.position.x;
     odom_pos_(1) = msg->pose.pose.position.y;
     odom_pos_(2) = msg->pose.pose.position.z;
@@ -232,30 +584,64 @@ namespace ego_planner
     odom_vel_(1) = msg->twist.twist.linear.y;
     odom_vel_(2) = msg->twist.twist.linear.z;
 
-    //odom_acc_ = estimateAcc( msg );
-
     odom_orient_.w() = msg->pose.pose.orientation.w;
     odom_orient_.x() = msg->pose.pose.orientation.x;
     odom_orient_.y() = msg->pose.pose.orientation.y;
     odom_orient_.z() = msg->pose.pose.orientation.z;
 
     have_odom_ = true;
+    odom_count++;
+    
+    // 计算数据变化统计
+    if (have_odom_ && odom_count > 1)
+    {
+      double pos_change = (odom_pos_ - prev_pos).norm();
+      double vel_change = (odom_vel_ - prev_vel).norm();
+      total_position_error += pos_change;
+      total_velocity_error += vel_change;
+    }
+    
+    static bool first_odom_received = false;
+    if (!first_odom_received)
+    {
+      RCLCPP_INFO(node_->get_logger(), "✓ 首次收到有效的odom数据: 位置(%.2f, %.2f, %.2f), 速度(%.2f, %.2f, %.2f) m/s", 
+                  odom_pos_(0), odom_pos_(1), odom_pos_(2), 
+                  odom_vel_(0), odom_vel_(1), odom_vel_(2));
+      first_odom_received = true;
+    }
+    
+    // 定期输出数据质量统计
+    if (odom_count % 1000 == 0 && odom_count > 1)
+    {
+      double avg_pos_error = total_position_error / (odom_count - 1);
+      double avg_vel_error = total_velocity_error / (odom_count - 1);
+      
+      RCLCPP_INFO(node_->get_logger(), "odom数据质量统计: 接收%d帧, 平均位置变化%.4fm, 平均速度变化%.4fm/s", 
+                  odom_count, avg_pos_error, avg_vel_error);
+    }
   }
 
-  void EGOReplanFSM::BroadcastBsplineCallback(const traj_utils::BsplinePtr &msg)
+  void EGOReplanFSM::BroadcastBsplineCallback(const std::shared_ptr<const traj_utils::msg::Bspline> &msg)
   {
     size_t id = msg->drone_id;
     if ((int)id == planner_manager_->pp_.drone_id)
       return;
 
-    if (abs((ros::Time::now() - msg->start_time).toSec()) > 0.25)
+    // if (abs((ros::Time::now() - msg->start_time).toSec()) > 0.25)
+    rclcpp::Clock clock(RCL_SYSTEM_TIME);  // 确保使用当前节点的时间源
+    auto msg_time = rclcpp::Time(msg->start_time, clock.get_clock_type());
+    // RCLCPP_INFO(node_->get_logger(), "Clock type: %d", rclcpp::Clock().now().get_clock_type());
+    // RCLCPP_INFO(node_->get_logger(), "Start time clock type: %d", rclcpp::Time(msg->start_time).get_clock_type());
+    // RCLCPP_INFO(node_->get_logger(), "msg_time: %d", msg_time.get_clock_type());
+    if (abs((rclcpp::Clock().now() - msg_time).seconds()) > 0.25)
     {
-      ROS_ERROR("Time difference is too large! Local - Remote Agent %d = %fs",
-                msg->drone_id, (ros::Time::now() - msg->start_time).toSec());
+      // ROS_ERROR("Time difference is too large! Local - Remote Agent %d = %fs", msg->drone_id, (ros::Time::now() - msg->start_time).toSec());
+      RCLCPP_ERROR(node_->get_logger(), "Time difference is too large! Local - Remote Agent %d = %fs",
+                   msg->drone_id, (rclcpp::Clock().now() - msg_time).seconds());
       return;
     }
 
-    /* Fill up the buffer */
+    // 路径缓冲区初始化
     if (planner_manager_->swarm_trajs_buf_.size() <= id)
     {
       for (size_t i = planner_manager_->swarm_trajs_buf_.size(); i <= id; i++)
@@ -293,6 +679,7 @@ namespace ego_planner
 
     planner_manager_->swarm_trajs_buf_[id].drone_id = id;
 
+    // 计算路径持续时间
     if (msg->order % 2)
     {
       double cutback = (double)msg->order / 2 + 1.5;
@@ -304,6 +691,7 @@ namespace ego_planner
       planner_manager_->swarm_trajs_buf_[id].duration_ = (msg->knots[msg->knots.size() - floor(cutback)] + msg->knots[msg->knots.size() - ceil(cutback)]) / 2;
     }
 
+    // 生成bspline并存储
     UniformBspline pos_traj(pos_pts, msg->order, msg->knots[1] - msg->knots[0]);
     pos_traj.setKnot(knots);
     planner_manager_->swarm_trajs_buf_[id].position_traj_ = pos_traj;
@@ -311,7 +699,6 @@ namespace ego_planner
     planner_manager_->swarm_trajs_buf_[id].start_pos_ = planner_manager_->swarm_trajs_buf_[id].position_traj_.evaluateDeBoorT(0);
 
     planner_manager_->swarm_trajs_buf_[id].start_time_ = msg->start_time;
-    // planner_manager_->swarm_trajs_buf_[id].start_time_ = ros::Time::now(); // Un-reliable time sync
 
     /* Check Collision */
     if (planner_manager_->checkCollision(id))
@@ -320,29 +707,27 @@ namespace ego_planner
     }
   }
 
-  void EGOReplanFSM::swarmTrajsCallback(const traj_utils::MultiBsplinesPtr &msg)
+  void EGOReplanFSM::swarmTrajsCallback(const std::shared_ptr<const traj_utils::msg::MultiBsplines> &msg)
   {
 
     multi_bspline_msgs_buf_.traj.clear();
     multi_bspline_msgs_buf_ = *msg;
 
-    // cout << "\033[45;33mmulti_bspline_msgs_buf.drone_id_from=" << multi_bspline_msgs_buf_.drone_id_from << " multi_bspline_msgs_buf_.traj.size()=" << multi_bspline_msgs_buf_.traj.size() << "\033[0m" << endl;
-
     if (!have_odom_)
     {
-      ROS_ERROR("swarmTrajsCallback(): no odom!, return.");
+      RCLCPP_ERROR(node_->get_logger(), "swarmTrajsCallback(): no odom!, return.");
       return;
     }
 
     if ((int)msg->traj.size() != msg->drone_id_from + 1) // drone_id must start from 0
     {
-      ROS_ERROR("Wrong trajectory size! msg->traj.size()=%d, msg->drone_id_from+1=%d", (int)msg->traj.size(), msg->drone_id_from + 1);
+      RCLCPP_ERROR(node_->get_logger(), "Wrong trajectory size!msg->traj.size()=%d, msg->drone_id_from+1=%d", (int)msg->traj.size(), msg->drone_id_from + 1);
       return;
     }
 
     if (msg->traj[0].order != 3) // only support B-spline order equals 3.
     {
-      ROS_ERROR("Only support B-spline order equals 3.");
+      RCLCPP_ERROR(node_->get_logger(), "Only support B-spline order equals 3.");
       return;
     }
 
@@ -350,6 +735,7 @@ namespace ego_planner
     planner_manager_->swarm_trajs_buf_.clear();
     planner_manager_->swarm_trajs_buf_.resize(msg->traj.size());
 
+    // 处理每条路径
     for (size_t i = 0; i < msg->traj.size(); i++)
     {
 
@@ -363,6 +749,7 @@ namespace ego_planner
         continue;
       }
 
+      // 存储路径控制点和节点
       Eigen::MatrixXd pos_pts(3, msg->traj[i].pos_pts.size());
       Eigen::VectorXd knots(msg->traj[i].knots.size());
       for (size_t j = 0; j < msg->traj[i].knots.size(); ++j)
@@ -378,6 +765,7 @@ namespace ego_planner
 
       planner_manager_->swarm_trajs_buf_[i].drone_id = i;
 
+      // 计算路径持续时间
       if (msg->traj[i].order % 2)
       {
         double cutback = (double)msg->traj[i].order / 2 + 1.5;
@@ -428,9 +816,9 @@ namespace ego_planner
     cout << "[FSM]: state: " + state_str[int(exec_state_)] << endl;
   }
 
-  void EGOReplanFSM::execFSMCallback(const ros::TimerEvent &e)
+  void EGOReplanFSM::execFSMCallback()
   {
-    exec_timer_.stop(); // To avoid blockage
+    exec_timer_->cancel(); // To avoid blockage
 
     static int fsm_num = 0;
     fsm_num++;
@@ -451,7 +839,6 @@ namespace ego_planner
       if (!have_odom_)
       {
         goto force_return;
-        // return;
       }
       changeFSMExecState(WAIT_TARGET, "FSM");
       break;
@@ -461,24 +848,15 @@ namespace ego_planner
     {
       if (!have_target_ || !have_trigger_)
         goto force_return;
-      // return;
       else
       {
-        // if ( planner_manager_->pp_.drone_id <= 0 )
-        // {
-        //   changeFSMExecState(GEN_NEW_TRAJ, "FSM");
-        // }
-        // else
-        // {
         changeFSMExecState(SEQUENTIAL_START, "FSM");
-        // }
       }
       break;
     }
 
     case SEQUENTIAL_START: // for swarm
     {
-      // cout << "id=" << planner_manager_->pp_.drone_id << " have_recv_pre_agent_=" << have_recv_pre_agent_ << endl;
       if (planner_manager_->pp_.drone_id <= 0 || (planner_manager_->pp_.drone_id >= 1 && have_recv_pre_agent_))
       {
         if (have_odom_ && have_target_ && have_trigger_)
@@ -492,13 +870,13 @@ namespace ego_planner
           }
           else
           {
-            ROS_ERROR("Failed to generate the first trajectory!!!");
+            RCLCPP_ERROR(node_->get_logger(), "Failed to generate the first trajectory!!!");
             changeFSMExecState(SEQUENTIAL_START, "FSM");
           }
         }
         else
         {
-          ROS_ERROR("No odom or no target! have_odom_=%d, have_target_=%d", have_odom_, have_target_);
+          RCLCPP_ERROR(node_->get_logger(), "No odom or no target! have_odom_=%d, have_target_=%d", have_odom_, have_target_);
         }
       }
 
@@ -507,10 +885,6 @@ namespace ego_planner
 
     case GEN_NEW_TRAJ:
     {
-
-      // Eigen::Vector3d rot_x = odom_orient_.toRotationMatrix().block(0, 0, 3, 1);
-      // start_yaw_(0)         = atan2(rot_x(1), rot_x(0));
-      // start_yaw_(1) = start_yaw_(2) = 0.0;
 
       bool success = planFromGlobalTraj(10); // zx-todo
       if (success)
@@ -546,9 +920,9 @@ namespace ego_planner
     {
       /* determine if need to replan */
       LocalTrajData *info = &planner_manager_->local_data_;
-      ros::Time time_now = ros::Time::now();
-      double t_cur = (time_now - info->start_time_).toSec();
-      t_cur = min(info->duration_, t_cur);
+      rclcpp::Time time_now = rclcpp::Clock().now();
+      double t_cur = (time_now - info->start_time_).seconds();
+      t_cur = std::min(info->duration_, t_cur);
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
 
@@ -575,7 +949,6 @@ namespace ego_planner
 
           changeFSMExecState(WAIT_TARGET, "FSM");
           goto force_return;
-          // return;
         }
         else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
         {
@@ -608,14 +981,19 @@ namespace ego_planner
     }
     }
 
-    data_disp_.header.stamp = ros::Time::now();
-    data_disp_pub_.publish(data_disp_);
+    data_disp_.header.stamp = rclcpp::Clock().now();
+    data_disp_pub_->publish(data_disp_);
 
   force_return:;
-    exec_timer_.start();
+    // exec_timer_.start();
+    if (exec_timer_ && exec_timer_->is_canceled())
+    {
+      // 取消状态下无需重新创建，可以复用现有计时器
+      exec_timer_->reset();
+    }
   }
 
-  bool EGOReplanFSM::planFromGlobalTraj(const int trial_times /*=1*/) //zx-todo
+  bool EGOReplanFSM::planFromGlobalTraj(const int trial_times /*=1*/) // zx-todo
   {
     start_pt_ = odom_pos_;
     start_vel_ = odom_vel_;
@@ -641,10 +1019,10 @@ namespace ego_planner
   {
 
     LocalTrajData *info = &planner_manager_->local_data_;
-    ros::Time time_now = ros::Time::now();
-    double t_cur = (time_now - info->start_time_).toSec();
-
-    //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
+    // ros::Time time_now = ros::Time::now();
+    auto time_now = rclcpp::Clock().now();
+    // double t_cur = (time_now - info->start_time_).toSec();
+    double t_cur = (time_now - info->start_time_).seconds();
 
     start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
@@ -655,7 +1033,6 @@ namespace ego_planner
     if (!success)
     {
       success = callReboundReplan(true, false);
-      //changeFSMExecState(EXEC_TRAJ, "FSM");
       if (!success)
       {
         for (int i = 0; i < trial_times; i++)
@@ -674,29 +1051,34 @@ namespace ego_planner
     return true;
   }
 
-  void EGOReplanFSM::checkCollisionCallback(const ros::TimerEvent &e)
+  void EGOReplanFSM::checkCollisionCallback()
   {
 
     LocalTrajData *info = &planner_manager_->local_data_;
     auto map = planner_manager_->grid_map_;
-
-    if (exec_state_ == WAIT_TARGET || info->start_time_.toSec() < 1e-5)
+    
+    if (exec_state_ == WAIT_TARGET || info->start_time_.seconds() < 1e-5)
       return;
 
     /* ---------- check lost of depth ---------- */
     if (map->getOdomDepthTimeout())
     {
-      ROS_ERROR("Depth Lost! EMERGENCY_STOP");
+      RCLCPP_ERROR(node_->get_logger(), "Depth Lost! EMERGENCY_STOP");
+
       enable_fail_safe_ = false;
       changeFSMExecState(EMERGENCY_STOP, "SAFETY");
     }
 
     /* ---------- check trajectory ---------- */
     constexpr double time_step = 0.01;
-    double t_cur = (ros::Time::now() - info->start_time_).toSec();
+    // double t_cur = (ros::Time::now() - info->start_time_).toSec();
+    double t_cur = (rclcpp::Clock().now() - info->start_time_).seconds();
+
     Eigen::Vector3d p_cur = info->position_traj_.evaluateDeBoorT(t_cur);
     const double CLEARANCE = 1.0 * planner_manager_->getSwarmClearance();
-    double t_cur_global = ros::Time::now().toSec();
+    // double t_cur_global = ros::Time::now().toSec();
+    double t_cur_global = rclcpp::Clock().now().seconds();
+
     double t_2_3 = info->duration_ * 2 / 3;
     for (double t = t_cur; t < info->duration_; t += time_step)
     {
@@ -713,7 +1095,7 @@ namespace ego_planner
           continue;
         }
 
-        double t_X = t_cur_global - planner_manager_->swarm_trajs_buf_.at(id).start_time_.toSec();
+        double t_X = t_cur_global - planner_manager_->swarm_trajs_buf_.at(id).start_time_.seconds();
         Eigen::Vector3d swarm_pridicted = planner_manager_->swarm_trajs_buf_.at(id).position_traj_.evaluateDeBoorT(t_X);
         double dist = (p_cur - swarm_pridicted).norm();
 
@@ -737,12 +1119,13 @@ namespace ego_planner
         {
           if (t - t_cur < emergency_time_) // 0.8s of emergency time
           {
-            ROS_WARN("Suddenly discovered obstacles. emergency stop! time=%f", t - t_cur);
+            RCLCPP_WARN(node_->get_logger(), "Suddenly discovered obstacles. emergency stop! time=%f", t - t_cur);
+
             changeFSMExecState(EMERGENCY_STOP, "SAFETY");
           }
           else
           {
-            //ROS_WARN("current traj in collision, replan.");
+            RCLCPP_WARN(node_->get_logger(), "current traj in collision, replan.");
             changeFSMExecState(REPLAN_TRAJ, "SAFETY");
           }
           return;
@@ -768,7 +1151,7 @@ namespace ego_planner
 
       auto info = &planner_manager_->local_data_;
 
-      traj_utils::Bspline bspline;
+      traj_utils::msg::Bspline bspline;
       bspline.order = 3;
       bspline.start_time = info->start_time_;
       bspline.traj_id = info->traj_id_;
@@ -777,7 +1160,7 @@ namespace ego_planner
       bspline.pos_pts.reserve(pos_pts.cols());
       for (int i = 0; i < pos_pts.cols(); ++i)
       {
-        geometry_msgs::Point pt;
+        geometry_msgs::msg::Point pt;
         pt.x = pos_pts(0, i);
         pt.y = pos_pts(1, i);
         pt.z = pos_pts(2, i);
@@ -785,7 +1168,7 @@ namespace ego_planner
       }
 
       Eigen::VectorXd knots = info->position_traj_.getKnot();
-      // cout << knots.transpose() << endl;
+
       bspline.knots.reserve(knots.rows());
       for (int i = 0; i < knots.rows(); ++i)
       {
@@ -793,7 +1176,7 @@ namespace ego_planner
       }
 
       /* 1. publish traj to traj_server */
-      bspline_pub_.publish(bspline);
+      bspline_pub_->publish(bspline);
 
       /* 2. publish traj to the next drone of swarm */
 
@@ -808,7 +1191,7 @@ namespace ego_planner
   {
     auto info = &planner_manager_->local_data_;
 
-    traj_utils::Bspline bspline;
+    traj_utils::msg::Bspline bspline;
     bspline.order = 3;
     bspline.start_time = info->start_time_;
     bspline.drone_id = planner_manager_->pp_.drone_id;
@@ -818,7 +1201,7 @@ namespace ego_planner
     bspline.pos_pts.reserve(pos_pts.cols());
     for (int i = 0; i < pos_pts.cols(); ++i)
     {
-      geometry_msgs::Point pt;
+      geometry_msgs::msg::Point pt;
       pt.x = pos_pts(0, i);
       pt.y = pos_pts(1, i);
       pt.z = pos_pts(2, i);
@@ -826,7 +1209,7 @@ namespace ego_planner
     }
 
     Eigen::VectorXd knots = info->position_traj_.getKnot();
-    // cout << knots.transpose() << endl;
+
     bspline.knots.reserve(knots.rows());
     for (int i = 0; i < knots.rows(); ++i)
     {
@@ -846,13 +1229,14 @@ namespace ego_planner
       }
       else
       {
-        ROS_ERROR("Wrong traj nums and drone_id pair!!! traj.size()=%d, drone_id=%d", (int)multi_bspline_msgs_buf_.traj.size(), planner_manager_->pp_.drone_id);
+        RCLCPP_ERROR(node_->get_logger(), "Wrong traj nums and drone_id pair!!! traj.size()=%d, drone_id=%d", (int)multi_bspline_msgs_buf_.traj.size(), planner_manager_->pp_.drone_id);
         // return plan_and_refine_success;
       }
-      swarm_trajs_pub_.publish(multi_bspline_msgs_buf_);
+      // swarm_trajs_pub_.publish(multi_bspline_msgs_buf_);
+      swarm_trajs_pub_->publish(multi_bspline_msgs_buf_);
     }
 
-    broadcast_bspline_pub_.publish(bspline);
+    broadcast_bspline_pub_->publish(bspline);
   }
 
   bool EGOReplanFSM::callEmergencyStop(Eigen::Vector3d stop_pos)
@@ -863,7 +1247,7 @@ namespace ego_planner
     auto info = &planner_manager_->local_data_;
 
     /* publish traj */
-    traj_utils::Bspline bspline;
+    traj_utils::msg::Bspline bspline;
     bspline.order = 3;
     bspline.start_time = info->start_time_;
     bspline.traj_id = info->traj_id_;
@@ -872,7 +1256,7 @@ namespace ego_planner
     bspline.pos_pts.reserve(pos_pts.cols());
     for (int i = 0; i < pos_pts.cols(); ++i)
     {
-      geometry_msgs::Point pt;
+      geometry_msgs::msg::Point pt;
       pt.x = pos_pts(0, i);
       pt.y = pos_pts(1, i);
       pt.z = pos_pts(2, i);
@@ -886,7 +1270,7 @@ namespace ego_planner
       bspline.knots.push_back(knots(i));
     }
 
-    bspline_pub_.publish(bspline);
+    bspline_pub_->publish(bspline);
 
     return true;
   }
