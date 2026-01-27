@@ -20,7 +20,7 @@ int traj_id_;
 
 // yaw control
 double last_yaw_, last_yaw_dot_;
-double time_forward_;
+double time_forward_ = 0.5;
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
@@ -46,12 +46,12 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 
   // parse yaw traj
 
-  Eigen::MatrixXd yaw_pts(msg->yaw_pts.size(), 1);
-  for (int i = 0; i < msg->yaw_pts.size(); ++i) {
-    yaw_pts(i, 0) = msg->yaw_pts[i];
-  }
+  // Eigen::MatrixXd yaw_pts(msg->yaw_pts.size(), 1);
+  // for (int i = 0; i < msg->yaw_pts.size(); ++i) {
+  //   yaw_pts(i, 0) = msg->yaw_pts[i];
+  // }
 
-  UniformBspline yaw_traj(yaw_pts, msg->order, msg->yaw_dt);
+  // UniformBspline yaw_traj(yaw_pts, msg->order, msg->yaw_dt);
 
   start_time_ = msg->start_time;
   traj_id_ = msg->traj_id;
@@ -66,33 +66,39 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   receive_traj_ = true;
 }
 
-std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &_, rclcpp::Time &time_now, rclcpp::Time &time_last)
+// 计算当前时刻的期望偏航角及偏航角速度
+std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclcpp::Time &time_now, rclcpp::Time &time_last)
 {
-  constexpr double PI = 3.1415926;
-  constexpr double YAW_DOT_MAX_PER_SEC = PI;
-  // constexpr double YAW_DOT_DOT_MAX_PER_SEC = PI;
-  std::pair<double, double> yaw_yawdot(0, 0);
-  double yaw = 0;
-  double yawdot = 0;
+  constexpr double PI = 3.1415926;                 // 圆周率
+  constexpr double YAW_DOT_MAX_PER_SEC = PI;         // 最大偏航角速度（rad/s）
+  // constexpr double YAW_DOT_DOT_MAX_PER_SEC = PI; // 最大偏航角加速度（未使用）
+  std::pair<double, double> yaw_yawdot(0, 0);      // 返回的偏航角与偏航角速度
+  double yaw = 0;                                    // 当前偏航角
+  double yawdot = 0;                                 // 当前偏航角速度
 
-  Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_ ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - _ : traj_[0].evaluateDeBoorT(traj_duration_) - _;
-  double yaw_temp = dir.norm() > 0.1 ? atan2(dir(1), dir(0)) : last_yaw_;
+  // 计算前瞻方向向量：若未超出轨迹时长，则取前瞻点；否则取终点
+  Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_
+                          ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos
+                          : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
+  // 若方向向量足够长，则计算目标偏航角；否则沿用上一时刻偏航角
+  double yaw_temp = dir.norm() > 0.001 ? atan2(dir(1), dir(0)) : last_yaw_;
+  // 根据时间差计算本周期允许的最大偏航角变化量
   double max_yaw_change = YAW_DOT_MAX_PER_SEC * (time_now - time_last).seconds();
+
+  // 处理跨越 ±PI 的跳变，确保角度平滑过渡
   if (yaw_temp - last_yaw_ > PI)
   {
     if (yaw_temp - last_yaw_ - 2 * PI < -max_yaw_change)
     {
       yaw = last_yaw_ - max_yaw_change;
-      if (yaw < -PI)
-        yaw += 2 * PI;
-
+      if (yaw < -PI) yaw += 2 * PI;  // 归一化到 [-PI, PI]
       yawdot = -YAW_DOT_MAX_PER_SEC;
     }
     else
     {
       yaw = yaw_temp;
       if (yaw - last_yaw_ > PI)
-        yawdot = -YAW_DOT_MAX_PER_SEC;
+        yawdot = -YAW_DOT_MAX_PER_SEC;  // 反向旋转最快
       else
         yawdot = (yaw_temp - last_yaw_) / (time_now - time_last).seconds();
     }
@@ -102,36 +108,31 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &_, rclcpp
     if (yaw_temp - last_yaw_ + 2 * PI > max_yaw_change)
     {
       yaw = last_yaw_ + max_yaw_change;
-      if (yaw > PI)
-        yaw -= 2 * PI;
-
+      if (yaw > PI) yaw -= 2 * PI;  // 归一化到 [-PI, PI]
       yawdot = YAW_DOT_MAX_PER_SEC;
     }
     else
     {
       yaw = yaw_temp;
       if (yaw - last_yaw_ < -PI)
-        yawdot = YAW_DOT_MAX_PER_SEC;
+        yawdot = YAW_DOT_MAX_PER_SEC;  // 正向旋转最快
       else
         yawdot = (yaw_temp - last_yaw_) / (time_now - time_last).seconds();
     }
   }
   else
   {
+    // 无跨越 ±PI 跳变，直接限制最大角速度
     if (yaw_temp - last_yaw_ < -max_yaw_change)
     {
       yaw = last_yaw_ - max_yaw_change;
-      if (yaw < -PI)
-        yaw += 2 * PI;
-
+      if (yaw < -PI) yaw += 2 * PI;
       yawdot = -YAW_DOT_MAX_PER_SEC;
     }
     else if (yaw_temp - last_yaw_ > max_yaw_change)
     {
       yaw = last_yaw_ + max_yaw_change;
-      if (yaw > PI)
-        yaw -= 2 * PI;
-
+      if (yaw > PI) yaw -= 2 * PI;
       yawdot = YAW_DOT_MAX_PER_SEC;
     }
     else
@@ -146,8 +147,9 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &_, rclcpp
     }
   }
 
+  // 简单低通滤波，使角度与角速度更平滑
   if (fabs(yaw - last_yaw_) <= max_yaw_change)
-    yaw = 0.5 * last_yaw_ + 0.5 * yaw; // nieve LPF
+    yaw = 0.5 * last_yaw_ + 0.5 * yaw;  // 朴素 LPF
   yawdot = 0.5 * last_yaw_dot_ + 0.5 * yawdot;
   last_yaw_ = yaw;
   last_yaw_dot_ = yawdot;

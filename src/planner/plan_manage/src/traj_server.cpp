@@ -48,12 +48,12 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 
   // parse yaw traj
 
-  Eigen::MatrixXd yaw_pts(msg->yaw_pts.size(), 1);
-  for (int i = 0; i < msg->yaw_pts.size(); ++i) {
-    yaw_pts(i, 0) = msg->yaw_pts[i];
-  }
+  // Eigen::MatrixXd yaw_pts(msg->yaw_pts.size(), 1);
+  // for (int i = 0; i < msg->yaw_pts.size(); ++i) {
+  //   yaw_pts(i, 0) = msg->yaw_pts[i];
+  // }
 
-  UniformBspline yaw_traj(yaw_pts, msg->order, msg->yaw_dt);
+  // UniformBspline yaw_traj(yaw_pts, msg->order, msg->yaw_dt);
 
   start_time_ = msg->start_time;
   traj_id_ = msg->traj_id;
