@@ -1,5 +1,6 @@
 #include "bspline_opt/uniform_bspline.h"
 #include "nav_msgs/msg/odometry.hpp"
+#include <px4_msgs/msg/vehicle_odometry.hpp>
 #include "traj_utils/msg/bspline.hpp"
 #include "quadrotor_msgs/msg/position_command.hpp"
 #include "std_msgs/msg/empty.hpp"
@@ -50,7 +51,7 @@ Eigen::Vector3d px4_to_ros2_translation_ = Eigen::Vector3d::Zero();
 
 // Function declarations
 void gazeboOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
-void px4OdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
+void px4OdomCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg);
 void calculateOdometryCompensation();
 void updateCoordinateTransformations();
 Eigen::Vector3d applyPositionCompensation(const Eigen::Vector3d& original_position);
@@ -64,7 +65,7 @@ Eigen::Quaterniond orientation_compensation_ = Eigen::Quaterniond::Identity();
 
 // Subscribers
 rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gazebo_odom_sub_;
-rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr px4_odom_sub_;
+rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr px4_odom_sub_;
 
 // TF buffer and listener
 std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -243,37 +244,60 @@ void gazeboOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
         gazebo_odom_buffer_.pop_front();
     }
     
+    // Print Gazebo position
+    static rclcpp::Node::SharedPtr log_node = rclcpp::Node::make_shared("traj_server_log");
+    // RCLCPP_INFO(log_node->get_logger(), "Gazebo odometry received: position=(%.3f, %.3f, %.3f)",
+    //             odom_data.position(0), odom_data.position(1), odom_data.position(2));
+    
     // Calculate compensation if we have PX4 data
-    calculateOdometryCompensation();
+    if (!px4_odom_buffer_.empty()) {
+        calculateOdometryCompensation();
+    }
 }
 
 // PX4 odometry callback
-void px4OdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+void px4OdomCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg)
 {
+  // Print PX4 position
+    // static rclcpp::Node::SharedPtr log_node = rclcpp::Node::make_shared("traj_server_log");
+    // RCLCPP_INFO(log_node->get_logger(), "PX4 odometry received: position=(%.3f, %.3f, %.3f)",
+    //             msg->position[0], msg->position[1], msg->position[2]);
+
+
     std::lock_guard<std::mutex> lock(odom_mutex_);
     
     OdometryData odom_data;
-    odom_data.timestamp = msg->header.stamp;
+    // Convert timestamp from PX4's uint64_t (microseconds) to rclcpp::Time
+    rclcpp::Time timestamp = rclcpp::Time(msg->timestamp / 1000000, (msg->timestamp % 1000000) * 1000);
+    odom_data.timestamp = timestamp;
+    
+    // PX4 VehicleOdometry uses NED coordinate system
     odom_data.position = Eigen::Vector3d(
-        msg->pose.pose.position.x,
-        msg->pose.pose.position.y,
-        msg->pose.pose.position.z
+        msg->position[0],  // North
+        msg->position[1],  // East
+        msg->position[2]   // Down
     );
+    
+    // PX4 VehicleOdometry uses quaternion in w, x, y, z order
     odom_data.orientation = Eigen::Quaterniond(
-        msg->pose.pose.orientation.w,
-        msg->pose.pose.orientation.x,
-        msg->pose.pose.orientation.y,
-        msg->pose.pose.orientation.z
+        msg->q[0],  // w
+        msg->q[1],  // x
+        msg->q[2],  // y
+        msg->q[3]   // z
     );
+    
+    // Velocity in NED
     odom_data.velocity = Eigen::Vector3d(
-        msg->twist.twist.linear.x,
-        msg->twist.twist.linear.y,
-        msg->twist.twist.linear.z
+        msg->velocity[0],  // North
+        msg->velocity[1],  // East
+        msg->velocity[2]   // Down
     );
+    
+    // Angular velocity in NED
     odom_data.angular_velocity = Eigen::Vector3d(
-        msg->twist.twist.angular.x,
-        msg->twist.twist.angular.y,
-        msg->twist.twist.angular.z
+        msg->angular_velocity[0],  // Roll rate
+        msg->angular_velocity[1],  // Pitch rate
+        msg->angular_velocity[2]   // Yaw rate
     );
     
     // Add to buffer (keep last 10 messages)
@@ -283,7 +307,9 @@ void px4OdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
     }
     
     // Calculate compensation if we have Gazebo data
-    calculateOdometryCompensation();
+    if (!gazebo_odom_buffer_.empty()) {
+        calculateOdometryCompensation();
+    }
 }
 
 // Calculate odometry compensation between Gazebo and PX4
@@ -304,11 +330,26 @@ void calculateOdometryCompensation()
     Eigen::Vector3d gazebo_pos_ros2 = gazebo_to_ros2_rotation_ * gazebo_odom.position + gazebo_to_ros2_translation_;
     Eigen::Vector3d px4_pos_ros2 = px4_to_ros2_rotation_ * px4_odom.position + px4_to_ros2_translation_;
     
+    // Calculate px4 position in gazebo coordinate system
+    Eigen::Vector3d px4_pos_gazebo = gazebo_to_ros2_rotation_.inverse() * (px4_pos_ros2 - gazebo_to_ros2_translation_);
+    
+    // Print compensation info
+    // static rclcpp::Node::SharedPtr log_node = rclcpp::Node::make_shared("traj_server_log");
+    // RCLCPP_INFO(log_node->get_logger(), "Compensation - Gazebo ROS2: (%.3f, %.3f, %.3f), PX4 ROS2: (%.3f, %.3f, %.3f)",
+    //             gazebo_pos_ros2(0), gazebo_pos_ros2(1), gazebo_pos_ros2(2),
+    //             px4_pos_ros2(0), px4_pos_ros2(1), px4_pos_ros2(2));
+    
+    // RCLCPP_INFO(log_node->get_logger(), "Compensation - PX4 in Gazebo frame: (%.3f, %.3f, %.3f)",
+    //             px4_pos_gazebo(0), px4_pos_gazebo(1), px4_pos_gazebo(2));
+    
     Eigen::Quaterniond gazebo_ori_ros2 = Eigen::Quaterniond(gazebo_to_ros2_rotation_) * gazebo_odom.orientation;
     Eigen::Quaterniond px4_ori_ros2 = Eigen::Quaterniond(px4_to_ros2_rotation_) * px4_odom.orientation;
     
     // Calculate position difference
     Eigen::Vector3d position_diff = px4_pos_ros2 - gazebo_pos_ros2;
+    
+    // RCLCPP_INFO(log_node->get_logger(), "Compensation - Position difference: (%.3f, %.3f, %.3f)",
+    //             position_diff(0), position_diff(1), position_diff(2));
     
     // Calculate orientation difference
     Eigen::Quaterniond orientation_diff = px4_ori_ros2 * gazebo_ori_ros2.inverse();
@@ -324,6 +365,12 @@ void calculateOdometryCompensation()
     }
     
     orientation_compensation_ = orientation_compensation_.slerp(1.0 - compensation_alpha_, orientation_diff);
+    
+    // Print current compensation values
+    // RCLCPP_INFO(log_node->get_logger(), "Compensation - Current values: position=(%.3f, %.3f, %.3f), orientation=(x=%.3f, y=%.3f, z=%.3f, w=%.3f)",
+    //             position_compensation_(0), position_compensation_(1), position_compensation_(2),
+    //             orientation_compensation_.x(), orientation_compensation_.y(), 
+    //             orientation_compensation_.z(), orientation_compensation_.w());
 }
 
 // Apply compensation to trajectory position
@@ -500,9 +547,9 @@ int main(int argc, char **argv)
       10,
       gazeboOdomCallback);
 
-  px4_odom_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
+  px4_odom_sub_ = node->create_subscription<px4_msgs::msg::VehicleOdometry>(
       px4_odom_topic,
-      10,
+      rclcpp::QoS(1).best_effort().transient_local(),
       px4OdomCallback);
 
   auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
@@ -529,6 +576,18 @@ int main(int argc, char **argv)
   auto cmd_timer = node->create_wall_timer(
       std::chrono::milliseconds(10),
       cmdCallback);
+
+  // Add timer to calculate compensation every second and print it
+  auto compensation_timer = node->create_wall_timer(
+      std::chrono::seconds(1),
+      [node]() {
+          calculateOdometryCompensation();
+          std::lock_guard<std::mutex> lock(odom_mutex_);
+          RCLCPP_INFO(node->get_logger(), "Odometry compensation: position=(%.3f, %.3f, %.3f), orientation=(x=%.3f, y=%.3f, z=%.3f, w=%.3f)",
+                      position_compensation_(0), position_compensation_(1), position_compensation_(2),
+                      orientation_compensation_.x(), orientation_compensation_.y(), 
+                      orientation_compensation_.z(), orientation_compensation_.w());
+      });
 
   RCLCPP_INFO(node->get_logger(), "Trajectory server started with odometry compensation");
   RCLCPP_INFO(node->get_logger(), "Gazebo odometry topic: %s", gazebo_odom_topic.c_str());

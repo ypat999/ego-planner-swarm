@@ -26,6 +26,7 @@ find_package(cv_bridge REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(px4_msgs REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
@@ -85,7 +86,7 @@ ament_target_dependencies(traj_server
 add_executable(xtd2_traj_server src/xtd2_traj_server.cpp)
 
 ament_target_dependencies(xtd2_traj_server 
-                          rclcpp nav_msgs 
+                          rclcpp nav_msgs px4_msgs 
                           visualization_msgs geometry_msgs 
                           quadrotor_msgs plan_env 
                           path_searching bspline_opt 
