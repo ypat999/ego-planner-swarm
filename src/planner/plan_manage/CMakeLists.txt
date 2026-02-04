@@ -23,6 +23,9 @@ find_package(path_searching REQUIRED)
 find_package(bspline_opt REQUIRED)
 find_package(traj_utils REQUIRED COMPONENTS traj_utils_lib)
 find_package(cv_bridge REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
@@ -86,7 +89,8 @@ ament_target_dependencies(xtd2_traj_server
                           visualization_msgs geometry_msgs 
                           quadrotor_msgs plan_env 
                           path_searching bspline_opt 
-                          traj_utils cv_bridge pcl_conversions)
+                          traj_utils cv_bridge pcl_conversions
+                          tf2 tf2_ros tf2_geometry_msgs)
 
 # Install targets
 install(

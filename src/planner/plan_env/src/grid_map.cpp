@@ -856,48 +856,68 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
   // 将点云从相机坐标系转换到世界坐标系
   pcl::PointCloud<pcl::PointXYZ> world_cloud;
   
-  try
+  // 检查点云是否已经在world frame
+  std::string source_frame = img->header.frame_id;
+  static bool first_time = true;
+  if (source_frame == mp_.frame_id_ or source_frame == "map" or source_frame == "world" or source_frame == "odom")
   {
-    // 使用全局TF2缓冲区（避免重复创建）
-    if (!tf_buffer_) {
-      RCLCPP_ERROR(node_->get_logger(), "TF2缓冲区未初始化，无法进行坐标系转换");
+    if (first_time)
+    {
+      first_time = false;
+      // 点云已经在world frame，不需要转换
+      RCLCPP_INFO(node_->get_logger(), "点云已经在%s坐标系，跳过转换，点数: %zu", 
+                 mp_.frame_id_.c_str(), latest_cloud.points.size());
+    }
+  }
+  else
+  {
+    if (first_time)
+    {
+      first_time = false;
+      RCLCPP_INFO(node_->get_logger(), "尝试将点云从%s转换到%s坐标系，点数: %zu", 
+                 source_frame.c_str(), mp_.frame_id_.c_str(), latest_cloud.points.size());
+    }    
+    try
+    {
+      // 使用全局TF2缓冲区（避免重复创建）
+      if (!tf_buffer_) {
+        RCLCPP_ERROR(node_->get_logger(), "TF2缓冲区未初始化，无法进行坐标系转换");
+        return;
+      }
+      
+      // 获取从相机坐标系到世界坐标系的变换
+      rclcpp::Duration timeout(-500000000, 500000000); // 500毫秒超时
+      geometry_msgs::msg::TransformStamped transform;
+      
+      if (source_frame.empty())
+      {
+        source_frame = "x500_depth_0/StereoOV7251"; // 默认相机坐标系
+      }
+      
+      transform = tf_buffer_->lookupTransform(mp_.frame_id_, source_frame, cloud_time, timeout);
+      
+      // 获取变换矩阵
+      Eigen::Isometry3d transform_matrix = tf2::transformToEigen(transform);
+      
+      // 预分配内存避免重复分配
+      world_cloud.points.resize(latest_cloud.points.size());
+      
+      // 使用PCL的高效转换函数（需要将Eigen::Isometry3d转换为Eigen::Affine3d）
+      Eigen::Affine3d affine_transform(transform_matrix);
+      pcl::transformPointCloud(latest_cloud, world_cloud, affine_transform);
+      
+      RCLCPP_DEBUG(node_->get_logger(), "成功将点云从%s转换到%s坐标系，点数: %zu", 
+                   source_frame.c_str(), mp_.frame_id_.c_str(), world_cloud.points.size());
+      
+      // 使用转换后的世界坐标系点云
+      latest_cloud = world_cloud;
+    }
+    catch (tf2::TransformException &ex)
+    {
+      RCLCPP_ERROR(node_->get_logger(), "TF变换失败: %s，无法处理点云数据", ex.what());
       return;
     }
-    
-    // 获取从相机坐标系到世界坐标系的变换
-    rclcpp::Duration timeout(-500000000, 500000000); // 500毫秒超时
-    geometry_msgs::msg::TransformStamped transform;
-    
-    // 根据点云头信息中的frame_id确定源坐标系
-    std::string source_frame = img->header.frame_id;
-    if (source_frame.empty())
-    {
-      source_frame = "x500_depth_0/StereoOV7251"; // 默认相机坐标系
-    }
-    
-    transform = tf_buffer_->lookupTransform(mp_.frame_id_, source_frame, cloud_time, timeout);
-    
-    // 获取变换矩阵
-    Eigen::Isometry3d transform_matrix = tf2::transformToEigen(transform);
-    
-    // 预分配内存避免重复分配
-    world_cloud.points.resize(latest_cloud.points.size());
-    
-    // 使用PCL的高效转换函数（需要将Eigen::Isometry3d转换为Eigen::Affine3d）
-    Eigen::Affine3d affine_transform(transform_matrix);
-    pcl::transformPointCloud(latest_cloud, world_cloud, affine_transform);
-    
-    RCLCPP_DEBUG(node_->get_logger(), "成功将点云从%s转换到world坐标系，点数: %zu", 
-                 source_frame.c_str(), world_cloud.points.size());
   }
-  catch (tf2::TransformException &ex)
-  {
-    RCLCPP_ERROR(node_->get_logger(), "TF变换失败: %s，无法处理点云数据", ex.what());
-    return;
-  }
-  
-  // 使用转换后的世界坐标系点云
-  latest_cloud = world_cloud;
   
   // 在世界坐标系中重置缓冲区
   this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
