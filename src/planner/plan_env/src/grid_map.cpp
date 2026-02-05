@@ -919,9 +919,9 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
     }
   }
   
-  // 在世界坐标系中重置缓冲区
-  this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
-                    md_.camera_pos_ + mp_.local_update_range_);
+  // 在世界坐标系中重置缓冲区   不重置，保留后方障碍信息
+  // this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
+  //                   md_.camera_pos_ + mp_.local_update_range_);
 
   pcl::PointXYZ pt;
   Eigen::Vector3d p3d, p3d_inf;

@@ -12,6 +12,7 @@ namespace ego_planner
     have_target_ = false;
     have_odom_ = false;
     have_recv_pre_agent_ = false;
+    goal_switch_in_progress_ = false;
 
     node_->declare_parameter("fsm/flight_type", -1);
     node_->declare_parameter("fsm/thresh_replan_time", -1.0);
@@ -473,6 +474,57 @@ namespace ego_planner
 
     RCLCPP_INFO(node_->get_logger(), "✓ 收到有效目标点: 位置(%.2f, %.2f, %.2f)", 
                 msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+
+    // 检查当前状态，如果是正在执行轨迹，需要先重置流程
+    if (exec_state_ != WAIT_TARGET && have_target_)
+    {
+      // 检查是否已经在切换过程中，避免重复切换
+      if (goal_switch_in_progress_)
+      {
+        RCLCPP_WARN(node_->get_logger(), "目标点切换正在进行中，跳过本次请求");
+        return;
+      }
+      
+      RCLCPP_WARN(node_->get_logger(), "检测到新目标点，当前正在执行轨迹，将重置流程并切换到新目标点");
+      
+      // 标记切换过程开始
+      goal_switch_in_progress_ = true;
+      
+      // 记录当前状态用于诊断
+      RCLCPP_INFO(node_->get_logger(), "当前状态: exec_state=%d, have_target=%d, traj_id=%d", 
+                  exec_state_, have_target_, planner_manager_->local_data_.traj_id_);
+      
+      // 执行紧急停止以确保安全
+      if (exec_state_ == EXEC_TRAJ || exec_state_ == REPLAN_TRAJ || exec_state_ == GEN_NEW_TRAJ)
+      {
+        RCLCPP_INFO(node_->get_logger(), "执行紧急停止以确保安全切换");
+        callEmergencyStop(odom_pos_);
+        
+        // 等待紧急停止完成
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      
+      // 重置状态标志
+      have_target_ = false;
+      have_new_target_ = false;
+      
+      // 重置航点索引（如果是预设目标模式）
+      if (target_type_ == TARGET_TYPE::PRESET_TARGET)
+      {
+        wp_id_ = 0;
+      }
+      
+      // 重置到等待目标状态
+      changeFSMExecState(WAIT_TARGET, "NEW_GOAL_RESET");
+      
+      // 等待状态转换完成
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      
+      RCLCPP_INFO(node_->get_logger(), "流程重置完成，准备处理新目标点");
+      
+      // 标记切换过程结束
+      goal_switch_in_progress_ = false;
+    }
 
     init_pt_ = odom_pos_;
 

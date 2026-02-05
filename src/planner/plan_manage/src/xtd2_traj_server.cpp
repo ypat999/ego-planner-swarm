@@ -494,15 +494,18 @@ void cmdCallback()
   }
 
   // 将偏航角转换为四元数
-  Eigen::Quaterniond q_ned;
-  Eigen::AngleAxisd yaw_angle_ned(yaw_yawdot.first + M_PI/2, Eigen::Vector3d::UnitX());
-  q_ned = Eigen::Quaterniond(yaw_angle_ned);
+  // 先在ENU坐标系下构造yaw四元数（绕Z轴）
+  Eigen::Quaterniond q_enu = Eigen::Quaterniond(Eigen::AngleAxisd(yaw_yawdot.first, Eigen::Vector3d::UnitZ()));
 
   // Apply orientation compensation
   {
     std::lock_guard<std::mutex> lock(odom_mutex_);
-    q_ned = applyOrientationCompensation(q_ned);
+    q_enu = applyOrientationCompensation(q_enu);
   }
+
+  // 将ENU坐标系下的四元数转换为NED坐标系
+  Eigen::Quaterniond q_ned = Eigen::Quaterniond(Eigen::AngleAxisd(M_PI/2, Eigen::Vector3d::UnitX())) * q_enu;
+
 
   cmd.position.x = pos_enu(1);      // FLU Y左 -> NED X北
   cmd.position.y = pos_enu(0);      // FLU X前 -> NED Y东
@@ -574,7 +577,7 @@ int main(int argc, char **argv)
   px4_to_ros2_translation_ = Eigen::Vector3d::Zero();
 
   auto cmd_timer = node->create_wall_timer(
-      std::chrono::milliseconds(10),
+      std::chrono::milliseconds(50),
       cmdCallback);
 
   // Add timer to calculate compensation every second and print it
