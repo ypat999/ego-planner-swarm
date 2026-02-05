@@ -1,22 +1,12 @@
 #include "bspline_opt/uniform_bspline.h"
-#include "nav_msgs/msg/odometry.hpp"
-#include <px4_msgs/msg/vehicle_odometry.hpp>
 #include "traj_utils/msg/bspline.hpp"
-#include "quadrotor_msgs/msg/position_command.hpp"
-#include "std_msgs/msg/empty.hpp"
-#include "visualization_msgs/msg/marker.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
 #include <rclcpp/rclcpp.hpp>
-#include <geometry_msgs/msg/transform_stamped.hpp>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/buffer.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <Eigen/Geometry>
-#include <deque>
-#include <mutex>
 
-rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr pos_cmd_pub;
+rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr raw_traj_pub;
 
-geometry_msgs::msg::Pose cmd;
+geometry_msgs::msg::PoseStamped raw_cmd;
 
 using ego_planner::UniformBspline;
 
@@ -29,47 +19,6 @@ int traj_id_;
 // yaw control
 double last_yaw_, last_yaw_dot_;
 double time_forward_ = 0.5;
-
-// Odometry monitoring and compensation
-std::mutex odom_mutex_;
-struct OdometryData {
-    rclcpp::Time timestamp;
-    Eigen::Vector3d position;
-    Eigen::Quaterniond orientation;
-    Eigen::Vector3d velocity;
-    Eigen::Vector3d angular_velocity;
-};
-
-std::deque<OdometryData> gazebo_odom_buffer_;
-std::deque<OdometryData> px4_odom_buffer_;
-
-// Coordinate system alignment parameters
-Eigen::Matrix3d gazebo_to_ros2_rotation_ = Eigen::Matrix3d::Identity();
-Eigen::Matrix3d px4_to_ros2_rotation_ = Eigen::Matrix3d::Identity();
-Eigen::Vector3d gazebo_to_ros2_translation_ = Eigen::Vector3d::Zero();
-Eigen::Vector3d px4_to_ros2_translation_ = Eigen::Vector3d::Zero();
-
-// Function declarations
-void gazeboOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
-void px4OdomCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg);
-void calculateOdometryCompensation();
-void updateCoordinateTransformations();
-Eigen::Vector3d applyPositionCompensation(const Eigen::Vector3d& original_position);
-Eigen::Quaterniond applyOrientationCompensation(const Eigen::Quaterniond& original_orientation);
-
-// Compensation parameters
-bool enable_compensation_ = true;
-double compensation_alpha_ = 0.8;  // Low-pass filter coefficient
-Eigen::Vector3d position_compensation_ = Eigen::Vector3d::Zero();
-Eigen::Quaterniond orientation_compensation_ = Eigen::Quaterniond::Identity();
-
-// Subscribers
-rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gazebo_odom_sub_;
-rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr px4_odom_sub_;
-
-// TF buffer and listener
-std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
@@ -208,237 +157,6 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
 
   return yaw_yawdot;
 }
-
-// Gazebo odometry callback
-void gazeboOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
-{
-    std::lock_guard<std::mutex> lock(odom_mutex_);
-    
-    OdometryData odom_data;
-    odom_data.timestamp = msg->header.stamp;
-    odom_data.position = Eigen::Vector3d(
-        msg->pose.pose.position.x,
-        msg->pose.pose.position.y,
-        msg->pose.pose.position.z
-    );
-    odom_data.orientation = Eigen::Quaterniond(
-        msg->pose.pose.orientation.w,
-        msg->pose.pose.orientation.x,
-        msg->pose.pose.orientation.y,
-        msg->pose.pose.orientation.z
-    );
-    odom_data.velocity = Eigen::Vector3d(
-        msg->twist.twist.linear.x,
-        msg->twist.twist.linear.y,
-        msg->twist.twist.linear.z
-    );
-    odom_data.angular_velocity = Eigen::Vector3d(
-        msg->twist.twist.angular.x,
-        msg->twist.twist.angular.y,
-        msg->twist.twist.angular.z
-    );
-    
-    // Add to buffer (keep last 10 messages)
-    gazebo_odom_buffer_.push_back(odom_data);
-    if (gazebo_odom_buffer_.size() > 10) {
-        gazebo_odom_buffer_.pop_front();
-    }
-    
-    // Print Gazebo position
-    static rclcpp::Node::SharedPtr log_node = rclcpp::Node::make_shared("traj_server_log");
-    // RCLCPP_INFO(log_node->get_logger(), "Gazebo odometry received: position=(%.3f, %.3f, %.3f)",
-    //             odom_data.position(0), odom_data.position(1), odom_data.position(2));
-    
-    // Calculate compensation if we have PX4 data
-    if (!px4_odom_buffer_.empty()) {
-        calculateOdometryCompensation();
-    }
-}
-
-// PX4 odometry callback
-void px4OdomCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg)
-{
-  // Print PX4 position
-    // static rclcpp::Node::SharedPtr log_node = rclcpp::Node::make_shared("traj_server_log");
-    // RCLCPP_INFO(log_node->get_logger(), "PX4 odometry received: position=(%.3f, %.3f, %.3f)",
-    //             msg->position[0], msg->position[1], msg->position[2]);
-
-
-    std::lock_guard<std::mutex> lock(odom_mutex_);
-    
-    OdometryData odom_data;
-    // Convert timestamp from PX4's uint64_t (microseconds) to rclcpp::Time
-    rclcpp::Time timestamp = rclcpp::Time(msg->timestamp / 1000000, (msg->timestamp % 1000000) * 1000);
-    odom_data.timestamp = timestamp;
-    
-    // PX4 VehicleOdometry uses NED coordinate system
-    odom_data.position = Eigen::Vector3d(
-        msg->position[0],  // North
-        msg->position[1],  // East
-        msg->position[2]   // Down
-    );
-    
-    // PX4 VehicleOdometry uses quaternion in w, x, y, z order
-    odom_data.orientation = Eigen::Quaterniond(
-        msg->q[0],  // w
-        msg->q[1],  // x
-        msg->q[2],  // y
-        msg->q[3]   // z
-    );
-    
-    // Velocity in NED
-    odom_data.velocity = Eigen::Vector3d(
-        msg->velocity[0],  // North
-        msg->velocity[1],  // East
-        msg->velocity[2]   // Down
-    );
-    
-    // Angular velocity in NED
-    odom_data.angular_velocity = Eigen::Vector3d(
-        msg->angular_velocity[0],  // Roll rate
-        msg->angular_velocity[1],  // Pitch rate
-        msg->angular_velocity[2]   // Yaw rate
-    );
-    
-    // Add to buffer (keep last 10 messages)
-    px4_odom_buffer_.push_back(odom_data);
-    if (px4_odom_buffer_.size() > 10) {
-        px4_odom_buffer_.pop_front();
-    }
-    
-    // Calculate compensation if we have Gazebo data
-    if (!gazebo_odom_buffer_.empty()) {
-        calculateOdometryCompensation();
-    }
-}
-
-// Calculate odometry compensation between Gazebo and PX4
-void calculateOdometryCompensation()
-{
-    if (gazebo_odom_buffer_.empty() || px4_odom_buffer_.empty()) {
-        return;
-    }
-    
-    // Update coordinate transformations using TF
-    updateCoordinateTransformations();
-    
-    // Get the latest odometry data
-    OdometryData gazebo_odom = gazebo_odom_buffer_.back();
-    OdometryData px4_odom = px4_odom_buffer_.back();
-    
-    // Align coordinate systems
-    Eigen::Vector3d gazebo_pos_ros2 = gazebo_to_ros2_rotation_ * gazebo_odom.position + gazebo_to_ros2_translation_;
-    Eigen::Vector3d px4_pos_ros2 = px4_to_ros2_rotation_ * px4_odom.position + px4_to_ros2_translation_;
-    
-    // Calculate px4 position in gazebo coordinate system
-    Eigen::Vector3d px4_pos_gazebo = gazebo_to_ros2_rotation_.inverse() * (px4_pos_ros2 - gazebo_to_ros2_translation_);
-    
-    // Print compensation info
-    // static rclcpp::Node::SharedPtr log_node = rclcpp::Node::make_shared("traj_server_log");
-    // RCLCPP_INFO(log_node->get_logger(), "Compensation - Gazebo ROS2: (%.3f, %.3f, %.3f), PX4 ROS2: (%.3f, %.3f, %.3f)",
-    //             gazebo_pos_ros2(0), gazebo_pos_ros2(1), gazebo_pos_ros2(2),
-    //             px4_pos_ros2(0), px4_pos_ros2(1), px4_pos_ros2(2));
-    
-    // RCLCPP_INFO(log_node->get_logger(), "Compensation - PX4 in Gazebo frame: (%.3f, %.3f, %.3f)",
-    //             px4_pos_gazebo(0), px4_pos_gazebo(1), px4_pos_gazebo(2));
-    
-    Eigen::Quaterniond gazebo_ori_ros2 = Eigen::Quaterniond(gazebo_to_ros2_rotation_) * gazebo_odom.orientation;
-    Eigen::Quaterniond px4_ori_ros2 = Eigen::Quaterniond(px4_to_ros2_rotation_) * px4_odom.orientation;
-    
-    // Calculate position difference
-    Eigen::Vector3d position_diff = px4_pos_ros2 - gazebo_pos_ros2;
-    
-    // RCLCPP_INFO(log_node->get_logger(), "Compensation - Position difference: (%.3f, %.3f, %.3f)",
-    //             position_diff(0), position_diff(1), position_diff(2));
-    
-    // Calculate orientation difference
-    Eigen::Quaterniond orientation_diff = px4_ori_ros2 * gazebo_ori_ros2.inverse();
-    
-    // Apply low-pass filter to smooth compensation
-    position_compensation_ = compensation_alpha_ * position_compensation_ + (1.0 - compensation_alpha_) * position_diff;
-    
-    // For orientation, use spherical linear interpolation
-    double dot_product = orientation_compensation_.dot(orientation_diff);
-    if (dot_product < 0.0) {
-        orientation_diff = Eigen::Quaterniond(-orientation_diff.w(), -orientation_diff.x(), 
-                                             -orientation_diff.y(), -orientation_diff.z());
-    }
-    
-    orientation_compensation_ = orientation_compensation_.slerp(1.0 - compensation_alpha_, orientation_diff);
-    
-    // Print current compensation values
-    // RCLCPP_INFO(log_node->get_logger(), "Compensation - Current values: position=(%.3f, %.3f, %.3f), orientation=(x=%.3f, y=%.3f, z=%.3f, w=%.3f)",
-    //             position_compensation_(0), position_compensation_(1), position_compensation_(2),
-    //             orientation_compensation_.x(), orientation_compensation_.y(), 
-    //             orientation_compensation_.z(), orientation_compensation_.w());
-}
-
-// Apply compensation to trajectory position
-Eigen::Vector3d applyPositionCompensation(const Eigen::Vector3d& original_position)
-{
-    if (!enable_compensation_) {
-        return original_position;
-    }
-    
-    return original_position + position_compensation_;
-}
-
-// Apply compensation to trajectory orientation
-Eigen::Quaterniond applyOrientationCompensation(const Eigen::Quaterniond& original_orientation)
-{
-    if (!enable_compensation_) {
-        return original_orientation;
-    }
-    
-    return orientation_compensation_ * original_orientation;
-}
-
-// Update coordinate transformations using TF
-void updateCoordinateTransformations()
-{
-    try {
-        // Try to get transformation from Gazebo frame to ROS2 frame
-        geometry_msgs::msg::TransformStamped gazebo_tf;
-        gazebo_tf = tf_buffer_->lookupTransform("world", "gazebo_world", tf2::TimePointZero);
-        
-        Eigen::Quaterniond gazebo_rot(
-            gazebo_tf.transform.rotation.w,
-            gazebo_tf.transform.rotation.x,
-            gazebo_tf.transform.rotation.y,
-            gazebo_tf.transform.rotation.z
-        );
-        gazebo_to_ros2_rotation_ = gazebo_rot.toRotationMatrix();
-        gazebo_to_ros2_translation_ = Eigen::Vector3d(
-            gazebo_tf.transform.translation.x,
-            gazebo_tf.transform.translation.y,
-            gazebo_tf.transform.translation.z
-        );
-    } catch (tf2::TransformException &ex) {
-        // If TF not available, use default transformations
-    }
-    
-    try {
-        // Try to get transformation from PX4 frame to ROS2 frame
-        geometry_msgs::msg::TransformStamped px4_tf;
-        px4_tf = tf_buffer_->lookupTransform("world", "px4_world", tf2::TimePointZero);
-        
-        Eigen::Quaterniond px4_rot(
-            px4_tf.transform.rotation.w,
-            px4_tf.transform.rotation.x,
-            px4_tf.transform.rotation.y,
-            px4_tf.transform.rotation.z
-        );
-        px4_to_ros2_rotation_ = px4_rot.toRotationMatrix();
-        px4_to_ros2_translation_ = Eigen::Vector3d(
-            px4_tf.transform.translation.x,
-            px4_tf.transform.translation.y,
-            px4_tf.transform.translation.z
-        );
-    } catch (tf2::TransformException &ex) {
-        // If TF not available, use default transformations
-    }
-}
-
 void cmdCallback()
 {
   /* no publishing before receive traj_ */
@@ -485,51 +203,32 @@ void cmdCallback()
   }
   time_last = time_now;
 
-  // Apply odometry compensation
-  {
-    std::lock_guard<std::mutex> lock(odom_mutex_);
-    pos_enu = applyPositionCompensation(pos_enu);
-    // Note: Yaw calculation is already done, so we don't apply orientation compensation to yaw
-    // The orientation compensation is applied to the final quaternion conversion below
-  }
-
   // 将偏航角转换为四元数
-  // 先在ENU坐标系下构造yaw四元数（绕Z轴）
+  // 在ENU坐标系下构造yaw四元数（绕Z轴）
   Eigen::Quaterniond q_enu = Eigen::Quaterniond(Eigen::AngleAxisd(yaw_yawdot.first, Eigen::Vector3d::UnitZ()));
 
-  // Apply orientation compensation
-  {
-    std::lock_guard<std::mutex> lock(odom_mutex_);
-    q_enu = applyOrientationCompensation(q_enu);
-  }
-
-  // 将ENU坐标系下的四元数转换为NED坐标系
-  Eigen::Quaterniond q_ned = Eigen::Quaterniond(Eigen::AngleAxisd(M_PI/2, Eigen::Vector3d::UnitX())) * q_enu;
-
-
-  cmd.position.x = pos_enu(1);      // FLU Y左 -> NED X北
-  cmd.position.y = pos_enu(0);      // FLU X前 -> NED Y东
-  cmd.position.z = -pos_enu(2);     // FLU Z上 -> NED Z地（取反）
-
+  // 设置原始Gazebo坐标系下的位置和姿态
+  raw_cmd.header.stamp = time_now;
+  raw_cmd.header.frame_id = "world";
   
-  cmd.orientation.x = q_ned.x();
-  cmd.orientation.y = q_ned.y();
-  cmd.orientation.z = q_ned.z();
-  cmd.orientation.w = q_ned.w();
+  raw_cmd.pose.position.x = pos_enu(0);  // ENU X
+  raw_cmd.pose.position.y = pos_enu(1);  // ENU Y
+  raw_cmd.pose.position.z = pos_enu(2);  // ENU Z
+  
+  raw_cmd.pose.orientation.x = q_enu.x();
+  raw_cmd.pose.orientation.y = q_enu.y();
+  raw_cmd.pose.orientation.z = q_enu.z();
+  raw_cmd.pose.orientation.w = q_enu.w();
 
   last_yaw_ = yaw_yawdot.first;
 
-  pos_cmd_pub->publish(cmd);
+  raw_traj_pub->publish(raw_cmd);
 }
 
 int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
   auto node = rclcpp::Node::make_shared("traj_server");
-
-  // Initialize TF buffer and listener
-  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
-  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
   // Get ROS namespace parameter
   std::string ros_ns;
@@ -541,60 +240,22 @@ int main(int argc, char **argv)
     ros_ns = "";
   }
 
-  // Create odometry subscribers
-  std::string gazebo_odom_topic = "/x500_depth_0/odometry";
-  std::string px4_odom_topic = "/x500_depth_0/fmu/out/vehicle_odometry";
-  
-  gazebo_odom_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
-      gazebo_odom_topic,
-      10,
-      gazeboOdomCallback);
-
-  px4_odom_sub_ = node->create_subscription<px4_msgs::msg::VehicleOdometry>(
-      px4_odom_topic,
-      rclcpp::QoS(1).best_effort().transient_local(),
-      px4OdomCallback);
-
   auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
       "planning/bspline",
       10,
       bsplineCallback);
 
-  pos_cmd_pub = node->create_publisher<geometry_msgs::msg::Pose>(
-      "/xtdrone2/planning/cmd_pose_local_ned",
+  // Publish raw trajectory in Gazebo coordinates
+  raw_traj_pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(
+      "/xtdrone2/planning/raw_trajectory",
       50);
-
-  // Initialize coordinate system transformations
-  // Gazebo to ROS2: typically identity (Gazebo uses ENU, same as ROS2)
-  gazebo_to_ros2_rotation_ = Eigen::Matrix3d::Identity();
-  gazebo_to_ros2_translation_ = Eigen::Vector3d::Zero();
-  
-  // PX4 to ROS2: PX4 uses NED, ROS2 uses ENU
-  // NED to ENU: x_north -> y_east, y_east -> x_north, z_down -> -z_up
-  px4_to_ros2_rotation_ << 0, 1, 0,
-                          1, 0, 0,
-                          0, 0, -1;
-  px4_to_ros2_translation_ = Eigen::Vector3d::Zero();
 
   auto cmd_timer = node->create_wall_timer(
       std::chrono::milliseconds(50),
       cmdCallback);
 
-  // Add timer to calculate compensation every second and print it
-  auto compensation_timer = node->create_wall_timer(
-      std::chrono::seconds(1),
-      [node]() {
-          calculateOdometryCompensation();
-          std::lock_guard<std::mutex> lock(odom_mutex_);
-          RCLCPP_INFO(node->get_logger(), "Odometry compensation: position=(%.3f, %.3f, %.3f), orientation=(x=%.3f, y=%.3f, z=%.3f, w=%.3f)",
-                      position_compensation_(0), position_compensation_(1), position_compensation_(2),
-                      orientation_compensation_.x(), orientation_compensation_.y(), 
-                      orientation_compensation_.z(), orientation_compensation_.w());
-      });
-
-  RCLCPP_INFO(node->get_logger(), "Trajectory server started with odometry compensation");
-  RCLCPP_INFO(node->get_logger(), "Gazebo odometry topic: %s", gazebo_odom_topic.c_str());
-  RCLCPP_INFO(node->get_logger(), "PX4 odometry topic: %s", px4_odom_topic.c_str());
+  RCLCPP_INFO(node->get_logger(), "Trajectory server started - outputting raw Gazebo coordinates");
+  RCLCPP_INFO(node->get_logger(), "Publishing raw trajectory to: /xtdrone2/planning/raw_trajectory");
 
   rclcpp::spin(node);
   rclcpp::shutdown();

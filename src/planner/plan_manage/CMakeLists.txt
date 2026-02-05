@@ -17,16 +17,11 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(quadrotor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
-find_package(nav_msgs REQUIRED)
 find_package(plan_env REQUIRED)
 find_package(path_searching REQUIRED)
 find_package(bspline_opt REQUIRED)
 find_package(traj_utils REQUIRED COMPONENTS traj_utils_lib)
 find_package(cv_bridge REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_ros REQUIRED)
-find_package(tf2_geometry_msgs REQUIRED)
-find_package(px4_msgs REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
@@ -62,11 +57,11 @@ add_executable(ego_planner_node
 # )
 
 ament_target_dependencies(ego_planner_node 
-                          rclcpp nav_msgs visualization_msgs 
+                          rclcpp visualization_msgs 
                           geometry_msgs quadrotor_msgs 
                           plan_env path_searching 
-                          bspline_opt traj_utils 
-                          cv_bridge pcl_conversions )
+                          bspline_opt traj_utils
+                          cv_bridge pcl_conversions)
 
 find_library(TRAJ_UTILS_LIB traj_utils_lib PATHS ${traj_utils_LIBRARY_DIRS})
 
@@ -77,21 +72,22 @@ target_link_libraries(ego_planner_node
 add_executable(traj_server src/traj_server.cpp)
 
 ament_target_dependencies(traj_server 
-                          rclcpp nav_msgs 
+                          rclcpp 
                           visualization_msgs geometry_msgs 
                           quadrotor_msgs plan_env 
                           path_searching bspline_opt 
-                          traj_utils cv_bridge pcl_conversions)
+                          traj_utils
+                          cv_bridge pcl_conversions)
 
 add_executable(xtd2_traj_server src/xtd2_traj_server.cpp)
 
 ament_target_dependencies(xtd2_traj_server 
-                          rclcpp nav_msgs px4_msgs 
+                          rclcpp 
                           visualization_msgs geometry_msgs 
                           quadrotor_msgs plan_env 
                           path_searching bspline_opt 
-                          traj_utils cv_bridge pcl_conversions
-                          tf2 tf2_ros tf2_geometry_msgs)
+                          traj_utils
+                          cv_bridge pcl_conversions)
 
 # Install targets
 install(
