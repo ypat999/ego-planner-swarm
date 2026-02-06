@@ -843,7 +843,13 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
 
   if (latest_cloud.points.size() == 0)
   {
-    RCLCPP_WARN(node_->get_logger(), "点云数据点数为0");
+    static int count_zero_or_rez_ = 0;
+    count_zero_or_rez_++;
+    if (count_zero_or_rez_ % 100 == 0)
+    {
+      RCLCPP_WARN(node_->get_logger(), "点云数据点数为0, 第%d次", count_zero_or_rez_);
+      count_zero_or_rez_ = 1;
+    }
     return;
   }
 
