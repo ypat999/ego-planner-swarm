@@ -5,8 +5,11 @@
 #include <Eigen/Geometry>
 
 rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr raw_traj_pub;
+rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub;
 
 geometry_msgs::msg::PoseStamped raw_cmd;
+geometry_msgs::msg::PoseStamped goal_pose;
+bool have_goal_ = false;
 
 using ego_planner::UniformBspline;
 
@@ -19,7 +22,6 @@ int traj_id_;
 // yaw control
 double last_yaw_, last_yaw_dot_;
 double time_forward_ = 0.5;
-double time_finish_thresh_percent_ = 0.2;
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
@@ -63,6 +65,14 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   traj_duration_ = traj_[0].getTimeSum();
 
   receive_traj_ = true;
+}
+
+void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
+{
+  goal_pose = *msg;
+  have_goal_ = true;
+  RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Received new goal pose: (%.2f, %.2f, %.2f)", 
+              msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
 }
 
 // 计算当前时刻的期望偏航角及偏航角速度
@@ -173,7 +183,7 @@ void cmdCallback()
   std::pair<double, double> yaw_yawdot(0, 0);
 
   static rclcpp::Time time_last = clock.now();
-  if (t_cur < traj_duration_ * (1.0 - time_finish_thresh_percent_) && t_cur >= 0.0)
+  if (t_cur < traj_duration_ && t_cur >= 0.0)
   {
     pos_enu = traj_[0].evaluateDeBoorT(t_cur);
     vel = traj_[1].evaluateDeBoorT(t_cur);
@@ -186,16 +196,41 @@ void cmdCallback()
     double tf = min(traj_duration_, t_cur + time_forward_);
     pos_f = traj_[0].evaluateDeBoorT(tf);
   }
-  else if (t_cur >= traj_duration_ * (1.0 - time_finish_thresh_percent_)   )
+  else if (t_cur >= traj_duration_)
   {
-    /* hover when finish traj_ */
-    pos_enu = traj_[0].evaluateDeBoorT(traj_duration_);
+    /* use goal pose when finish traj_ */
+    if (have_goal_)
+    {
+      // 使用目标点的位置和姿态
+      pos_enu(0) = goal_pose.pose.position.x;
+      pos_enu(1) = goal_pose.pose.position.y;
+      pos_enu(2) = goal_pose.pose.position.z;
+      
+      // 从目标点的四元数中提取偏航角
+      Eigen::Quaterniond q_goal(goal_pose.pose.orientation.w, 
+                               goal_pose.pose.orientation.x, 
+                               goal_pose.pose.orientation.y, 
+                               goal_pose.pose.orientation.z);
+      Eigen::Vector3d euler = q_goal.toRotationMatrix().eulerAngles(0, 1, 2);
+      yaw_yawdot.first = euler(2);
+      yaw_yawdot.second = 0;
+      
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Using goal pose: (%.2f, %.2f, %.2f), yaw: %.2f", 
+                  pos_enu(0), pos_enu(1), pos_enu(2), yaw_yawdot.first);
+    }
+    else
+    {
+      // 如果没有目标点，使用轨迹终点
+      pos_enu = traj_[0].evaluateDeBoorT(traj_duration_);
+      yaw_yawdot.first = last_yaw_;
+      yaw_yawdot.second = 0;
+      
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Using trajectory end point: (%.2f, %.2f, %.2f)", 
+                  pos_enu(0), pos_enu(1), pos_enu(2));
+    }
+    
     vel.setZero();
     acc.setZero();
-
-    yaw_yawdot.first = last_yaw_;
-    yaw_yawdot.second = 0;
-
     pos_f = pos_enu;
   }
   else
@@ -240,10 +275,6 @@ int main(int argc, char **argv)
   node->declare_parameter("traj_server/time_forward", 0.5);
   node->get_parameter("traj_server/time_forward", time_forward_);
   
-  // Get time finish threshold parameter
-  node->declare_parameter("traj_server/time_finish_thresh_percent",0.1);
-  node->get_parameter("traj_server/time_finish_thresh_percent", time_finish_thresh_percent_);
-  
   if (ros_ns.empty()) {
     RCLCPP_WARN(node->get_logger(), "ROS namespace not specified, using default topics");
     ros_ns = "";
@@ -253,6 +284,12 @@ int main(int argc, char **argv)
       "planning/bspline",
       10,
       bsplineCallback);
+
+  // Subscribe to goal pose
+  goal_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>(
+      "/goal_pose_3d",
+      10,
+      goalCallback);
 
   // Publish raw trajectory in Gazebo coordinates
   raw_traj_pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(
@@ -265,6 +302,7 @@ int main(int argc, char **argv)
 
   RCLCPP_INFO(node->get_logger(), "Trajectory server started - outputting raw Gazebo coordinates");
   RCLCPP_INFO(node->get_logger(), "Publishing raw trajectory to: /xtdrone2/planning/raw_trajectory");
+  RCLCPP_INFO(node->get_logger(), "Subscribed to goal pose: /goal_pose_3d");
 
   rclcpp::spin(node);
   rclcpp::shutdown();
