@@ -871,7 +871,8 @@ namespace ego_planner
 
   void EGOReplanFSM::execFSMCallback()
   {
-    exec_timer_->cancel(); // To avoid blockage
+    // 不再取消计时器，避免计时器管理问题
+    // exec_timer_->cancel(); // To avoid blockage
 
     static int fsm_num = 0;
     fsm_num++;
@@ -1038,12 +1039,7 @@ namespace ego_planner
     data_disp_pub_->publish(data_disp_);
 
   force_return:;
-    // exec_timer_.start();
-    if (exec_timer_ && exec_timer_->is_canceled())
-    {
-      // 取消状态下无需重新创建，可以复用现有计时器
-      exec_timer_->reset();
-    }
+    // 不再需要重置计时器，因为我们没有取消它
   }
 
   bool EGOReplanFSM::planFromGlobalTraj(const int trial_times /*=1*/) // zx-todo

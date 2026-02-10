@@ -19,6 +19,7 @@ int traj_id_;
 // yaw control
 double last_yaw_, last_yaw_dot_;
 double time_forward_ = 0.5;
+double time_finish_thresh_percent_ = 0.2;
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
@@ -172,7 +173,7 @@ void cmdCallback()
   std::pair<double, double> yaw_yawdot(0, 0);
 
   static rclcpp::Time time_last = clock.now();
-  if (t_cur < traj_duration_ && t_cur >= 0.0)
+  if (t_cur < traj_duration_ * (1.0 - time_finish_thresh_percent_) && t_cur >= 0.0)
   {
     pos_enu = traj_[0].evaluateDeBoorT(t_cur);
     vel = traj_[1].evaluateDeBoorT(t_cur);
@@ -182,10 +183,10 @@ void cmdCallback()
     yaw_yawdot = calculate_yaw(t_cur, pos_enu, time_now, time_last);
     /*** calculate yaw ***/
 
-    double tf = min(traj_duration_, t_cur + 2.0);
+    double tf = min(traj_duration_, t_cur + time_forward_);
     pos_f = traj_[0].evaluateDeBoorT(tf);
   }
-  else if (t_cur >= traj_duration_)
+  else if (t_cur >= traj_duration_ * (1.0 - time_finish_thresh_percent_)   )
   {
     /* hover when finish traj_ */
     pos_enu = traj_[0].evaluateDeBoorT(traj_duration_);
@@ -234,6 +235,14 @@ int main(int argc, char **argv)
   std::string ros_ns;
   node->declare_parameter("ros_ns", "");
   node->get_parameter("ros_ns", ros_ns);
+
+  //Get time_forward parameter
+  node->declare_parameter("traj_server/time_forward", 0.5);
+  node->get_parameter("traj_server/time_forward", time_forward_);
+  
+  // Get time finish threshold parameter
+  node->declare_parameter("traj_server/time_finish_thresh_percent",0.1);
+  node->get_parameter("traj_server/time_finish_thresh_percent", time_finish_thresh_percent_);
   
   if (ros_ns.empty()) {
     RCLCPP_WARN(node->get_logger(), "ROS namespace not specified, using default topics");
