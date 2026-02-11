@@ -71,7 +71,9 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
 {
   goal_pose = *msg;
   have_goal_ = true;
-  RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Received new goal pose: (%.2f, %.2f, %.2f)", 
+  // 每次收到目标点后，重置轨迹接收标志，确保检查新的轨迹
+  receive_traj_ = false;
+  RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Received new goal pose: (%.2f, %.2f, %.2f), resetting trajectory receive flag", 
               msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
 }
 
@@ -172,7 +174,14 @@ void cmdCallback()
 {
   /* no publishing before receive traj_ */
   if (!receive_traj_)
+  {
+    if (have_goal_)
+    {
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Received goal pose but waiting for trajectory (bspline)...");
+      sleep(0.5);
+    }
     return;
+  }
 
   // 统一时间源
   rclcpp::Clock clock(RCL_ROS_TIME);  
@@ -215,8 +224,8 @@ void cmdCallback()
       yaw_yawdot.first = euler(2);
       yaw_yawdot.second = 0;
       
-      RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Using goal pose: (%.2f, %.2f, %.2f), yaw: %.2f", 
-                  pos_enu(0), pos_enu(1), pos_enu(2), yaw_yawdot.first);
+      // RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Using goal pose: (%.2f, %.2f, %.2f), yaw: %.2f", 
+      //             pos_enu(0), pos_enu(1), pos_enu(2), yaw_yawdot.first);
     }
     else
     {
