@@ -1004,7 +1004,7 @@ namespace ego_planner
           changeFSMExecState(WAIT_TARGET, "FSM");
           goto force_return;
         }
-        else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
+        else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_ && (end_pt_ - pos).norm() > 2.0)
         {
           changeFSMExecState(REPLAN_TRAJ, "FSM");
         }

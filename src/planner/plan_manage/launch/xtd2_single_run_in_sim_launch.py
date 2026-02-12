@@ -1,4 +1,5 @@
 import os
+import platform
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution, PythonExpression
@@ -7,12 +8,19 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 
+# 检查主机名，设置默认namespace
+hostname = platform.node()
+if hostname == 'ywj-B250-D3A':
+    default_namespace = '/x500_depth_0/'
+else:
+    default_namespace = '/'
+
 def generate_launch_description():
     # 定义参数的 LaunchConfiguration
     world_name_arg = DeclareLaunchArgument('world_name', default_value='aruco', description='Name of the world to launch (without .sdf)')
     model_name_arg = DeclareLaunchArgument('model_name', default_value='gz_x500', description='Name of the model to spawn')
     id_arg = DeclareLaunchArgument('id', default_value='0', description='ID of the model to spawn')
-    name_space_arg = DeclareLaunchArgument('namespace', default_value='x500_0', description='ROS namespace for the model')
+    name_space_arg = DeclareLaunchArgument('namespace', default_value=default_namespace, description='ROS namespace for the model')
 
     obj_num = LaunchConfiguration('obj_num', default=10)
     drone_id = LaunchConfiguration('drone_id', default=0)
@@ -82,7 +90,7 @@ def generate_launch_description():
                 'world_name': LaunchConfiguration('world_name'),
                 'model': 'gz_x500_depth',
                 'id': '0',
-                'namespace': 'x500_depth_0',
+                'namespace': LaunchConfiguration('namespace'),
             }.items()
         )
     
@@ -91,14 +99,14 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory('ego_planner'), 'launch', 'xtd2_advanced_param_launch.py')),
         launch_arguments={
-            'xtd_ns': 'x500_depth_0',
+                'xtd_ns': LaunchConfiguration('namespace'),
 
-            'drone_id': drone_id,
-            'map_size_x_': map_size_x,
-            'map_size_y_': map_size_y,
-            'map_size_z_': map_size_z,
-            'odometry_topic': odom_topic,
-            'obj_num_set': obj_num,
+                'drone_id': drone_id,
+                'map_size_x_': map_size_x,
+                'map_size_y_': map_size_y,
+                'map_size_z_': map_size_z,
+                'odometry_topic': odom_topic,
+                'obj_num_set': obj_num,
             
             'camera_pose_topic': 'pcl_render_node/camera_pose',
             'depth_topic': 'pcl_render_node/depth',
@@ -123,7 +131,7 @@ def generate_launch_description():
         name=['drone_', drone_id, '_traj_server'],
         output='screen',
         remappings=[
-            ('/xtdrone2/planning/cmd_pose_local_ned', ['/xtdrone2/', 'x500_depth_0', '/planning/cmd_pose_local_ned']),
+            ('/xtdrone2/planning/cmd_pose_local_ned', ['/xtdrone2/', LaunchConfiguration('namespace'), '/planning/cmd_pose_local_ned']),
             ('planning/bspline', ['drone_', drone_id, '_planning/bspline'])
         ],
         parameters=[
