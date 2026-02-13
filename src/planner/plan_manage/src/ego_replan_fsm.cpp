@@ -1005,6 +1005,7 @@ namespace ego_planner
           goto force_return;
         }
         else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_ && (end_pt_ - pos).norm() > 2.0)
+        // else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
         {
           changeFSMExecState(REPLAN_TRAJ, "FSM");
         }
