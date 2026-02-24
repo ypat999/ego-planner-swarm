@@ -209,7 +209,7 @@ namespace ego_planner
       Eigen::Vector3d pt = optimal_pts.col(i).transpose();
       list.push_back(pt);
     }
-    Eigen::Vector4d color(1, 0, 0, 1);
+    Eigen::Vector4d color(1, 1, 1, 1);
     displayMarkerList(optimal_list_pub, list, 0.15, color, id);
   }
 
