@@ -1,5 +1,6 @@
 #include "bspline_opt/bspline_optimizer.h"
 #include "bspline_opt/gradient_descent_optimizer.h"
+#include <chrono>
 // using namespace std;
 
 namespace ego_planner
@@ -476,6 +477,12 @@ namespace ego_planner
     return control_pts_buf;
   } // namespace ego_planner
 
+// 初始化静态成员变量
+std::chrono::steady_clock::time_point ego_planner::BsplineOptimizer::last_log_time_ = std::chrono::steady_clock::now();
+int ego_planner::BsplineOptimizer::log_count_ = 0;
+const double ego_planner::BsplineOptimizer::LOG_INTERVAL_SECONDS = 2.0;
+const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
+
   /* This function is very similar to check_collision_and_rebound().
    * It was written separately, just because I did it once and it has been running stably since March 2020.
    * But I will merge then someday.*/
@@ -584,7 +591,10 @@ namespace ego_planner
       }
       else
       {
-        RCLCPP_ERROR(rclcpp::get_logger("initControlPoints"), "a star error, force return!");
+        if (shouldLogNow("initControlPoints"))
+        {
+          RCLCPP_WARN(rclcpp::get_logger("initControlPoints"), "WARNING! a star error, force return!");
+        }
         vector<std::pair<int, int>> blank_ret;
         return blank_ret;
       }
@@ -1340,7 +1350,10 @@ namespace ego_planner
         }
         if (j < 0) // fail to get the obs free point
         {
-          RCLCPP_ERROR(rclcpp::get_logger("check_collision_and_rebound"), "ERROR! the drone is in obstacle. This should not happen.");
+          if (shouldLogNow("check_collision_and_rebound"))
+          {
+            RCLCPP_WARN(rclcpp::get_logger("check_collision_and_rebound"), "WARNING! the drone is in obstacle. This should not happen.");
+          }
           in_id = 0;
         }
 
@@ -1382,7 +1395,10 @@ namespace ego_planner
         }
         else
         {
-          RCLCPP_ERROR(rclcpp::get_logger("check_collision_and_rebound"), "a star error");
+          if (shouldLogNow("check_collision_and_rebound"))
+          {
+            RCLCPP_WARN(rclcpp::get_logger("check_collision_and_rebound"), "WARNING! a star error");
+          }
           segment_ids.erase(segment_ids.begin() + i);
           i--;
         }
