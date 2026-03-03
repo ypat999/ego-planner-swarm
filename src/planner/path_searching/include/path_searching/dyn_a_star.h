@@ -6,6 +6,7 @@
 #include <Eigen/Eigen>
 #include <plan_env/grid_map.h>
 #include <queue>
+#include <chrono>
 
 constexpr double inf = 1 >> 20;
 struct GridNode;
@@ -57,8 +58,6 @@ private:
 	inline Eigen::Vector3d Index2Coord(const Eigen::Vector3i &index) const;
 	inline bool Coord2Index(const Eigen::Vector3d &pt, Eigen::Vector3i &idx) const;
 
-	//bool (*checkOccupancyPtr)( const Eigen::Vector3d &pos );
-
 	inline bool checkOccupancy(const Eigen::Vector3d &pos) { return (bool)grid_map_->getInflateOccupancy(pos); }
 
 	std::vector<GridNodePtr> retrievePath(GridNodePtr current);
@@ -74,6 +73,32 @@ private:
 	std::priority_queue<GridNodePtr, std::vector<GridNodePtr>, NodeComparator> openSet_;
 
 	int rounds_{0};
+
+	/* log rate limiting */
+	static std::chrono::steady_clock::time_point last_log_time_;
+	static const double LOG_INTERVAL_SECONDS;
+	static int log_count_;
+	static const int MAX_LOGS_PER_INTERVAL;
+
+	static inline bool shouldLogNow(const char* logger_name)
+	{
+		auto now = std::chrono::steady_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time_).count();
+		
+		if (elapsed < LOG_INTERVAL_SECONDS * 1000)
+		{
+			return false;
+		}
+		
+		if (log_count_ >= MAX_LOGS_PER_INTERVAL)
+		{
+			return false;
+		}
+		
+		last_log_time_ = now;
+		log_count_++;
+		return true;
+	}
 
 public:
 	typedef std::shared_ptr<AStar> Ptr;
@@ -104,7 +129,10 @@ inline bool AStar::Coord2Index(const Eigen::Vector3d &pt, Eigen::Vector3i &idx) 
 
 	if (idx(0) < 0 || idx(0) >= POOL_SIZE_(0) || idx(1) < 0 || idx(1) >= POOL_SIZE_(1) || idx(2) < 0 || idx(2) >= POOL_SIZE_(2))
 	{
-		RCLCPP_ERROR(rclcpp::get_logger("Coord2Index"), "Ran out of pool, index=%d %d %d, POOL_SIZE=%d %d %d", idx(0), idx(1), idx(2),POOL_SIZE_(0), POOL_SIZE_(1), POOL_SIZE_(2));
+		if (shouldLogNow("Coord2Index"))
+		{
+			RCLCPP_ERROR(rclcpp::get_logger("Coord2Index"), "Ran out of pool, index=%d %d %d, POOL_SIZE=%d %d %d", idx(0), idx(1), idx(2),POOL_SIZE_(0), POOL_SIZE_(1), POOL_SIZE_(2));
+		}
 		return false;
 	}
 

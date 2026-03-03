@@ -130,7 +130,10 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
     Vector3i start_idx, end_idx;
     if (!ConvertToIndexAndAdjustStartEndPoints(start_pt, end_pt, start_idx, end_idx))
     {
-        RCLCPP_ERROR(rclcpp::get_logger("AstarSearch"), "Unable to handle the initial or end point, force return!");
+        if (shouldLogNow("AstarSearch"))
+        {
+            RCLCPP_WARN(rclcpp::get_logger("AstarSearch"), "WARNING! Unable to handle the initial or end point, force return!");
+        }
         return false;
     }
 
@@ -259,3 +262,9 @@ vector<Vector3d> AStar::getPath()
     reverse(path.begin(), path.end());
     return path;
 }
+
+// 初始化静态成员变量
+std::chrono::steady_clock::time_point AStar::last_log_time_ = std::chrono::steady_clock::now();
+int AStar::log_count_ = 0;
+const double AStar::LOG_INTERVAL_SECONDS = 2.0;
+const int AStar::MAX_LOGS_PER_INTERVAL = 5;

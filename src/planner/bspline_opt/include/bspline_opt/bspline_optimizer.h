@@ -177,6 +177,36 @@ namespace ego_planner
 
     ControlPoints cps_;
 
+    /* log rate limiting */
+    static std::chrono::steady_clock::time_point last_log_time_;
+    static const double LOG_INTERVAL_SECONDS;
+    static int log_count_;
+    static const int MAX_LOGS_PER_INTERVAL;
+
+    static inline bool shouldLogNow(const char* logger_name)
+    {
+      auto now = std::chrono::steady_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time_).count();
+      
+      // 检查时间间隔
+      if (elapsed < LOG_INTERVAL_SECONDS * 1000)
+      {
+        return false;
+      }
+      
+      // 检查计数限制
+      if (log_count_ >= MAX_LOGS_PER_INTERVAL)
+      {
+        return false;
+      }
+      
+      // 允许输出日志，更新时间戳和计数器
+      last_log_time_ = now;
+      log_count_++;
+      return true;
+    }
+
+  private:
     /* cost function */
     /* calculate each part of cost function with control points q as input */
 
