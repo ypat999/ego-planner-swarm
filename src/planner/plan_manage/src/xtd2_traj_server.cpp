@@ -1,13 +1,14 @@
 #include "bspline_opt/uniform_bspline.h"
 #include "traj_utils/msg/bspline.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/pose.hpp"
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Geometry>
 
-rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr raw_traj_pub;
+rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr raw_traj_pub;
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub;
 
-geometry_msgs::msg::PoseStamped raw_cmd;
+geometry_msgs::msg::Pose raw_cmd;
 geometry_msgs::msg::PoseStamped goal_pose;
 bool have_goal_ = false;
 
@@ -188,18 +189,18 @@ void cmdCallback()
   rclcpp::Time time_now = clock.now();
   double t_cur = (time_now - start_time_).seconds();
 
-  Eigen::Vector3d pos_enu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
+  Eigen::Vector3d pos_flu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
   std::pair<double, double> yaw_yawdot(0, 0);
 
   static rclcpp::Time time_last = clock.now();
   if (t_cur < traj_duration_ && t_cur >= 0.0)
   {
-    pos_enu = traj_[0].evaluateDeBoorT(t_cur);
+    pos_flu = traj_[0].evaluateDeBoorT(t_cur);
     vel = traj_[1].evaluateDeBoorT(t_cur);
     acc = traj_[2].evaluateDeBoorT(t_cur);
 
     /*** calculate yaw ***/
-    yaw_yawdot = calculate_yaw(t_cur, pos_enu, time_now, time_last);
+    yaw_yawdot = calculate_yaw(t_cur, pos_flu, time_now, time_last);
     /*** calculate yaw ***/
 
     double tf = min(traj_duration_, t_cur + time_forward_);
@@ -211,9 +212,9 @@ void cmdCallback()
     if (have_goal_)
     {
       // 使用目标点的位置和姿态
-      pos_enu(0) = goal_pose.pose.position.x;
-      pos_enu(1) = goal_pose.pose.position.y;
-      pos_enu(2) = goal_pose.pose.position.z;
+      pos_flu(0) = goal_pose.pose.position.x;
+      pos_flu(1) = goal_pose.pose.position.y;
+      pos_flu(2) = goal_pose.pose.position.z;
       
       // 从目标点的四元数中提取偏航角
       Eigen::Quaterniond q_goal(goal_pose.pose.orientation.w, 
@@ -225,22 +226,22 @@ void cmdCallback()
       yaw_yawdot.second = 0;
       
       // RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Using goal pose: (%.2f, %.2f, %.2f), yaw: %.2f", 
-      //             pos_enu(0), pos_enu(1), pos_enu(2), yaw_yawdot.first);
+      //             pos_flu(0), pos_flu(1), pos_flu(2), yaw_yawdot.first);
     }
     else
     {
       // 如果没有目标点，使用轨迹终点
-      pos_enu = traj_[0].evaluateDeBoorT(traj_duration_);
+      pos_flu = traj_[0].evaluateDeBoorT(traj_duration_);
       yaw_yawdot.first = last_yaw_;
       yaw_yawdot.second = 0;
       
       RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Using trajectory end point: (%.2f, %.2f, %.2f)", 
-                  pos_enu(0), pos_enu(1), pos_enu(2));
+                  pos_flu(0), pos_flu(1), pos_flu(2));
     }
     
     vel.setZero();
     acc.setZero();
-    pos_f = pos_enu;
+    pos_f = pos_flu;
   }
   else
   {
@@ -249,21 +250,18 @@ void cmdCallback()
   time_last = time_now;
 
   // 将偏航角转换为四元数
-  // 在ENU坐标系下构造yaw四元数（绕Z轴）
-  Eigen::Quaterniond q_enu = Eigen::Quaterniond(Eigen::AngleAxisd(yaw_yawdot.first, Eigen::Vector3d::UnitZ()));
+  // 在flu坐标系下构造yaw四元数（绕Z轴）
+  Eigen::Quaterniond q_flu = Eigen::Quaterniond(Eigen::AngleAxisd(yaw_yawdot.first, Eigen::Vector3d::UnitZ()));
 
   // 设置原始Gazebo坐标系下的位置和姿态
-  raw_cmd.header.stamp = time_now;
-  raw_cmd.header.frame_id = "world";
+  raw_cmd.position.x = pos_flu(0);  // flu X
+  raw_cmd.position.y = pos_flu(1);  // flu Y
+  raw_cmd.position.z = pos_flu(2);  // flu Z
   
-  raw_cmd.pose.position.x = pos_enu(0);  // ENU X
-  raw_cmd.pose.position.y = pos_enu(1);  // ENU Y
-  raw_cmd.pose.position.z = pos_enu(2);  // ENU Z
-  
-  raw_cmd.pose.orientation.x = q_enu.x();
-  raw_cmd.pose.orientation.y = q_enu.y();
-  raw_cmd.pose.orientation.z = q_enu.z();
-  raw_cmd.pose.orientation.w = q_enu.w();
+  raw_cmd.orientation.x = q_flu.x();
+  raw_cmd.orientation.y = q_flu.y();
+  raw_cmd.orientation.z = q_flu.z();
+  raw_cmd.orientation.w = q_flu.w();
 
   last_yaw_ = yaw_yawdot.first;
 
@@ -286,7 +284,7 @@ int main(int argc, char **argv)
   
   if (ros_ns.empty()) {
     RCLCPP_WARN(node->get_logger(), "ROS namespace not specified, using default topics");
-    ros_ns = "";
+    ros_ns = "/";
   }
 
   auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
@@ -301,8 +299,9 @@ int main(int argc, char **argv)
       goalCallback);
 
   // Publish raw trajectory in Gazebo coordinates
-  raw_traj_pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(
-      "/xtdrone2/planning/raw_trajectory",
+  raw_traj_pub = node->create_publisher<geometry_msgs::msg::Pose>(
+      // "/xtdrone2/planning/raw_trajectory",
+      std::string("/xtdrone2") + ros_ns + "cmd_pose_local_flu",
       50);
 
   auto cmd_timer = node->create_wall_timer(
