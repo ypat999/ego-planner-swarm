@@ -5,10 +5,10 @@
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Geometry>
 
-rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr raw_traj_pub;
+rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr raw_traj_pub;
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub;
 
-geometry_msgs::msg::Pose raw_cmd;
+geometry_msgs::msg::PoseStamped raw_cmd;
 geometry_msgs::msg::PoseStamped goal_pose;
 bool have_goal_ = false;
 
@@ -254,14 +254,16 @@ void cmdCallback()
   Eigen::Quaterniond q_flu = Eigen::Quaterniond(Eigen::AngleAxisd(yaw_yawdot.first, Eigen::Vector3d::UnitZ()));
 
   // 设置原始Gazebo坐标系下的位置和姿态
-  raw_cmd.position.x = pos_flu(0);  // flu X
-  raw_cmd.position.y = pos_flu(1);  // flu Y
-  raw_cmd.position.z = pos_flu(2);  // flu Z
+  raw_cmd.header.stamp = time_now;
+  raw_cmd.header.frame_id = "world";
+  raw_cmd.pose.position.x = pos_flu(0);  // flu X
+  raw_cmd.pose.position.y = pos_flu(1);  // flu Y
+  raw_cmd.pose.position.z = pos_flu(2);  // flu Z
   
-  raw_cmd.orientation.x = q_flu.x();
-  raw_cmd.orientation.y = q_flu.y();
-  raw_cmd.orientation.z = q_flu.z();
-  raw_cmd.orientation.w = q_flu.w();
+  raw_cmd.pose.orientation.x = q_flu.x();
+  raw_cmd.pose.orientation.y = q_flu.y();
+  raw_cmd.pose.orientation.z = q_flu.z();
+  raw_cmd.pose.orientation.w = q_flu.w();
 
   last_yaw_ = yaw_yawdot.first;
 
@@ -299,7 +301,7 @@ int main(int argc, char **argv)
       goalCallback);
 
   // Publish raw trajectory in Gazebo coordinates
-  raw_traj_pub = node->create_publisher<geometry_msgs::msg::Pose>(
+  raw_traj_pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(
       // "/xtdrone2/planning/raw_trajectory",
       std::string("/xtdrone2") + ros_ns + "cmd_pose_local_flu",
       50);
