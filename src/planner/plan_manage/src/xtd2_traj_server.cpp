@@ -2,15 +2,26 @@
 #include "traj_utils/msg/bspline.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/pose.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Geometry>
 
 rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr raw_traj_pub;
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub;
+rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub;
 
 geometry_msgs::msg::PoseStamped raw_cmd;
 geometry_msgs::msg::PoseStamped goal_pose;
 bool have_goal_ = false;
+
+// Current drone position and orientation
+Eigen::Vector3d current_pos_ = Eigen::Vector3d::Zero();
+Eigen::Quaterniond current_orientation_ = Eigen::Quaterniond::Identity();
+bool have_odom_ = false;
+
+// Turning state variables
+bool turning_to_goal_ = false;
+double target_yaw_ = 0.0;
 
 using ego_planner::UniformBspline;
 
@@ -26,6 +37,14 @@ double time_forward_ = 0.5;
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
+  // 如果正在转向目标点，收到轨迹后停止转向
+  if (turning_to_goal_)
+  {
+    turning_to_goal_ = false;
+    RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
+                "Received trajectory, stopping turn and continuing with path planning");
+  }
+
   // parse _ traj
 
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
@@ -68,14 +87,59 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   receive_traj_ = true;
 }
 
+void odomCallback(const nav_msgs::msg::Odometry::ConstPtr &msg)
+{
+  current_pos_(0) = msg->pose.pose.position.x;
+  current_pos_(1) = msg->pose.pose.position.y;
+  current_pos_(2) = msg->pose.pose.position.z;
+  
+  current_orientation_ = Eigen::Quaterniond(
+    msg->pose.pose.orientation.w,
+    msg->pose.pose.orientation.x,
+    msg->pose.pose.orientation.y,
+    msg->pose.pose.orientation.z
+  );
+  
+  have_odom_ = true;
+}
+
 void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
 {
   goal_pose = *msg;
   have_goal_ = true;
+  
   // 每次收到目标点后，重置轨迹接收标志，确保检查新的轨迹
   receive_traj_ = false;
-  RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Received new goal pose: (%.2f, %.2f, %.2f), resetting trajectory receive flag", 
-              msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+  
+  // 如果有当前位置信息，立即计算目标角度并开始转向
+  if (have_odom_)
+  {
+    Eigen::Vector3d goal_pos(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    Eigen::Vector3d direction = goal_pos - current_pos_;
+    
+    // 计算目标偏航角（忽略高度差，只考虑水平方向）
+    if (direction.norm() > 0.001)
+    {
+      target_yaw_ = atan2(direction(1), direction(0));
+      turning_to_goal_ = true;
+      
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
+                  "Received new goal pose: (%.2f, %.2f, %.2f), calculating target yaw: %.2f rad (%.2f deg)", 
+                  msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
+                  target_yaw_, target_yaw_ * 180.0 / M_PI);
+    }
+    else
+    {
+      RCLCPP_WARN(rclcpp::get_logger("traj_server"), 
+                  "Goal too close to current position, skipping turn");
+    }
+  }
+  else
+  {
+    RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
+                "Received new goal pose: (%.2f, %.2f, %.2f), waiting for odometry data", 
+                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+  }
 }
 
 // 计算当前时刻的期望偏航角及偏航角速度
@@ -173,13 +237,66 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
 }
 void cmdCallback()
 {
+  // 统一时间源
+  rclcpp::Clock clock(RCL_ROS_TIME);  
+  rclcpp::Time time_now = clock.now();
+  
+  // 如果正在转向目标点，优先处理转向逻辑
+  if (turning_to_goal_ && have_odom_)
+  {
+    // 计算当前偏航角
+    Eigen::Vector3d euler = current_orientation_.toRotationMatrix().eulerAngles(0, 1, 2);
+    double current_yaw = euler(2);
+    
+    // 计算偏航角误差
+    double yaw_error = target_yaw_ - current_yaw;
+    
+    // 处理角度跨越 ±PI 的情况
+    if (yaw_error > M_PI)
+      yaw_error -= 2 * M_PI;
+    else if (yaw_error < -M_PI)
+      yaw_error += 2 * M_PI;
+    
+    // 检查是否已经朝向目标点（误差小于阈值）
+    constexpr double YAW_TOLERANCE = 0.087; // 约5度
+    if (fabs(yaw_error) < YAW_TOLERANCE)
+    {
+      turning_to_goal_ = false;
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
+                  "Turn completed! Current yaw: %.2f°, Target yaw: %.2f°", 
+                  current_yaw * 180.0 / M_PI, target_yaw_ * 180.0 / M_PI);
+    }
+    else
+    {
+      // 发布转向命令：保持当前位置，只改变偏航角
+      raw_cmd.header.stamp = time_now;
+      raw_cmd.header.frame_id = "world";
+      raw_cmd.pose.position.x = current_pos_(0);
+      raw_cmd.pose.position.y = current_pos_(1);
+      raw_cmd.pose.position.z = current_pos_(2);
+      
+      // 使用目标偏航角
+      Eigen::Quaterniond q_flu = Eigen::Quaterniond(Eigen::AngleAxisd(target_yaw_, Eigen::Vector3d::UnitZ()));
+      raw_cmd.pose.orientation.x = q_flu.x();
+      raw_cmd.pose.orientation.y = q_flu.y();
+      raw_cmd.pose.orientation.z = q_flu.z();
+      raw_cmd.pose.orientation.w = q_flu.w();
+      
+      raw_traj_pub->publish(raw_cmd);
+      
+      // 更新last_yaw_以保持一致性
+      last_yaw_ = target_yaw_;
+      
+      return;
+    }
+  }
+  
   /* no publishing before receive traj_ */
   if (!receive_traj_)
   {
     if (have_goal_)
     {
       RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Received goal pose but waiting for trajectory (bspline)...");
-      sleep(1);
     }
     return;
   }
@@ -294,6 +411,12 @@ int main(int argc, char **argv)
       10,
       bsplineCallback);
 
+  // Subscribe to odometry for current position
+  odom_sub = node->create_subscription<nav_msgs::msg::Odometry>(
+      "odom_world",
+      10,
+      odomCallback);
+
   // Subscribe to goal pose
   goal_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>(
       "/goal_pose_3d",
@@ -312,6 +435,7 @@ int main(int argc, char **argv)
 
   RCLCPP_INFO(node->get_logger(), "Trajectory server started - outputting raw Gazebo coordinates");
   RCLCPP_INFO(node->get_logger(), "Publishing raw trajectory to: /xtdrone2/planning/raw_trajectory");
+  RCLCPP_INFO(node->get_logger(), "Subscribed to odometry: odom_world");
   RCLCPP_INFO(node->get_logger(), "Subscribed to goal pose: /goal_pose_3d");
 
   rclcpp::spin(node);
