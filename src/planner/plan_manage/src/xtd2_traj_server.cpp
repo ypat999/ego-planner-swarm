@@ -301,9 +301,7 @@ void cmdCallback()
     return;
   }
 
-  // 统一时间源
-  rclcpp::Clock clock(RCL_ROS_TIME);  
-  rclcpp::Time time_now = clock.now();
+  time_now = clock.now();
   double t_cur = (time_now - start_time_).seconds();
 
   Eigen::Vector3d pos_flu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
