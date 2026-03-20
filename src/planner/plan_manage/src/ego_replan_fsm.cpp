@@ -1,4 +1,7 @@
 #include <ego_planner/ego_replan_fsm.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 namespace ego_planner
 {
@@ -22,6 +25,7 @@ namespace ego_planner
     node_->declare_parameter("fsm/emergency_time", 1.0);
     node_->declare_parameter("fsm/realworld_experiment", false);
     node_->declare_parameter("fsm/fail_safe", true);
+    node_->declare_parameter("fsm/frame_id", "world");
 
     node_->get_parameter("fsm/flight_type", target_type_);
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
@@ -31,6 +35,7 @@ namespace ego_planner
     node_->get_parameter("fsm/emergency_time", emergency_time_);
     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
+    node_->get_parameter("fsm/frame_id", target_frame_);
 
     have_trigger_ = !flag_realworld_experiment_;
 
@@ -64,6 +69,9 @@ namespace ego_planner
 
     safety_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
                                              std::bind(&EGOReplanFSM::checkCollisionCallback, this));
+
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
         "odom_world",
@@ -430,9 +438,39 @@ namespace ego_planner
       return;
     }
 
+    // 使用配置的目标frame
+    std::string target_frame = target_frame_;
+
+    // 检查frame_id，如果不同则进行tf变换
+    geometry_msgs::msg::PoseStamped transformed_msg = *msg;
+    if (msg->header.frame_id != target_frame)
+    {
+      try
+      {
+        geometry_msgs::msg::TransformStamped transform = tf_buffer_->lookupTransform(
+            target_frame, 
+            msg->header.frame_id,
+            msg->header.stamp,
+            rclcpp::Duration::from_seconds(1.0));
+        
+        tf2::doTransform(*msg, transformed_msg, transform);
+        
+        RCLCPP_INFO(node_->get_logger(), "触发信号从frame '%s' 变换到frame '%s': 原始位置(%.2f, %.2f, %.2f) -> 变换后位置(%.2f, %.2f, %.2f)",
+                    msg->header.frame_id.c_str(), target_frame.c_str(),
+                    msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
+                    transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
+      }
+      catch (tf2::TransformException &ex)
+      {
+        RCLCPP_ERROR(node_->get_logger(), "TF变换失败: %s (从 '%s' 到 '%s')", 
+                    ex.what(), msg->header.frame_id.c_str(), target_frame.c_str());
+        return;
+      }
+    }
+
     have_trigger_ = true;
     RCLCPP_INFO(node_->get_logger(), "✓ 收到有效触发信号: 位置(%.2f, %.2f, %.2f)", 
-                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+                transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
     init_pt_ = odom_pos_;
   }
 
@@ -472,8 +510,38 @@ namespace ego_planner
       return;
     }
 
+    // 使用配置的目标frame
+    std::string target_frame = target_frame_;
+
+    // 检查frame_id，如果不同则进行tf变换
+    geometry_msgs::msg::PoseStamped transformed_msg = *msg;
+    if (msg->header.frame_id != target_frame)
+    {
+      try
+      {
+        geometry_msgs::msg::TransformStamped transform = tf_buffer_->lookupTransform(
+            target_frame, 
+            msg->header.frame_id,
+            msg->header.stamp,
+            rclcpp::Duration::from_seconds(1.0));
+        
+        tf2::doTransform(*msg, transformed_msg, transform);
+        
+        RCLCPP_INFO(node_->get_logger(), "目标点从frame '%s' 变换到frame '%s': 原始位置(%.2f, %.2f, %.2f) -> 变换后位置(%.2f, %.2f, %.2f)",
+                    msg->header.frame_id.c_str(), target_frame.c_str(),
+                    msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
+                    transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
+      }
+      catch (tf2::TransformException &ex)
+      {
+        RCLCPP_ERROR(node_->get_logger(), "TF变换失败: %s (从 '%s' 到 '%s')", 
+                    ex.what(), msg->header.frame_id.c_str(), target_frame.c_str());
+        return;
+      }
+    }
+
     RCLCPP_INFO(node_->get_logger(), "✓ 收到有效目标点: 位置(%.2f, %.2f, %.2f)", 
-                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+                transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
 
     // 检查当前状态，如果是正在执行轨迹，需要先重置流程
     if (exec_state_ != WAIT_TARGET && have_target_)
@@ -528,7 +596,7 @@ namespace ego_planner
 
     init_pt_ = odom_pos_;
 
-    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    Eigen::Vector3d end_wp(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
 
     planNextWaypoint(end_wp);
   }
@@ -939,7 +1007,6 @@ namespace ego_planner
 
     case GEN_NEW_TRAJ:
     {
-
       bool success = planFromGlobalTraj(10); // zx-todo
       if (success)
       {
@@ -956,7 +1023,6 @@ namespace ego_planner
 
     case REPLAN_TRAJ:
     {
-
       if (planFromCurrentTraj(1))
       {
         changeFSMExecState(EXEC_TRAJ, "FSM");
@@ -1067,7 +1133,6 @@ namespace ego_planner
 
   bool EGOReplanFSM::planFromCurrentTraj(const int trial_times /*=1*/)
   {
-
     LocalTrajData *info = &planner_manager_->local_data_;
     // ros::Time time_now = ros::Time::now();
     auto time_now = rclcpp::Clock().now();

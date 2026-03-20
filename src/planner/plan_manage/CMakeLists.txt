@@ -26,6 +26,8 @@ find_package(cv_bridge REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -61,7 +63,8 @@ ament_target_dependencies(ego_planner_node
                           geometry_msgs quadrotor_msgs 
                           plan_env path_searching 
                           bspline_opt traj_utils
-                          cv_bridge pcl_conversions)
+                          cv_bridge pcl_conversions
+                          tf2_ros tf2_geometry_msgs)
 
 find_library(TRAJ_UTILS_LIB traj_utils_lib PATHS ${traj_utils_LIBRARY_DIRS})
 

@@ -69,6 +69,7 @@ namespace ego_planner
     bool goal_switch_in_progress_; // 标记目标点切换是否正在进行
     FSM_EXEC_STATE exec_state_;
     int continously_called_times_{0};
+    std::string target_frame_; // 目标坐标系frame_id
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
     Eigen::Quaterniond odom_orient_;
@@ -84,6 +85,8 @@ namespace ego_planner
     /* ROS utils */
     rclcpp::Node::SharedPtr node_;
     rclcpp::TimerBase::SharedPtr exec_timer_, safety_timer_;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
