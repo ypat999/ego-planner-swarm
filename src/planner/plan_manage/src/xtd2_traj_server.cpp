@@ -5,6 +5,9 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Geometry>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr raw_traj_pub;
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub;
@@ -26,6 +29,11 @@ bool have_odom_ = false;
 // Turning state variables
 bool turning_to_goal_ = false;
 double target_yaw_ = 0.0;
+
+// TF transform variables
+std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+std::string target_frame_ = "world"; // 目标坐标系frame_id
 
 using ego_planner::UniformBspline;
 
@@ -109,7 +117,65 @@ void odomCallback(const nav_msgs::msg::Odometry::ConstPtr &msg)
 
 void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
 {
-  Eigen::Vector3d new_goal_pos(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+  // 检查目标点数据的有效性
+  bool data_valid = true;
+  
+  // 检查位置数据
+  if (!std::isfinite(msg->pose.position.x) || !std::isfinite(msg->pose.position.y) || !std::isfinite(msg->pose.position.z))
+  {
+    RCLCPP_WARN(rclcpp::get_logger("traj_server"), "收到无效的目标点位置数据: x=%f, y=%f, z=%f", 
+                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    data_valid = false;
+  }
+  
+  // 检查姿态数据
+  double quat_norm = sqrt(msg->pose.orientation.w * msg->pose.orientation.w +
+                         msg->pose.orientation.x * msg->pose.orientation.x +
+                         msg->pose.orientation.y * msg->pose.orientation.y +
+                         msg->pose.orientation.z * msg->pose.orientation.z);
+  if (fabs(quat_norm - 1.0) > 0.01)
+  {
+    RCLCPP_WARN(rclcpp::get_logger("traj_server"), "收到无效的目标点姿态数据: 四元数范数=%f (期望1.0)", quat_norm);
+    data_valid = false;
+  }
+  
+  if (!data_valid)
+  {
+    RCLCPP_ERROR(rclcpp::get_logger("traj_server"), "目标点数据无效，跳过本次处理");
+    return;
+  }
+
+  // 使用配置的目标frame
+  std::string target_frame = target_frame_;
+
+  // 检查frame_id，如果不同则进行tf变换
+  geometry_msgs::msg::PoseStamped transformed_msg = *msg;
+  if (msg->header.frame_id != target_frame)
+  {
+    try
+    {
+      geometry_msgs::msg::TransformStamped transform = tf_buffer_->lookupTransform(
+          target_frame, 
+          msg->header.frame_id,
+          msg->header.stamp,
+          rclcpp::Duration::from_seconds(1.0));
+      
+      tf2::doTransform(*msg, transformed_msg, transform);
+      
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"), "目标点从frame '%s' 变换到frame '%s': 原始位置(%.2f, %.2f, %.2f) -> 变换后位置(%.2f, %.2f, %.2f)",
+                  msg->header.frame_id.c_str(), target_frame.c_str(),
+                  msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
+                  transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
+    }
+    catch (tf2::TransformException &ex)
+    {
+      RCLCPP_ERROR(rclcpp::get_logger("traj_server"), "TF变换失败: %s (从 '%s' 到 '%s')", 
+                  ex.what(), msg->header.frame_id.c_str(), target_frame.c_str());
+      return;
+    }
+  }
+
+  Eigen::Vector3d new_goal_pos(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
 
   // 检查新目标点是否与当前目标点相同
   if (has_valid_goal_)
@@ -124,7 +190,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
     }
   }
 
-  goal_pose = *msg;
+  goal_pose = transformed_msg;
   have_goal_ = true;
   
   // 更新当前目标点
@@ -147,7 +213,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
       
       RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
                   "Received new goal pose: (%.2f, %.2f, %.2f), calculating target yaw: %.2f rad (%.2f deg)", 
-                  msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
+                  transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z,
                   target_yaw_, target_yaw_ * 180.0 / M_PI);
     }
     else
@@ -160,7 +226,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
   {
     RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
                 "Received new goal pose: (%.2f, %.2f, %.2f), waiting for odometry data", 
-                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+                transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
   }
 }
 
@@ -420,6 +486,14 @@ int main(int argc, char **argv)
   //Get time_forward parameter
   node->declare_parameter("traj_server/time_forward", 0.5);
   node->get_parameter("traj_server/time_forward", time_forward_);
+  
+  // Get target frame parameter
+  node->declare_parameter("traj_server/frame_id", "world");
+  node->get_parameter("traj_server/frame_id", target_frame_);
+  
+  // Initialize TF buffer and listener
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   
   if (ros_ns.empty()) {
     RCLCPP_WARN(node->get_logger(), "ROS namespace not specified, using default topics");

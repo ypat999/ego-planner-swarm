@@ -90,7 +90,8 @@ ament_target_dependencies(xtd2_traj_server
                           quadrotor_msgs plan_env 
                           path_searching bspline_opt 
                           traj_utils
-                          cv_bridge pcl_conversions)
+                          cv_bridge pcl_conversions
+                          tf2_ros tf2_geometry_msgs)
 
 # Install targets
 install(
