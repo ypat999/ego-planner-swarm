@@ -79,6 +79,8 @@ namespace ego_planner
     Eigen::Vector3d local_target_pt_, local_target_vel_;                     // local target state
     std::vector<Eigen::Vector3d> wps_;
     int current_wp_;
+    Eigen::Vector3d current_transformed_goal_; // 记录当前经过TF变换后的实际目标点
+    bool has_valid_goal_{false}; // 标记是否有有效的目标点
 
     bool flag_escape_emergency_;
 

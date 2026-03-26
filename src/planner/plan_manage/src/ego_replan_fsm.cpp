@@ -543,6 +543,19 @@ namespace ego_planner
     RCLCPP_INFO(node_->get_logger(), "✓ 收到有效目标点: 位置(%.2f, %.2f, %.2f)", 
                 transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
 
+    Eigen::Vector3d new_goal(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
+
+    // 检查新目标点是否与当前目标点相同
+    if (has_valid_goal_)
+    {
+      double position_diff = (new_goal - current_transformed_goal_).norm();
+      if (position_diff < 0.01) // 1cm 阈值，认为是同一个点
+      {
+        RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点相同(差异 %.4f m)，忽略本次请求，继续当前状态", position_diff);
+        return;
+      }
+    }
+
     // 检查当前状态，如果是正在执行轨迹，需要先重置流程
     if (exec_state_ != WAIT_TARGET && have_target_)
     {
@@ -575,6 +588,7 @@ namespace ego_planner
       // 重置状态标志
       have_target_ = false;
       have_new_target_ = false;
+      has_valid_goal_ = false; // 重置目标点标记
       
       // 重置航点索引（如果是预设目标模式）
       if (target_type_ == TARGET_TYPE::PRESET_TARGET)
@@ -597,6 +611,10 @@ namespace ego_planner
     init_pt_ = odom_pos_;
 
     Eigen::Vector3d end_wp(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
+
+    // 更新当前目标点
+    current_transformed_goal_ = end_wp;
+    has_valid_goal_ = true;
 
     planNextWaypoint(end_wp);
   }

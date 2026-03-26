@@ -14,6 +14,10 @@ geometry_msgs::msg::PoseStamped raw_cmd;
 geometry_msgs::msg::PoseStamped goal_pose;
 bool have_goal_ = false;
 
+// 记录当前目标点，用于判断重复目标
+Eigen::Vector3d current_goal_pos_ = Eigen::Vector3d::Zero();
+bool has_valid_goal_ = false;
+
 // Current drone position and orientation
 Eigen::Vector3d current_pos_ = Eigen::Vector3d::Zero();
 Eigen::Quaterniond current_orientation_ = Eigen::Quaterniond::Identity();
@@ -105,8 +109,27 @@ void odomCallback(const nav_msgs::msg::Odometry::ConstPtr &msg)
 
 void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
 {
+  Eigen::Vector3d new_goal_pos(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+
+  // 检查新目标点是否与当前目标点相同
+  if (has_valid_goal_)
+  {
+    double position_diff = (new_goal_pos - current_goal_pos_).norm();
+    if (position_diff < 0.01) // 1cm 阈值，认为是同一个点
+    {
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
+                  "New goal pose is the same as current (diff %.4f m), ignoring request, continuing current state", 
+                  position_diff);
+      return;
+    }
+  }
+
   goal_pose = *msg;
   have_goal_ = true;
+  
+  // 更新当前目标点
+  current_goal_pos_ = new_goal_pos;
+  has_valid_goal_ = true;
   
   // 每次收到目标点后，重置轨迹接收标志，确保检查新的轨迹
   receive_traj_ = false;
@@ -114,8 +137,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
   // 如果有当前位置信息，立即计算目标角度并开始转向
   if (have_odom_)
   {
-    Eigen::Vector3d goal_pos(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
-    Eigen::Vector3d direction = goal_pos - current_pos_;
+    Eigen::Vector3d direction = new_goal_pos - current_pos_;
     
     // 计算目标偏航角（忽略高度差，只考虑水平方向）
     if (direction.norm() > 0.001)
