@@ -326,7 +326,7 @@ void cmdCallback()
   {
     if (have_goal_)
     {
-      RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Received goal pose but waiting for trajectory (bspline)...");
+      RCLCPP_DEBUG(rclcpp::get_logger("traj_server"), "Received goal pose but waiting for trajectory (bspline)...");
     }
     return;
   }
