@@ -20,14 +20,14 @@ bool have_goal_ = false;
 // 记录当前目标点，用于判断重复目标
 Eigen::Vector3d current_goal_pos_ = Eigen::Vector3d::Zero();
 bool has_valid_goal_ = false;
+bool goal_near_origin_ = false;
 
 // Current drone position and orientation
 Eigen::Vector3d current_pos_ = Eigen::Vector3d::Zero();
 Eigen::Quaterniond current_orientation_ = Eigen::Quaterniond::Identity();
 bool have_odom_ = false;
 
-// Turning state variables
-bool turning_to_goal_ = false;
+// Target yaw from goal pose orientation
 double target_yaw_ = 0.0;
 
 // TF transform variables
@@ -49,14 +49,6 @@ double time_forward_ = 0.5;
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
-  // 如果正在转向目标点，收到轨迹后停止转向
-  if (turning_to_goal_)
-  {
-    turning_to_goal_ = false;
-    RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
-                "Received trajectory, stopping turn and continuing with path planning");
-  }
-
   // parse _ traj
 
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
@@ -197,37 +189,24 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
   current_goal_pos_ = new_goal_pos;
   has_valid_goal_ = true;
   
+  // 判断目标点是否在原点附近（距离原点0.5m以内）
+  goal_near_origin_ = (new_goal_pos.norm() < 0.5);
+  
   // 每次收到目标点后，重置轨迹接收标志，确保检查新的轨迹
   receive_traj_ = false;
   
-  // 如果有当前位置信息，立即计算目标角度并开始转向
-  if (have_odom_)
-  {
-    Eigen::Vector3d direction = new_goal_pos - current_pos_;
-    
-    // 计算目标偏航角（忽略高度差，只考虑水平方向）
-    if (direction.norm() > 0.001)
-    {
-      target_yaw_ = atan2(direction(1), direction(0));
-      turning_to_goal_ = true;
-      
-      RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
-                  "Received new goal pose: (%.2f, %.2f, %.2f), calculating target yaw: %.2f rad (%.2f deg)", 
-                  transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z,
-                  target_yaw_, target_yaw_ * 180.0 / M_PI);
-    }
-    else
-    {
-      RCLCPP_WARN(rclcpp::get_logger("traj_server"), 
-                  "Goal too close to current position, skipping turn");
-    }
-  }
-  else
-  {
-    RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
-                "Received new goal pose: (%.2f, %.2f, %.2f), waiting for odometry data", 
-                transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
-  }
+  // 从目标点的四元数中提取偏航角，存储到 target_yaw_ 供后续使用
+  Eigen::Quaterniond q_goal(transformed_msg.pose.orientation.w, 
+                           transformed_msg.pose.orientation.x, 
+                           transformed_msg.pose.orientation.y, 
+                           transformed_msg.pose.orientation.z);
+  Eigen::Vector3d euler = q_goal.toRotationMatrix().eulerAngles(0, 1, 2);
+  target_yaw_ = euler(2);
+  
+  RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
+              "Received new goal pose: (%.2f, %.2f, %.2f), target yaw from orientation: %.2f rad (%.2f deg)", 
+              transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z,
+              target_yaw_, target_yaw_ * 180.0 / M_PI);
 }
 
 // 计算当前时刻的期望偏航角及偏航角速度
@@ -235,17 +214,30 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
 {
   constexpr double PI = 3.1415926;                 // 圆周率
   constexpr double YAW_DOT_MAX_PER_SEC = PI / 4;         // 最大偏航角速度（rad/s）
+  constexpr double GOAL_DISTANCE_THRESHOLD = 2.0;        // 目标点距离阈值（米）
   // constexpr double YAW_DOT_DOT_MAX_PER_SEC = PI; // 最大偏航角加速度（未使用）
   std::pair<double, double> yaw_yawdot(0, 0);      // 返回的偏航角与偏航角速度
   double yaw = 0;                                    // 当前偏航角
   double yawdot = 0;                                 // 当前偏航角速度
 
-  // 计算前瞻方向向量：若未超出轨迹时长，则取前瞻点；否则取终点
-  Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_
-                          ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos
-                          : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
-  // 若方向向量足够长，则计算目标偏航角；否则沿用上一时刻偏航角
-  double yaw_temp = dir.norm() > 0.001 ? atan2(dir(1), dir(0)) : last_yaw_;
+  // 计算当前位置到目标点的水平距离（只考虑x和y方向）
+  Eigen::Vector2d pos_xy(pos(0), pos(1));
+  Eigen::Vector2d goal_xy(current_goal_pos_(0), current_goal_pos_(1));
+  double horizontal_distance = (pos_xy - goal_xy).norm();
+
+  // 计算目标偏航角
+  double yaw_temp;
+  if (horizontal_distance <= GOAL_DISTANCE_THRESHOLD && have_goal_) {
+    // 当距离目标点水平距离2m以内时，直接使用预先计算的目标偏航角
+    yaw_temp = target_yaw_;
+  } else {
+    // 否则，使用轨迹的前瞻点计算方向
+    Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_
+              ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos
+              : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
+    yaw_temp = dir.norm() > 0.001 ? atan2(dir(1), dir(0)) : last_yaw_;
+  }
+  
   // 根据时间差计算本周期允许的最大偏航角变化量
   double max_yaw_change = YAW_DOT_MAX_PER_SEC * (time_now - time_last).seconds();
 
@@ -329,56 +321,6 @@ void cmdCallback()
   rclcpp::Clock clock(RCL_ROS_TIME);  
   rclcpp::Time time_now = clock.now();
   
-  // 如果正在转向目标点，优先处理转向逻辑
-  if (turning_to_goal_ && have_odom_)
-  {
-    // 计算当前偏航角
-    Eigen::Vector3d euler = current_orientation_.toRotationMatrix().eulerAngles(0, 1, 2);
-    double current_yaw = euler(2);
-    
-    // 计算偏航角误差
-    double yaw_error = target_yaw_ - current_yaw;
-    
-    // 处理角度跨越 ±PI 的情况
-    if (yaw_error > M_PI)
-      yaw_error -= 2 * M_PI;
-    else if (yaw_error < -M_PI)
-      yaw_error += 2 * M_PI;
-    
-    // 检查是否已经朝向目标点（误差小于阈值）
-    constexpr double YAW_TOLERANCE = 0.087; // 约5度
-    if (fabs(yaw_error) < YAW_TOLERANCE)
-    {
-      turning_to_goal_ = false;
-      RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
-                  "Turn completed! Current yaw: %.2f°, Target yaw: %.2f°", 
-                  current_yaw * 180.0 / M_PI, target_yaw_ * 180.0 / M_PI);
-    }
-    else
-    {
-      // 发布转向命令：保持当前位置，只改变偏航角
-      raw_cmd.header.stamp = time_now;
-      raw_cmd.header.frame_id = "world";
-      raw_cmd.pose.position.x = current_pos_(0);
-      raw_cmd.pose.position.y = current_pos_(1);
-      raw_cmd.pose.position.z = current_pos_(2);
-      
-      // 使用目标偏航角
-      Eigen::Quaterniond q_flu = Eigen::Quaterniond(Eigen::AngleAxisd(target_yaw_, Eigen::Vector3d::UnitZ()));
-      raw_cmd.pose.orientation.x = q_flu.x();
-      raw_cmd.pose.orientation.y = q_flu.y();
-      raw_cmd.pose.orientation.z = q_flu.z();
-      raw_cmd.pose.orientation.w = q_flu.w();
-      
-      raw_traj_pub->publish(raw_cmd);
-      
-      // 更新last_yaw_以保持一致性
-      last_yaw_ = target_yaw_;
-      
-      return;
-    }
-  }
-  
   /* no publishing before receive traj_ */
   if (!receive_traj_)
   {
@@ -414,6 +356,12 @@ void cmdCallback()
     /* use goal pose when finish traj_ */
     if (have_goal_)
     {
+      // 如果目标点在原点附近（距离0.5m以内），不再持续输出该点
+      if (goal_near_origin_)
+      {
+        return;
+      }
+      
       // 使用目标点的位置和姿态
       pos_flu(0) = goal_pose.pose.position.x;
       pos_flu(1) = goal_pose.pose.position.y;

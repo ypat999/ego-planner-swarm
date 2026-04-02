@@ -387,6 +387,10 @@ namespace ego_planner
       have_target_ = true;
       have_new_target_ = true;
 
+      // bspline 成功生成后才标记目标点，避免规划失败时误判重复
+      current_transformed_goal_ = next_wp;
+      has_valid_goal_ = true;
+
       /*** FSM状态转换 ***/
       if (exec_state_ == WAIT_TARGET)
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
@@ -612,10 +616,8 @@ namespace ego_planner
 
     Eigen::Vector3d end_wp(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
 
-    // 更新当前目标点
-    current_transformed_goal_ = end_wp;
-    has_valid_goal_ = true;
-
+    // 不在这里标记目标点，延迟到 planNextWaypoint 中 bspline 成功生成后再标记
+    // 这样如果规划失败，下次收到同一个点不会被误判为重复
     planNextWaypoint(end_wp);
   }
 
