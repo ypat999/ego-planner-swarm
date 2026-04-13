@@ -58,6 +58,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/local_map_margin", 1);
   node_->declare_parameter("grid_map/ground_height", 1.0);
   node_->declare_parameter("grid_map/odom_depth_timeout", 1.0);
+  node_->declare_parameter("grid_map/reset_buffer_enabled", true);
 
   node_->get_parameter("grid_map/resolution", mp_.resolution_);
   node_->get_parameter("grid_map/map_size_x", x_size);
@@ -95,6 +96,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/local_map_margin", mp_.local_map_margin_);
   node_->get_parameter("grid_map/ground_height", mp_.ground_height_);
   node_->get_parameter("grid_map/odom_depth_timeout", mp_.odom_depth_timeout_);
+  node_->get_parameter("grid_map/reset_buffer_enabled", mp_.reset_buffer_enabled_);
 
   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
   {
@@ -925,9 +927,12 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
     }
   }
   
-  // 在世界坐标系中重置缓冲区   不重置，保留后方障碍信息
-  this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
-                    md_.camera_pos_ + mp_.local_update_range_);
+  // 在世界坐标系中重置缓冲区   如果不重置，保留后方障碍信息
+  if (mp_.reset_buffer_enabled_)
+  {
+    this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
+                      md_.camera_pos_ + mp_.local_update_range_);
+  }
 
   pcl::PointXYZ pt;
   Eigen::Vector3d p3d, p3d_inf;

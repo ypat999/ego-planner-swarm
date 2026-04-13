@@ -93,6 +93,9 @@ struct MappingParameters
 
   /* active mapping */
   double unknown_flag_;
+
+  /* buffer reset control */
+  bool reset_buffer_enabled_;
 };
 
 // intermediate mapping data for fusion
