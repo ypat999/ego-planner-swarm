@@ -96,6 +96,10 @@ struct MappingParameters
 
   /* buffer reset control */
   bool reset_buffer_enabled_;
+
+  /* origin safe zone for landing */
+  bool origin_safe_zone_enabled_;
+  Eigen::Vector3d origin_safe_zone_size_;
 };
 
 // intermediate mapping data for fusion
@@ -169,6 +173,7 @@ public:
   // occupancy map management
   void resetBuffer();
   void resetBuffer(Eigen::Vector3d min, Eigen::Vector3d max);
+  void clearOriginSafeZone();
 
   inline void posToIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &id);
   inline void indexToPos(const Eigen::Vector3i &id, Eigen::Vector3d &pos);

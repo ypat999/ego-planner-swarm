@@ -59,6 +59,10 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/ground_height", 1.0);
   node_->declare_parameter("grid_map/odom_depth_timeout", 1.0);
   node_->declare_parameter("grid_map/reset_buffer_enabled", true);
+  node_->declare_parameter("grid_map/origin_safe_zone_enabled", true);
+  node_->declare_parameter("grid_map/origin_safe_zone_size_x", 1.0);
+  node_->declare_parameter("grid_map/origin_safe_zone_size_y", 1.0);
+  node_->declare_parameter("grid_map/origin_safe_zone_size_z", 1.0);
 
   node_->get_parameter("grid_map/resolution", mp_.resolution_);
   node_->get_parameter("grid_map/map_size_x", x_size);
@@ -97,6 +101,10 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/ground_height", mp_.ground_height_);
   node_->get_parameter("grid_map/odom_depth_timeout", mp_.odom_depth_timeout_);
   node_->get_parameter("grid_map/reset_buffer_enabled", mp_.reset_buffer_enabled_);
+  node_->get_parameter("grid_map/origin_safe_zone_enabled", mp_.origin_safe_zone_enabled_);
+  node_->get_parameter("grid_map/origin_safe_zone_size_x", mp_.origin_safe_zone_size_(0));
+  node_->get_parameter("grid_map/origin_safe_zone_size_y", mp_.origin_safe_zone_size_(1));
+  node_->get_parameter("grid_map/origin_safe_zone_size_z", mp_.origin_safe_zone_size_(2));
 
   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
   {
@@ -248,6 +256,66 @@ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
       {
         md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 0;
       }
+}
+
+void GridMap::clearOriginSafeZone()
+{
+  static bool first_call = true;
+  if (first_call)
+  {
+    RCLCPP_DEBUG(node_->get_logger(), 
+                "clearOriginSafeZone called. enabled=%d, size=[%.2f, %.2f, %.2f]",
+                mp_.origin_safe_zone_enabled_,
+                mp_.origin_safe_zone_size_(0),
+                mp_.origin_safe_zone_size_(1),
+                mp_.origin_safe_zone_size_(2));
+    first_call = false;
+  }
+
+  if (!mp_.origin_safe_zone_enabled_)
+    return;
+
+  Eigen::Vector3d origin(0.0, 0.0, 0.0);
+  Eigen::Vector3d min_pos = origin - mp_.origin_safe_zone_size_ / 2.0;
+  Eigen::Vector3d max_pos = origin + mp_.origin_safe_zone_size_ / 2.0;
+
+  min_pos(2) = std::max(min_pos(2), mp_.map_min_boundary_(2));
+  max_pos(2) = std::min(max_pos(2), mp_.map_max_boundary_(2));
+
+  RCLCPP_DEBUG(node_->get_logger(), 
+               "Safe zone range: min=[%.2f, %.2f, %.2f], max=[%.2f, %.2f, %.2f], map_min_z=%.2f, map_max_z=%.2f",
+               min_pos(0), min_pos(1), min_pos(2), 
+               max_pos(0), max_pos(1), max_pos(2),
+               mp_.map_min_boundary_(2), mp_.map_max_boundary_(2));
+
+  Eigen::Vector3i min_id, max_id;
+  posToIndex(min_pos, min_id);
+  posToIndex(max_pos, max_id);
+
+  boundIndex(min_id);
+  boundIndex(max_id);
+
+  int cleared_count = 0;
+  for (int x = min_id(0); x <= max_id(0); ++x)
+    for (int y = min_id(1); y <= max_id(1); ++y)
+      for (int z = min_id(2); z <= max_id(2); ++z)
+      {
+        int idx = toAddress(x, y, z);
+        if (md_.occupancy_buffer_inflate_[idx] != 0 || 
+            md_.occupancy_buffer_[idx] > mp_.clamp_min_log_)
+        {
+          md_.occupancy_buffer_inflate_[idx] = 0;
+          md_.occupancy_buffer_[idx] = mp_.clamp_min_log_;
+          cleared_count++;
+        }
+      }
+
+  if (cleared_count > 0)
+  {
+    RCLCPP_DEBUG(node_->get_logger(), 
+                "Cleared %d occupied voxels in origin safe zone [%.2f, %.2f, %.2f] to [%.2f, %.2f, %.2f]",
+                cleared_count, min_pos(0), min_pos(1), min_pos(2), max_pos(0), max_pos(1), max_pos(2));
+  }
 }
 
 int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
@@ -725,6 +793,8 @@ void GridMap::updateOccupancyCallback()
 {
   if (md_.last_occ_update_time_.seconds() < 1.0)
     md_.last_occ_update_time_ = node_->now();
+
+  clearOriginSafeZone();
 
   if (!md_.occ_need_update_)
   {
