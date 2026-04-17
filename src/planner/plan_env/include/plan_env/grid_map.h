@@ -275,6 +275,8 @@ private:
   uniform_real_distribution<double> rand_noise_;
   normal_distribution<double> rand_noise2_;
   default_random_engine eng_;
+
+  bool is_map_updating_;
 };
 
 /* ============================== definition of inline function

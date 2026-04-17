@@ -970,7 +970,7 @@ namespace ego_planner
       if (!have_odom_)
         cout << "no odom." << endl;
       if (!have_target_)
-        cout << "wait for goal or trigger." << endl;
+        // cout << "wait for goal or trigger." << endl;
       fsm_num = 0;
     }
 

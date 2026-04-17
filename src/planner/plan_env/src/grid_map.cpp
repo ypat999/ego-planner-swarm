@@ -226,6 +226,8 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   // rand_noise2_ = normal_distribution<double>(0, 0.2);
   // random_device rd;
   // eng_ = default_random_engine(rd());
+
+  is_map_updating_ = false;
 }
 
 void GridMap::resetBuffer()
@@ -785,16 +787,17 @@ void GridMap::clearAndInflateLocalMap()
 
 void GridMap::visCallback()
 {
+  if (is_map_updating_)
+    return;
   publishMapInflate(true);
   publishMap();
 }
 
 void GridMap::updateOccupancyCallback()
 {
+  is_map_updating_ = true;
   if (md_.last_occ_update_time_.seconds() < 1.0)
     md_.last_occ_update_time_ = node_->now();
-
-  clearOriginSafeZone();
 
   if (!md_.occ_need_update_)
   {
@@ -808,6 +811,8 @@ void GridMap::updateOccupancyCallback()
                    mp_.odom_depth_timeout_);
       md_.flag_depth_odom_timeout_ = true;
     }
+    clearOriginSafeZone();
+    is_map_updating_ = false;
     return;
   }
   md_.last_occ_update_time_ = node_->now();
@@ -838,6 +843,8 @@ void GridMap::updateOccupancyCallback()
 
   md_.occ_need_update_ = false;
   md_.local_updated_ = false;
+  clearOriginSafeZone();
+  is_map_updating_ = false;
 }
 
 void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,
@@ -1020,6 +1027,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
   max_y = mp_.map_min_boundary_(1);
   max_z = mp_.map_min_boundary_(2);
 
+  is_map_updating_ = true;
   for (size_t i = 0; i < latest_cloud.points.size(); ++i)
   {
     pt = latest_cloud.points[i];
@@ -1091,6 +1099,8 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
         md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
       }
   }
+  clearOriginSafeZone();
+  is_map_updating_ = false;
 }
 
 void GridMap::publishMap()

@@ -89,7 +89,7 @@ namespace ego_planner
 
     if ((start_pt - local_target_pt).norm() < 0.2)
     {
-      cout << "Close to goal" << endl;
+      // cout << "Close to goal" << endl;
       continous_failures_count_++;
       return false;
     }

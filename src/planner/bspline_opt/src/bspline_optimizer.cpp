@@ -1644,7 +1644,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
               //      << cps_.points.col(2).transpose() << "\n"
               //      << cps_.points.col(3).transpose() << "\n"
               //      << cps_.points.col(4).transpose() << endl;
-              RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"), "First 3 control points in obstacles! return false, t=%f", t);
+              RCLCPP_DEBUG(rclcpp::get_logger("rebound_optimize"), "First 3 control points in obstacles! return false, t=%f", t);
               return false;
             }
 
@@ -1725,7 +1725,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
       }
       else
       {
-        RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"), 
+        RCLCPP_DEBUG(rclcpp::get_logger("rebound_optimize"), 
                                         "Solver error. Return = %d, %s. Skip this planning.", result, lbfgs::lbfgs_strerror(result));
         // while (rclcpp::ok());
       }
