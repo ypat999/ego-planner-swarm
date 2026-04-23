@@ -1,19 +1,22 @@
 #include "bspline_opt/uniform_bspline.h"
 #include "traj_utils/msg/bspline.hpp"
+#include "quadrotor_msgs/msg/position_command.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/pose.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "std_msgs/msg/empty.hpp"
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Geometry>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
-rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr raw_traj_pub;
+rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub;
 rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub;
+rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr reset_traj_sub;
 
-geometry_msgs::msg::PoseStamped raw_cmd;
+quadrotor_msgs::msg::PositionCommand pos_cmd;
 geometry_msgs::msg::PoseStamped goal_pose;
 bool have_goal_ = false;
 
@@ -46,6 +49,16 @@ int traj_id_;
 // yaw control
 double last_yaw_, last_yaw_dot_;
 double time_forward_ = 0.5;
+
+void resetTrajCallback(const std_msgs::msg::Empty::ConstPtr msg)
+{
+  if (receive_traj_)
+  {
+    rclcpp::Clock clock(RCL_ROS_TIME);
+    start_time_ = clock.now();
+    RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Trajectory start time reset to now");
+  }
+}
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
@@ -334,6 +347,19 @@ void cmdCallback()
   time_now = clock.now();
   double t_cur = (time_now - start_time_).seconds();
 
+  static double last_t_cur = 0.0;
+  if (t_cur < 0.0 && receive_traj_)
+  {
+    RCLCPP_WARN(rclcpp::get_logger("traj_server"), "Time jump detected (t_cur=%.3f -> last_t_cur=%.3f), adjusting start_time_ to continue trajectory", t_cur, last_t_cur);
+    start_time_ = time_now - rclcpp::Duration::from_seconds(last_t_cur);
+    t_cur = last_t_cur;
+  }
+  
+  if (t_cur >= 0.0 && t_cur < traj_duration_)
+  {
+    last_t_cur = t_cur;
+  }
+
   Eigen::Vector3d pos_flu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
   std::pair<double, double> yaw_yawdot(0, 0);
 
@@ -400,25 +426,29 @@ void cmdCallback()
   }
   time_last = time_now;
 
-  // 将偏航角转换为四元数
-  // 在flu坐标系下构造yaw四元数（绕Z轴）
-  Eigen::Quaterniond q_flu = Eigen::Quaterniond(Eigen::AngleAxisd(yaw_yawdot.first, Eigen::Vector3d::UnitZ()));
+  pos_cmd.header.stamp = time_now;
+  pos_cmd.header.frame_id = "world";
+  pos_cmd.trajectory_flag = quadrotor_msgs::msg::PositionCommand::TRAJECTORY_STATUS_READY;
+  pos_cmd.trajectory_id = traj_id_;
 
-  // 设置原始Gazebo坐标系下的位置和姿态
-  raw_cmd.header.stamp = time_now;
-  raw_cmd.header.frame_id = "world";
-  raw_cmd.pose.position.x = pos_flu(0);  // flu X
-  raw_cmd.pose.position.y = pos_flu(1);  // flu Y
-  raw_cmd.pose.position.z = pos_flu(2);  // flu Z
-  
-  raw_cmd.pose.orientation.x = q_flu.x();
-  raw_cmd.pose.orientation.y = q_flu.y();
-  raw_cmd.pose.orientation.z = q_flu.z();
-  raw_cmd.pose.orientation.w = q_flu.w();
+  pos_cmd.position.x = pos_flu(0);
+  pos_cmd.position.y = pos_flu(1);
+  pos_cmd.position.z = pos_flu(2);
+
+  pos_cmd.velocity.x = vel(0);
+  pos_cmd.velocity.y = vel(1);
+  pos_cmd.velocity.z = vel(2);
+
+  pos_cmd.acceleration.x = acc(0);
+  pos_cmd.acceleration.y = acc(1);
+  pos_cmd.acceleration.z = acc(2);
+
+  pos_cmd.yaw = yaw_yawdot.first;
+  pos_cmd.yaw_dot = yaw_yawdot.second;
 
   last_yaw_ = yaw_yawdot.first;
 
-  raw_traj_pub->publish(raw_cmd);
+  pos_cmd_pub->publish(pos_cmd);
 }
 
 int main(int argc, char **argv)
@@ -465,18 +495,21 @@ int main(int argc, char **argv)
       10,
       goalCallback);
 
-  // Publish raw trajectory in Gazebo coordinates
-  raw_traj_pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(
-      // "/xtdrone2/planning/raw_trajectory",
-      std::string("/xtdrone2") + ros_ns + "cmd_pose_local_flu",
+  pos_cmd_pub = node->create_publisher<quadrotor_msgs::msg::PositionCommand>(
+      std::string("/xtdrone2") + ros_ns + "cmd_trajectory_flu",
       50);
+
+  reset_traj_sub = node->create_subscription<std_msgs::msg::Empty>(
+      std::string("/xtdrone2") + ros_ns + "reset_traj_time",
+      10,
+      resetTrajCallback);
 
   auto cmd_timer = node->create_wall_timer(
       std::chrono::milliseconds(50),
       cmdCallback);
 
-  RCLCPP_INFO(node->get_logger(), "Trajectory server started - outputting raw Gazebo coordinates");
-  RCLCPP_INFO(node->get_logger(), "Publishing raw trajectory to: /xtdrone2/planning/raw_trajectory");
+  RCLCPP_INFO(node->get_logger(), "Trajectory server started - outputting position, velocity, acceleration");
+  RCLCPP_INFO(node->get_logger(), "Publishing trajectory to: /xtdrone2%s cmd_trajectory_flu", ros_ns.c_str());
   RCLCPP_INFO(node->get_logger(), "Subscribed to odometry: odom_world");
   RCLCPP_INFO(node->get_logger(), "Subscribed to goal pose: /goal_pose_3d");
 

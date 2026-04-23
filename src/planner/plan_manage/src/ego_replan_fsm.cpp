@@ -550,16 +550,32 @@ namespace ego_planner
     Eigen::Vector3d new_goal(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
 
     // 检查新目标点是否与当前目标点相同
+    static rclcpp::Time last_plan_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    rclcpp::Time current_time = node_->now();
     if (has_valid_goal_)
     {
       double position_diff = (new_goal - current_transformed_goal_).norm();
       if (position_diff < 0.01) // 1cm 阈值，认为是同一个点
       {
-        RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点相同(差异 %.4f m)，忽略本次请求，继续当前状态", position_diff);
-        return;
+        // 检查距离上次规划的时间，如果超过2秒，允许重新规划
+        double time_since_last_plan = (current_time - last_plan_time).seconds();
+        if (time_since_last_plan < 2.0)
+        {
+          RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点相同(差异 %.4f m)，且距上次规划仅 %.2f 秒，忽略本次请求，继续当前状态", 
+                      position_diff, time_since_last_plan);
+          return;
+        }
+        else
+        {
+          RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点相同(差异 %.4f m)，但距上次规划已超过 %.2f 秒，允许重新规划", 
+                      position_diff, time_since_last_plan);
+        }
       }
     }
 
+    // 更新上次规划时间
+    last_plan_time = current_time;
+    
     // 检查当前状态，如果是正在执行轨迹，需要先重置流程
     if (exec_state_ != WAIT_TARGET && have_target_)
     {
