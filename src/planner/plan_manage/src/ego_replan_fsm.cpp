@@ -23,6 +23,7 @@ namespace ego_planner
     node_->declare_parameter("fsm/planning_horizon", -1.0);
     node_->declare_parameter("fsm/planning_horizen_time", -1.0);
     node_->declare_parameter("fsm/emergency_time", 1.0);
+    node_->declare_parameter("fsm/same_point_replan_time_threshold", 10.0);
     node_->declare_parameter("fsm/realworld_experiment", false);
     node_->declare_parameter("fsm/fail_safe", true);
     node_->declare_parameter("fsm/frame_id", "world");
@@ -33,6 +34,7 @@ namespace ego_planner
     node_->get_parameter("fsm/planning_horizon", planning_horizen_);
     node_->get_parameter("fsm/planning_horizen_time", planning_horizen_time_);
     node_->get_parameter("fsm/emergency_time", emergency_time_);
+    node_->get_parameter("fsm/same_point_replan_time_threshold", same_point_replan_time_threshold_);
     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
     node_->get_parameter("fsm/frame_id", target_frame_);
@@ -557,9 +559,9 @@ namespace ego_planner
       double position_diff = (new_goal - current_transformed_goal_).norm();
       if (position_diff < 0.01) // 1cm 阈值，认为是同一个点
       {
-        // 检查距离上次规划的时间，如果超过2秒，允许重新规划
+        // 检查距离上次规划的时间，如果超过配置的时间阈值，允许重新规划
         double time_since_last_plan = (current_time - last_plan_time).seconds();
-        if (time_since_last_plan < 2.0)
+        if (time_since_last_plan < same_point_replan_time_threshold_)
         {
           RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点相同(差异 %.4f m)，且距上次规划仅 %.2f 秒，忽略本次请求，继续当前状态", 
                       position_diff, time_since_last_plan);
