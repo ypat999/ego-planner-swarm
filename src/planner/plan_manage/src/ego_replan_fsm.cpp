@@ -533,7 +533,7 @@ namespace ego_planner
         
         tf2::doTransform(*msg, transformed_msg, transform);
         
-        RCLCPP_INFO(node_->get_logger(), "目标点从frame '%s' 变换到frame '%s': 原始位置(%.2f, %.2f, %.2f) -> 变换后位置(%.2f, %.2f, %.2f)",
+        RCLCPP_DEBUG(node_->get_logger(), "目标点从frame '%s' 变换到frame '%s': 原始位置(%.2f, %.2f, %.2f) -> 变换后位置(%.2f, %.2f, %.2f)",
                     msg->header.frame_id.c_str(), target_frame.c_str(),
                     msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
                     transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
@@ -546,7 +546,7 @@ namespace ego_planner
       }
     }
 
-    RCLCPP_INFO(node_->get_logger(), "✓ 收到有效目标点: 位置(%.2f, %.2f, %.2f)", 
+    RCLCPP_DEBUG(node_->get_logger(), "✓ 收到有效目标点: 位置(%.2f, %.2f, %.2f)", 
                 transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
 
     Eigen::Vector3d new_goal(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
@@ -563,7 +563,7 @@ namespace ego_planner
         double time_since_last_plan = (current_time - last_plan_time).seconds();
         if (time_since_last_plan < same_point_replan_time_threshold_)
         {
-          RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点相同(差异 %.4f m)，且距上次规划仅 %.2f 秒，忽略本次请求，继续当前状态", 
+          RCLCPP_DEBUG(node_->get_logger(), "新目标点与当前目标点相同(差异 %.4f m)，且距上次规划仅 %.2f 秒，忽略本次请求，继续当前状态", 
                       position_diff, time_since_last_plan);
           return;
         }

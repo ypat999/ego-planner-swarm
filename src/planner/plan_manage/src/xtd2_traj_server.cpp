@@ -167,7 +167,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
       
       tf2::doTransform(*msg, transformed_msg, transform);
       
-      RCLCPP_INFO(rclcpp::get_logger("traj_server"), "目标点从frame '%s' 变换到frame '%s': 原始位置(%.2f, %.2f, %.2f) -> 变换后位置(%.2f, %.2f, %.2f)",
+      RCLCPP_DEBUG(rclcpp::get_logger("traj_server"), "目标点从frame '%s' 变换到frame '%s': 原始位置(%.2f, %.2f, %.2f) -> 变换后位置(%.2f, %.2f, %.2f)",
                   msg->header.frame_id.c_str(), target_frame.c_str(),
                   msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
                   transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
@@ -188,7 +188,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
     double position_diff = (new_goal_pos - current_goal_pos_).norm();
     if (position_diff < 0.01) // 1cm 阈值，认为是同一个点
     {
-      RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
+      RCLCPP_DEBUG(rclcpp::get_logger("traj_server"), 
                   "New goal pose is the same as current (diff %.4f m), ignoring request, continuing current state", 
                   position_diff);
       return;
