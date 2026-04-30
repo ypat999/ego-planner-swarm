@@ -226,7 +226,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
 std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclcpp::Time &time_now, rclcpp::Time &time_last)
 {
   constexpr double PI = 3.1415926;                 // 圆周率
-  constexpr double YAW_DOT_MAX_PER_SEC = PI / 4;         // 最大偏航角速度（rad/s）
+  constexpr double YAW_DOT_MAX_PER_SEC = PI / 2;         // 最大偏航角速度（rad/s）
   constexpr double GOAL_DISTANCE_THRESHOLD = 2.0;        // 目标点距离阈值（米）
   // constexpr double YAW_DOT_DOT_MAX_PER_SEC = PI; // 最大偏航角加速度（未使用）
   std::pair<double, double> yaw_yawdot(0, 0);      // 返回的偏航角与偏航角速度
