@@ -50,6 +50,28 @@ int traj_id_;
 double last_yaw_, last_yaw_dot_;
 double time_forward_ = 0.5;
 
+// Safe zone descent configuration
+bool szd_enabled_ = false;
+double szd_speed_ = 0.5;
+Eigen::Vector3d szd_zone_size_ = Eigen::Vector3d(2.0, 2.0, 2.0);
+double szd_position_threshold_ = 0.05;
+
+// Safe zone descent state
+bool szd_active_ = false;
+enum SZDPhase { SZD_NONE, SZD_HORIZONTAL, SZD_VERTICAL, SZD_DONE };
+SZDPhase szd_phase_ = SZD_NONE;
+Eigen::Vector3d szd_target_ = Eigen::Vector3d::Zero();
+Eigen::Vector3d szd_ref_pos_ = Eigen::Vector3d::Zero();
+bool szd_ref_pos_initialized_ = false;
+
+bool isTargetInSafeZone(const Eigen::Vector3d &target)
+{
+  Eigen::Vector3d half_size = szd_zone_size_ / 2.0;
+  return fabs(target(0)) < half_size(0) &&
+         fabs(target(1)) < half_size(1) &&
+         fabs(target(2)) < half_size(2);
+}
+
 void resetTrajCallback(const std_msgs::msg::Empty::ConstPtr msg)
 {
   if (receive_traj_)
@@ -204,10 +226,32 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
   
   // 判断目标点是否在原点附近（距离原点0.5m以内）
   goal_near_origin_ = (new_goal_pos.norm() < 0.5);
-  
-  // 每次收到目标点后，重置轨迹接收标志，确保检查新的轨迹
-  receive_traj_ = false;
-  
+
+  // Safe zone descent check
+  if (szd_enabled_ && isTargetInSafeZone(new_goal_pos))
+  {
+    szd_active_ = true;
+    szd_phase_ = SZD_HORIZONTAL;
+    szd_target_ = new_goal_pos;
+    szd_ref_pos_initialized_ = false;
+    receive_traj_ = false;
+    RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                "Target (%.2f, %.2f, %.2f) is in safe zone, activating safe zone descent mode (speed=%.2f)",
+                new_goal_pos(0), new_goal_pos(1), new_goal_pos(2), szd_speed_);
+  }
+  else
+  {
+    if (szd_active_)
+    {
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                  "Target (%.2f, %.2f, %.2f) is outside safe zone, deactivating safe zone descent mode",
+                  new_goal_pos(0), new_goal_pos(1), new_goal_pos(2));
+      szd_active_ = false;
+      szd_phase_ = SZD_NONE;
+    }
+    receive_traj_ = false;
+  }
+
   // 从目标点的四元数中提取偏航角，存储到 target_yaw_ 供后续使用
   Eigen::Quaterniond q_goal(transformed_msg.pose.orientation.w, 
                            transformed_msg.pose.orientation.x, 
@@ -330,10 +374,102 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
 }
 void cmdCallback()
 {
-  // 统一时间源
-  rclcpp::Clock clock(RCL_ROS_TIME);  
+  rclcpp::Clock clock(RCL_ROS_TIME);
   rclcpp::Time time_now = clock.now();
-  
+
+  if (szd_active_ && have_odom_)
+  {
+    double dt = 0.05;
+
+    if (!szd_ref_pos_initialized_)
+    {
+      szd_ref_pos_ = current_pos_;
+      szd_ref_pos_initialized_ = true;
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                  "Safe zone descent: starting from (%.2f, %.2f, %.2f) to (%.2f, %.2f, %.2f)",
+                  current_pos_(0), current_pos_(1), current_pos_(2),
+                  szd_target_(0), szd_target_(1), szd_target_(2));
+    }
+
+    Eigen::Vector3d pos_flu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero());
+
+    if (szd_phase_ == SZD_HORIZONTAL)
+    {
+      Eigen::Vector3d target(szd_target_(0), szd_target_(1), szd_ref_pos_(2));
+      Eigen::Vector3d dir = target - szd_ref_pos_;
+      double dist = dir.norm();
+
+      if (dist < szd_position_threshold_)
+      {
+        szd_ref_pos_ = target;
+        szd_phase_ = SZD_VERTICAL;
+        RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                    "Safe zone descent: horizontal phase complete at (%.2f, %.2f, %.2f), starting vertical descent to z=%.2f",
+                    szd_ref_pos_(0), szd_ref_pos_(1), szd_ref_pos_(2), szd_target_(2));
+      }
+      else
+      {
+        dir.normalize();
+        double step = min(szd_speed_ * dt, dist);
+        szd_ref_pos_ += dir * step;
+        vel = dir * szd_speed_;
+      }
+      pos_flu = szd_ref_pos_;
+    }
+    else if (szd_phase_ == SZD_VERTICAL)
+    {
+      Eigen::Vector3d target = szd_target_;
+      Eigen::Vector3d dir = target - szd_ref_pos_;
+      double dist = dir.norm();
+
+      if (dist < szd_position_threshold_)
+      {
+        szd_ref_pos_ = target;
+        szd_phase_ = SZD_DONE;
+        RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                    "Safe zone descent: vertical descent complete, reached target (%.2f, %.2f, %.2f)",
+                    szd_target_(0), szd_target_(1), szd_target_(2));
+      }
+      else
+      {
+        dir.normalize();
+        double step = min(szd_speed_ * dt, dist);
+        szd_ref_pos_ += dir * step;
+        vel = dir * szd_speed_;
+      }
+      pos_flu = szd_ref_pos_;
+    }
+    else
+    {
+      pos_flu = szd_target_;
+      vel.setZero();
+      acc.setZero();
+    }
+
+    pos_cmd.header.stamp = time_now;
+    pos_cmd.header.frame_id = "world";
+    pos_cmd.trajectory_flag = quadrotor_msgs::msg::PositionCommand::TRAJECTORY_STATUS_READY;
+    pos_cmd.trajectory_id = traj_id_;
+
+    pos_cmd.position.x = pos_flu(0);
+    pos_cmd.position.y = pos_flu(1);
+    pos_cmd.position.z = pos_flu(2);
+
+    pos_cmd.velocity.x = vel(0);
+    pos_cmd.velocity.y = vel(1);
+    pos_cmd.velocity.z = vel(2);
+
+    pos_cmd.acceleration.x = acc(0);
+    pos_cmd.acceleration.y = acc(1);
+    pos_cmd.acceleration.z = acc(2);
+
+    pos_cmd.yaw = last_yaw_;
+    pos_cmd.yaw_dot = 0;
+
+    pos_cmd_pub->publish(pos_cmd);
+    return;
+  }
+
   /* no publishing before receive traj_ */
   if (!receive_traj_)
   {
@@ -468,6 +604,20 @@ int main(int argc, char **argv)
   // Get target frame parameter
   node->declare_parameter("traj_server/frame_id", "world");
   node->get_parameter("traj_server/frame_id", target_frame_);
+
+  // Safe zone descent parameters
+  node->declare_parameter("safe_zone_descent/enabled", false);
+  node->get_parameter("safe_zone_descent/enabled", szd_enabled_);
+  node->declare_parameter("safe_zone_descent/speed", 0.5);
+  node->get_parameter("safe_zone_descent/speed", szd_speed_);
+  node->declare_parameter("safe_zone_descent/zone_size_x", 2.0);
+  node->get_parameter("safe_zone_descent/zone_size_x", szd_zone_size_(0));
+  node->declare_parameter("safe_zone_descent/zone_size_y", 2.0);
+  node->get_parameter("safe_zone_descent/zone_size_y", szd_zone_size_(1));
+  node->declare_parameter("safe_zone_descent/zone_size_z", 2.0);
+  node->get_parameter("safe_zone_descent/zone_size_z", szd_zone_size_(2));
+  node->declare_parameter("safe_zone_descent/position_threshold", 0.05);
+  node->get_parameter("safe_zone_descent/position_threshold", szd_position_threshold_);
   
   // Initialize TF buffer and listener
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
@@ -512,6 +662,9 @@ int main(int argc, char **argv)
   RCLCPP_INFO(node->get_logger(), "Publishing trajectory to: /xtdrone2%s cmd_trajectory_flu", ros_ns.c_str());
   RCLCPP_INFO(node->get_logger(), "Subscribed to odometry: odom_world");
   RCLCPP_INFO(node->get_logger(), "Subscribed to goal pose: /goal_pose_3d");
+  RCLCPP_INFO(node->get_logger(), "Safe zone descent: enabled=%s, speed=%.2f m/s, zone_size=[%.2f, %.2f, %.2f], threshold=%.3f",
+              szd_enabled_ ? "true" : "false", szd_speed_,
+              szd_zone_size_(0), szd_zone_size_(1), szd_zone_size_(2), szd_position_threshold_);
 
   rclcpp::spin(node);
   rclcpp::shutdown();
