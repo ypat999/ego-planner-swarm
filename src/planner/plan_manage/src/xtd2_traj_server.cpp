@@ -68,6 +68,7 @@ bool szd_ref_pos_initialized_ = false;
 
 // Safe zone descent yaw control
 double szd_current_yaw_ = 0.0;
+double szd_target_yaw_ = 0.0;
 double szd_yaw_speed_ = 1.0;
 constexpr double SZD_YAW_THRESHOLD = 0.02;
 
@@ -84,6 +85,13 @@ bool isTargetInSafeZone(const Eigen::Vector3d &target)
   return fabs(target(0)) < half_size(0) &&
          fabs(target(1)) < half_size(1) &&
          fabs(target(2)) < half_size(2);
+}
+
+double normalizeAngle(double angle)
+{
+  while (angle > M_PI) angle -= 2 * M_PI;
+  while (angle < -M_PI) angle += 2 * M_PI;
+  return angle;
 }
 
 void resetTrajCallback(const std_msgs::msg::Empty::ConstPtr msg)
@@ -423,7 +431,8 @@ void cmdCallback()
       szd_ref_pos_initialized_ = true;
       
       Eigen::Vector3d euler = current_orientation_.toRotationMatrix().eulerAngles(0, 1, 2);
-      szd_current_yaw_ = euler(2);
+      szd_current_yaw_ = normalizeAngle(euler(2));
+      szd_target_yaw_ = normalizeAngle(target_yaw_);
       
       RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                   "Safe zone descent: starting from (%.2f, %.2f, %.2f) to (%.2f, %.2f, %.2f)",
@@ -432,7 +441,7 @@ void cmdCallback()
       RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                   "Safe zone descent: initial yaw %.2f rad (%.2f deg), target yaw %.2f rad (%.2f deg)",
                   szd_current_yaw_, szd_current_yaw_ * 180.0 / M_PI,
-                  target_yaw_, target_yaw_ * 180.0 / M_PI);
+                  szd_target_yaw_, szd_target_yaw_ * 180.0 / M_PI);
     }
 
     Eigen::Vector3d pos_flu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero());
@@ -445,14 +454,12 @@ void cmdCallback()
       Eigen::Vector3d dir = target - szd_ref_pos_;
       double dist = dir.norm();
 
-      double yaw_diff = target_yaw_ - szd_current_yaw_;
-      
-      while (yaw_diff > M_PI) yaw_diff -= 2 * M_PI;
-      while (yaw_diff < -M_PI) yaw_diff += 2 * M_PI;
+      double yaw_diff = szd_target_yaw_ - szd_current_yaw_;
+      yaw_diff = normalizeAngle(yaw_diff);
       
       if (fabs(yaw_diff) < SZD_YAW_THRESHOLD)
       {
-        szd_current_yaw_ = target_yaw_;
+        szd_current_yaw_ = normalizeAngle(szd_target_yaw_);
         yaw = szd_current_yaw_;
         yaw_dot = 0.0;
       }
@@ -461,13 +468,14 @@ void cmdCallback()
         double yaw_step = szd_yaw_speed_ * dt;
         if (fabs(yaw_diff) < yaw_step)
         {
-          szd_current_yaw_ = target_yaw_;
-          yaw_step = fabs(yaw_diff);
+          szd_current_yaw_ = szd_target_yaw_;
         }
         else
         {
           szd_current_yaw_ += (yaw_diff > 0 ? 1.0 : -1.0) * yaw_step;
         }
+        
+        szd_current_yaw_ = normalizeAngle(szd_current_yaw_);
         yaw = szd_current_yaw_;
         yaw_dot = (yaw_diff > 0 ? 1.0 : -1.0) * szd_yaw_speed_;
       }
@@ -495,7 +503,7 @@ void cmdCallback()
       Eigen::Vector3d dir = target - szd_ref_pos_;
       double dist = dir.norm();
 
-      yaw = target_yaw_;
+      yaw = szd_target_yaw_;
       yaw_dot = 0.0;
 
       if (dist < szd_position_threshold_)
@@ -521,7 +529,7 @@ void cmdCallback()
       pos_flu = szd_target_;
       vel.setZero();
       acc.setZero();
-      yaw = target_yaw_;
+      yaw = szd_target_yaw_;
       yaw_dot = 0.0;
     }
 
