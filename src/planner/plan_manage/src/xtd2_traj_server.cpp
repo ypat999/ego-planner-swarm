@@ -239,10 +239,10 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
   has_valid_goal_ = true;
   
   // 判断目标点是否在原点附近（距离原点0.5m以内）
-  goal_near_origin_ = (new_goal_pos.norm() < 0.5);
+  goal_near_origin_ = isTargetInSafeZone(new_goal_pos);
 
   // Safe zone descent check
-  if (szd_enabled_ && isTargetInSafeZone(new_goal_pos))
+  if (szd_enabled_ && goal_near_origin_)
   {
     szd_active_ = true;
     szd_phase_ = SZD_HORIZONTAL;
@@ -502,6 +502,7 @@ void cmdCallback()
       {
         szd_ref_pos_ = target;
         szd_phase_ = SZD_DONE;
+        szd_active_ = false;
         RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                     "Safe zone descent: vertical descent complete, reached target (%.2f, %.2f, %.2f)",
                     szd_target_(0), szd_target_(1), szd_target_(2));
