@@ -68,7 +68,6 @@ bool szd_ref_pos_initialized_ = false;
 
 // Safe zone descent yaw control
 double szd_current_yaw_ = 0.0;
-double szd_target_yaw_ = 0.0;
 double szd_yaw_speed_ = 1.0;
 constexpr double SZD_YAW_THRESHOLD = 0.02;
 
@@ -432,7 +431,7 @@ void cmdCallback()
       
       Eigen::Vector3d euler = current_orientation_.toRotationMatrix().eulerAngles(0, 1, 2);
       szd_current_yaw_ = normalizeAngle(euler(2));
-      szd_target_yaw_ = normalizeAngle(target_yaw_);
+      target_yaw_ = normalizeAngle(target_yaw_);
       
       RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                   "Safe zone descent: starting from (%.2f, %.2f, %.2f) to (%.2f, %.2f, %.2f)",
@@ -441,7 +440,7 @@ void cmdCallback()
       RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                   "Safe zone descent: initial yaw %.2f rad (%.2f deg), target yaw %.2f rad (%.2f deg)",
                   szd_current_yaw_, szd_current_yaw_ * 180.0 / M_PI,
-                  szd_target_yaw_, szd_target_yaw_ * 180.0 / M_PI);
+                  target_yaw_, target_yaw_ * 180.0 / M_PI);
     }
 
     Eigen::Vector3d pos_flu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero());
@@ -454,12 +453,12 @@ void cmdCallback()
       Eigen::Vector3d dir = target - szd_ref_pos_;
       double dist = dir.norm();
 
-      double yaw_diff = szd_target_yaw_ - szd_current_yaw_;
+      double yaw_diff = target_yaw_ - szd_current_yaw_;
       yaw_diff = normalizeAngle(yaw_diff);
       
       if (fabs(yaw_diff) < SZD_YAW_THRESHOLD)
       {
-        szd_current_yaw_ = normalizeAngle(szd_target_yaw_);
+        szd_current_yaw_ = normalizeAngle(target_yaw_);
         yaw = szd_current_yaw_;
         yaw_dot = 0.0;
       }
@@ -468,7 +467,7 @@ void cmdCallback()
         double yaw_step = szd_yaw_speed_ * dt;
         if (fabs(yaw_diff) < yaw_step)
         {
-          szd_current_yaw_ = szd_target_yaw_;
+          szd_current_yaw_ = target_yaw_;
         }
         else
         {
@@ -503,7 +502,7 @@ void cmdCallback()
       Eigen::Vector3d dir = target - szd_ref_pos_;
       double dist = dir.norm();
 
-      yaw = szd_target_yaw_;
+      yaw = target_yaw_;
       yaw_dot = 0.0;
 
       if (dist < szd_position_threshold_)
@@ -529,7 +528,7 @@ void cmdCallback()
       pos_flu = szd_target_;
       vel.setZero();
       acc.setZero();
-      yaw = szd_target_yaw_;
+      yaw = target_yaw_;
       yaw_dot = 0.0;
     }
 
