@@ -10,6 +10,8 @@
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <unistd.h>
+#include <limits.h>
 
 rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub;
@@ -63,6 +65,18 @@ SZDPhase szd_phase_ = SZD_NONE;
 Eigen::Vector3d szd_target_ = Eigen::Vector3d::Zero();
 Eigen::Vector3d szd_ref_pos_ = Eigen::Vector3d::Zero();
 bool szd_ref_pos_initialized_ = false;
+
+// Safe zone descent yaw control
+double szd_current_yaw_ = 0.0;
+double szd_yaw_speed_ = 1.0;
+constexpr double SZD_YAW_THRESHOLD = 0.02;
+
+// Topic configuration variables
+std::string odom_world_topic;
+std::string grid_map_cloud_topic;
+std::string grid_map_pose_topic;
+std::string default_namespace;
+bool default_use_sim_time;
 
 bool isTargetInSafeZone(const Eigen::Vector3d &target)
 {
@@ -238,6 +252,13 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
     RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                 "Target (%.2f, %.2f, %.2f) is in safe zone, activating safe zone descent mode (speed=%.2f)",
                 new_goal_pos(0), new_goal_pos(1), new_goal_pos(2), szd_speed_);
+    RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                "Safe zone descent activated: szd_active_=%s, have_odom_=%s, current_pos_=(%.2f, %.2f, %.2f)",
+                szd_active_ ? "true" : "false", have_odom_ ? "true" : "false",
+                current_pos_(0), current_pos_(1), current_pos_(2));
+    RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                "Safe zone descent: target yaw set to %.2f rad (%.2f deg)",
+                target_yaw_, target_yaw_ * 180.0 / M_PI);
   }
   else
   {
@@ -377,6 +398,21 @@ void cmdCallback()
   rclcpp::Clock clock(RCL_ROS_TIME);
   rclcpp::Time time_now = clock.now();
 
+  static int log_counter = 0;
+  if (szd_active_ && log_counter % 20 == 0) // 每1秒输出一次（20*50ms=1s）
+  {
+    RCLCPP_DEBUG(rclcpp::get_logger("traj_server"),
+                "cmdCallback: szd_active_=%s, have_odom_=%s, szd_phase_=%d, szd_ref_pos_initialized_=%s",
+                szd_active_ ? "true" : "false", have_odom_ ? "true" : "false", szd_phase_,
+                szd_ref_pos_initialized_ ? "true" : "false");
+  }
+  if (szd_active_ && !have_odom_)
+  {
+    RCLCPP_WARN(rclcpp::get_logger("traj_server"),
+                         "Safe zone descent active but no odometry data received yet!");
+  }
+  log_counter++;
+
   if (szd_active_ && have_odom_)
   {
     double dt = 0.05;
@@ -385,19 +421,56 @@ void cmdCallback()
     {
       szd_ref_pos_ = current_pos_;
       szd_ref_pos_initialized_ = true;
+      
+      Eigen::Vector3d euler = current_orientation_.toRotationMatrix().eulerAngles(0, 1, 2);
+      szd_current_yaw_ = euler(2);
+      
       RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                   "Safe zone descent: starting from (%.2f, %.2f, %.2f) to (%.2f, %.2f, %.2f)",
                   current_pos_(0), current_pos_(1), current_pos_(2),
                   szd_target_(0), szd_target_(1), szd_target_(2));
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                  "Safe zone descent: initial yaw %.2f rad (%.2f deg), target yaw %.2f rad (%.2f deg)",
+                  szd_current_yaw_, szd_current_yaw_ * 180.0 / M_PI,
+                  target_yaw_, target_yaw_ * 180.0 / M_PI);
     }
 
     Eigen::Vector3d pos_flu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero());
+    double yaw = last_yaw_;
+    double yaw_dot = 0.0;
 
     if (szd_phase_ == SZD_HORIZONTAL)
     {
       Eigen::Vector3d target(szd_target_(0), szd_target_(1), szd_ref_pos_(2));
       Eigen::Vector3d dir = target - szd_ref_pos_;
       double dist = dir.norm();
+
+      double yaw_diff = target_yaw_ - szd_current_yaw_;
+      
+      while (yaw_diff > M_PI) yaw_diff -= 2 * M_PI;
+      while (yaw_diff < -M_PI) yaw_diff += 2 * M_PI;
+      
+      if (fabs(yaw_diff) < SZD_YAW_THRESHOLD)
+      {
+        szd_current_yaw_ = target_yaw_;
+        yaw = szd_current_yaw_;
+        yaw_dot = 0.0;
+      }
+      else
+      {
+        double yaw_step = szd_yaw_speed_ * dt;
+        if (fabs(yaw_diff) < yaw_step)
+        {
+          szd_current_yaw_ = target_yaw_;
+          yaw_step = fabs(yaw_diff);
+        }
+        else
+        {
+          szd_current_yaw_ += (yaw_diff > 0 ? 1.0 : -1.0) * yaw_step;
+        }
+        yaw = szd_current_yaw_;
+        yaw_dot = (yaw_diff > 0 ? 1.0 : -1.0) * szd_yaw_speed_;
+      }
 
       if (dist < szd_position_threshold_)
       {
@@ -422,6 +495,9 @@ void cmdCallback()
       Eigen::Vector3d dir = target - szd_ref_pos_;
       double dist = dir.norm();
 
+      yaw = target_yaw_;
+      yaw_dot = 0.0;
+
       if (dist < szd_position_threshold_)
       {
         szd_ref_pos_ = target;
@@ -444,6 +520,8 @@ void cmdCallback()
       pos_flu = szd_target_;
       vel.setZero();
       acc.setZero();
+      yaw = target_yaw_;
+      yaw_dot = 0.0;
     }
 
     pos_cmd.header.stamp = time_now;
@@ -463,8 +541,10 @@ void cmdCallback()
     pos_cmd.acceleration.y = acc(1);
     pos_cmd.acceleration.z = acc(2);
 
-    pos_cmd.yaw = last_yaw_;
-    pos_cmd.yaw_dot = 0;
+    pos_cmd.yaw = yaw;
+    pos_cmd.yaw_dot = yaw_dot;
+
+    last_yaw_ = yaw;
 
     pos_cmd_pub->publish(pos_cmd);
     return;
@@ -592,9 +672,33 @@ int main(int argc, char **argv)
   rclcpp::init(argc, argv);
   auto node = rclcpp::Node::make_shared("traj_server");
 
+  // Get hostname and configure topics based on host
+  char hostname[HOST_NAME_MAX];
+  gethostname(hostname, HOST_NAME_MAX);
+  std::string hostname_str(hostname);
+
+  if (hostname_str == "ywj-B250-D3A" || hostname_str == "DESKTOP-ypat")
+  {
+    default_namespace = "/x500_depth_0/";
+    default_use_sim_time = true;
+    odom_world_topic = "/x500_depth_0/odometry";
+    grid_map_cloud_topic = "/livox_down/lidar";
+    grid_map_pose_topic = "/x500_depth_0/StereoOV7251/pose";
+    RCLCPP_INFO(node->get_logger(), "Running on %s, using simulation topics", hostname_str.c_str());
+  }
+  else
+  {
+    default_namespace = "/";
+    default_use_sim_time = false;
+    odom_world_topic = "lio/odom";
+    grid_map_cloud_topic = "lio/cloud_world";
+    grid_map_pose_topic = "mid360/pose";
+    RCLCPP_INFO(node->get_logger(), "Running on %s, using real robot topics", hostname_str.c_str());
+  }
+
   // Get ROS namespace parameter
   std::string ros_ns;
-  node->declare_parameter("ros_ns", "");
+  node->declare_parameter("ros_ns", default_namespace);
   node->get_parameter("ros_ns", ros_ns);
 
   //Get time_forward parameter
@@ -610,6 +714,8 @@ int main(int argc, char **argv)
   node->get_parameter("safe_zone_descent/enabled", szd_enabled_);
   node->declare_parameter("safe_zone_descent/speed", 0.5);
   node->get_parameter("safe_zone_descent/speed", szd_speed_);
+  node->declare_parameter("safe_zone_descent/yaw_speed", 1.0);
+  node->get_parameter("safe_zone_descent/yaw_speed", szd_yaw_speed_);
   node->declare_parameter("safe_zone_descent/zone_size_x", 2.0);
   node->get_parameter("safe_zone_descent/zone_size_x", szd_zone_size_(0));
   node->declare_parameter("safe_zone_descent/zone_size_y", 2.0);
@@ -635,7 +741,7 @@ int main(int argc, char **argv)
 
   // Subscribe to odometry for current position
   odom_sub = node->create_subscription<nav_msgs::msg::Odometry>(
-      "odom_world",
+      odom_world_topic,
       10,
       odomCallback);
 
@@ -660,10 +766,12 @@ int main(int argc, char **argv)
 
   RCLCPP_INFO(node->get_logger(), "Trajectory server started - outputting position, velocity, acceleration");
   RCLCPP_INFO(node->get_logger(), "Publishing trajectory to: /xtdrone2%s cmd_trajectory_flu", ros_ns.c_str());
-  RCLCPP_INFO(node->get_logger(), "Subscribed to odometry: odom_world");
+  RCLCPP_INFO(node->get_logger(), "Subscribed to odometry: %s", odom_world_topic.c_str());
   RCLCPP_INFO(node->get_logger(), "Subscribed to goal pose: /goal_pose_3d");
-  RCLCPP_INFO(node->get_logger(), "Safe zone descent: enabled=%s, speed=%.2f m/s, zone_size=[%.2f, %.2f, %.2f], threshold=%.3f",
-              szd_enabled_ ? "true" : "false", szd_speed_,
+  RCLCPP_INFO(node->get_logger(), "Subscribed to grid map cloud: %s", grid_map_cloud_topic.c_str());
+  RCLCPP_INFO(node->get_logger(), "Subscribed to grid map pose: %s", grid_map_pose_topic.c_str());
+  RCLCPP_INFO(node->get_logger(), "Safe zone descent: enabled=%s, speed=%.2f m/s, yaw_speed=%.2f rad/s, zone_size=[%.2f, %.2f, %.2f], threshold=%.3f",
+              szd_enabled_ ? "true" : "false", szd_speed_, szd_yaw_speed_,
               szd_zone_size_(0), szd_zone_size_(1), szd_zone_size_(2), szd_position_threshold_);
 
   rclcpp::spin(node);
