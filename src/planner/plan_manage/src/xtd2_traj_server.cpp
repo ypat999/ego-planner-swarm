@@ -70,6 +70,7 @@ bool szd_ref_pos_initialized_ = false;
 double szd_current_yaw_ = 0.0;
 double szd_yaw_speed_ = 1.0;
 constexpr double SZD_YAW_THRESHOLD = 0.02;
+int szd_cmd_count_ = 0;
 
 // Topic configuration variables
 std::string odom_world_topic;
@@ -255,6 +256,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
     szd_phase_ = SZD_HORIZONTAL;
     szd_target_ = new_goal_pos;
     szd_ref_pos_initialized_ = false;
+    szd_cmd_count_ = 0;  // 重置命令计数器
     receive_traj_ = false;
     RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                 "Target (%.2f, %.2f, %.2f) is in safe zone, activating safe zone descent mode (speed=%.2f)",
@@ -285,8 +287,9 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
                            transformed_msg.pose.orientation.x, 
                            transformed_msg.pose.orientation.y, 
                            transformed_msg.pose.orientation.z);
-  Eigen::Vector3d euler = q_goal.toRotationMatrix().eulerAngles(0, 1, 2);
-  target_yaw_ = euler(2);
+  // 使用更可靠的atan2方法提取yaw，避免eulerAngles的不稳定性
+  Eigen::Matrix3d rot_goal = q_goal.toRotationMatrix();
+  target_yaw_ = atan2(rot_goal(1, 0), rot_goal(0, 0));
   
   RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
               "Received new goal pose: (%.2f, %.2f, %.2f), target yaw from orientation: %.2f rad (%.2f deg)", 
@@ -429,18 +432,19 @@ void cmdCallback()
       szd_ref_pos_ = current_pos_;
       szd_ref_pos_initialized_ = true;
       
-      Eigen::Vector3d euler = current_orientation_.toRotationMatrix().eulerAngles(0, 1, 2);
-      szd_current_yaw_ = normalizeAngle(euler(2));
-      target_yaw_ = normalizeAngle(target_yaw_);
+      // 使用更可靠的方法提取yaw（从旋转矩阵）
+      Eigen::Matrix3d rot = current_orientation_.toRotationMatrix();
+      szd_current_yaw_ = atan2(rot(1, 0), rot(0, 0));
       
       RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                   "Safe zone descent: starting from (%.2f, %.2f, %.2f) to (%.2f, %.2f, %.2f)",
                   current_pos_(0), current_pos_(1), current_pos_(2),
                   szd_target_(0), szd_target_(1), szd_target_(2));
       RCLCPP_INFO(rclcpp::get_logger("traj_server"),
-                  "Safe zone descent: initial yaw %.2f rad (%.2f deg), target yaw %.2f rad (%.2f deg)",
+                  "Safe zone descent: initial yaw %.2f rad (%.2f deg), target yaw %.2f rad (%.2f deg), yaw_diff %.2f rad",
                   szd_current_yaw_, szd_current_yaw_ * 180.0 / M_PI,
-                  target_yaw_, target_yaw_ * 180.0 / M_PI);
+                  target_yaw_, target_yaw_ * 180.0 / M_PI,
+                  normalizeAngle(target_yaw_ - szd_current_yaw_));
     }
 
     Eigen::Vector3d pos_flu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero());
@@ -553,6 +557,17 @@ void cmdCallback()
     pos_cmd.yaw_dot = yaw_dot;
 
     last_yaw_ = yaw;
+
+    // 添加详细日志，前10次命令输出详细信息
+    if (szd_cmd_count_ < 10)
+    {
+      RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                  "SZD cmd #%d: phase=%d, pos=(%.2f, %.2f, %.2f), yaw=%.2f rad (%.2f deg), yaw_dot=%.2f rad/s",
+                  szd_cmd_count_, szd_phase_,
+                  pos_flu(0), pos_flu(1), pos_flu(2),
+                  yaw, yaw * 180.0 / M_PI, yaw_dot);
+      szd_cmd_count_++;
+    }
 
     pos_cmd_pub->publish(pos_cmd);
     return;
