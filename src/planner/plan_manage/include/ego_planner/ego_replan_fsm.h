@@ -63,6 +63,7 @@ namespace ego_planner
     double emergency_time_;
     bool flag_realworld_experiment_;
     bool enable_fail_safe_;
+    double same_goal_skip_threshold_;
     double same_point_replan_time_threshold_;
 
     /* planning data */

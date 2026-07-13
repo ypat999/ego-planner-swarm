@@ -23,6 +23,7 @@ namespace ego_planner
     node_->declare_parameter("fsm/planning_horizon", -1.0);
     node_->declare_parameter("fsm/planning_horizen_time", -1.0);
     node_->declare_parameter("fsm/emergency_time", 1.0);
+    node_->declare_parameter("fsm/same_goal_skip_threshold", 1.0);
     node_->declare_parameter("fsm/same_point_replan_time_threshold", 10.0);
     node_->declare_parameter("fsm/realworld_experiment", false);
     node_->declare_parameter("fsm/fail_safe", true);
@@ -34,6 +35,7 @@ namespace ego_planner
     node_->get_parameter("fsm/planning_horizon", planning_horizen_);
     node_->get_parameter("fsm/planning_horizen_time", planning_horizen_time_);
     node_->get_parameter("fsm/emergency_time", emergency_time_);
+    node_->get_parameter("fsm/same_goal_skip_threshold", same_goal_skip_threshold_);
     node_->get_parameter("fsm/same_point_replan_time_threshold", same_point_replan_time_threshold_);
     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
@@ -551,85 +553,100 @@ namespace ego_planner
 
     Eigen::Vector3d new_goal(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
 
-    // 检查新目标点是否与当前目标点相同
-    static rclcpp::Time last_plan_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    // 检查新目标点与当前目标点的差异
+    static rclcpp::Time last_exact_same_goal_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
     rclcpp::Time current_time = node_->now();
+    bool is_same_goal = false;  // true → 跳过急停；false → 完整急停+重置
     if (has_valid_goal_)
     {
       double position_diff = (new_goal - current_transformed_goal_).norm();
-      if (position_diff < 0.01) // 1cm 阈值，认为是同一个点
+
+      if (position_diff < 0.01) // 1cm 阈值：定位抖动导致的完全相同点
       {
-        // 检查距离上次规划的时间，如果超过配置的时间阈值，允许重新规划
-        double time_since_last_plan = (current_time - last_plan_time).seconds();
+        // 完全相同点：10s 高频过滤，避免外部高频发送同一点导致无效重规划
+        double time_since_last_plan = (current_time - last_exact_same_goal_time).seconds();
         if (time_since_last_plan < same_point_replan_time_threshold_)
         {
-          RCLCPP_DEBUG(node_->get_logger(), "新目标点与当前目标点相同(差异 %.4f m)，且距上次规划仅 %.2f 秒，忽略本次请求，继续当前状态", 
+          RCLCPP_DEBUG(node_->get_logger(), "完全相同点(差异 %.4f m)，距上次规划仅 %.2f 秒，忽略",
                       position_diff, time_since_last_plan);
           return;
         }
-        else
-        {
-          RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点相同(差异 %.4f m)，但距上次规划已超过 %.2f 秒，允许重新规划", 
-                      position_diff, time_since_last_plan);
-        }
+        RCLCPP_INFO(node_->get_logger(), "完全相同点(差异 %.4f m)，距上次规划已超 %.2f 秒，跳过急停重规划",
+                    position_diff, time_since_last_plan);
+        is_same_goal = true;
       }
+      else if (position_diff < same_goal_skip_threshold_) // 1m 内：不同但相近的点
+      {
+        RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点差异 %.4f m < %.2f m，跳过急停直接重规划",
+                    position_diff, same_goal_skip_threshold_);
+        is_same_goal = true;
+      }
+      // 差异 ≥ 1m：is_same_goal 保持 false，走完整急停+重置
     }
 
-    // 更新上次规划时间
-    last_plan_time = current_time;
-    
     // 检查当前状态，如果是正在执行轨迹，需要先重置流程
     if (exec_state_ != WAIT_TARGET && have_target_)
     {
-      // 检查是否已经在切换过程中，避免重复切换
-      if (goal_switch_in_progress_)
+      if (is_same_goal)
       {
-        RCLCPP_WARN(node_->get_logger(), "目标点切换正在进行中，跳过本次请求");
-        return;
+        // 同点重规划：跳过急停和流程重置，直接从当前状态生成新轨迹，实现顺畅过渡
+        RCLCPP_INFO(node_->get_logger(), "同点重规划，跳过急停，从当前状态直接生成轨迹");
+        has_valid_goal_ = false; // 标记旧目标无效，以便 planNextWaypoint 接受新目标
       }
-      
-      RCLCPP_WARN(node_->get_logger(), "检测到新目标点，当前正在执行轨迹，将重置流程并切换到新目标点");
-      
-      // 标记切换过程开始
-      goal_switch_in_progress_ = true;
-      
-      // 记录当前状态用于诊断
-      RCLCPP_INFO(node_->get_logger(), "当前状态: exec_state=%d, have_target=%d, traj_id=%d", 
-                  exec_state_, have_target_, planner_manager_->local_data_.traj_id_);
-      
-      // 执行紧急停止以确保安全
-      if (exec_state_ == EXEC_TRAJ || exec_state_ == REPLAN_TRAJ || exec_state_ == GEN_NEW_TRAJ)
+      else
       {
-        RCLCPP_INFO(node_->get_logger(), "执行紧急停止以确保安全切换");
-        callEmergencyStop(odom_pos_);
+        // 真正不同的目标点：执行完整的急停+重置流程以确保安全
+        // 检查是否已经在切换过程中，避免重复切换
+        if (goal_switch_in_progress_)
+        {
+          RCLCPP_WARN(node_->get_logger(), "目标点切换正在进行中，跳过本次请求");
+          return;
+        }
         
-        // 等待紧急停止完成
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        RCLCPP_WARN(node_->get_logger(), "检测到新目标点，当前正在执行轨迹，将重置流程并切换到新目标点");
+        
+        // 标记切换过程开始
+        goal_switch_in_progress_ = true;
+        
+        // 记录当前状态用于诊断
+        RCLCPP_INFO(node_->get_logger(), "当前状态: exec_state=%d, have_target=%d, traj_id=%d", 
+                    exec_state_, have_target_, planner_manager_->local_data_.traj_id_);
+        
+        // 执行紧急停止以确保安全
+        if (exec_state_ == EXEC_TRAJ || exec_state_ == REPLAN_TRAJ || exec_state_ == GEN_NEW_TRAJ)
+        {
+          RCLCPP_INFO(node_->get_logger(), "执行紧急停止以确保安全切换");
+          callEmergencyStop(odom_pos_);
+          
+          // 等待紧急停止完成
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        
+        // 重置状态标志
+        have_target_ = false;
+        have_new_target_ = false;
+        has_valid_goal_ = false; // 重置目标点标记
+        
+        // 重置航点索引（如果是预设目标模式）
+        if (target_type_ == TARGET_TYPE::PRESET_TARGET)
+        {
+          wp_id_ = 0;
+        }
+        
+        // 重置到等待目标状态
+        changeFSMExecState(WAIT_TARGET, "NEW_GOAL_RESET");
+        
+        // 等待状态转换完成
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        RCLCPP_INFO(node_->get_logger(), "流程重置完成，准备处理新目标点");
+        
+        // 标记切换过程结束
+        goal_switch_in_progress_ = false;
       }
-      
-      // 重置状态标志
-      have_target_ = false;
-      have_new_target_ = false;
-      has_valid_goal_ = false; // 重置目标点标记
-      
-      // 重置航点索引（如果是预设目标模式）
-      if (target_type_ == TARGET_TYPE::PRESET_TARGET)
-      {
-        wp_id_ = 0;
-      }
-      
-      // 重置到等待目标状态
-      changeFSMExecState(WAIT_TARGET, "NEW_GOAL_RESET");
-      
-      // 等待状态转换完成
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      
-      RCLCPP_INFO(node_->get_logger(), "流程重置完成，准备处理新目标点");
-      
-      // 标记切换过程结束
-      goal_switch_in_progress_ = false;
     }
 
+    last_exact_same_goal_time = current_time;
     init_pt_ = odom_pos_;
 
     Eigen::Vector3d end_wp(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
