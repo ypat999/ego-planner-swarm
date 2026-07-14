@@ -713,7 +713,7 @@ int main(int argc, char **argv)
   {
     default_namespace = "/";
     default_use_sim_time = false;
-    odom_world_topic = "lio/odom";
+    odom_world_topic = "lio/robo/odom";
     grid_map_cloud_topic = "lio/cloud_world";
     grid_map_pose_topic = "mid360/pose";
     RCLCPP_INFO(node->get_logger(), "Running on %s, using real robot topics", hostname_str.c_str());
@@ -747,7 +747,27 @@ int main(int argc, char **argv)
   node->get_parameter("safe_zone_descent/zone_size_z", szd_zone_size_(2));
   node->declare_parameter("safe_zone_descent/position_threshold", 0.05);
   node->get_parameter("safe_zone_descent/position_threshold", szd_position_threshold_);
-  
+
+  // 参数运行时修改回调
+  node->add_on_set_parameters_callback(
+    [](const std::vector<rclcpp::Parameter> & params) {
+      for (const auto & p : params) {
+        const auto & name = p.get_name();
+        if (name == "traj_server/time_forward") time_forward_ = p.as_double();
+        else if (name == "traj_server/frame_id") target_frame_ = p.as_string();
+        else if (name == "safe_zone_descent/enabled") szd_enabled_ = p.as_bool();
+        else if (name == "safe_zone_descent/speed") szd_speed_ = p.as_double();
+        else if (name == "safe_zone_descent/yaw_speed") szd_yaw_speed_ = p.as_double();
+        else if (name == "safe_zone_descent/zone_size_x") szd_zone_size_(0) = p.as_double();
+        else if (name == "safe_zone_descent/zone_size_y") szd_zone_size_(1) = p.as_double();
+        else if (name == "safe_zone_descent/zone_size_z") szd_zone_size_(2) = p.as_double();
+        else if (name == "safe_zone_descent/position_threshold") szd_position_threshold_ = p.as_double();
+      }
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      return result;
+    });
+
   // Initialize TF buffer and listener
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);

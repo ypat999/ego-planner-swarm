@@ -261,6 +261,18 @@ int main(int argc, char **argv)
   node->declare_parameter("traj_server/time_forward", -1.0);
   node->get_parameter("traj_server/time_forward", time_forward_);
 
+  // 参数运行时修改回调
+  node->add_on_set_parameters_callback(
+    [](const std::vector<rclcpp::Parameter> & params) {
+      for (const auto & p : params) {
+        const auto & name = p.get_name();
+        if (name == "traj_server/time_forward") time_forward_ = p.as_double();
+      }
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      return result;
+    });
+
   last_yaw_ = 0.0;
   last_yaw_dot_ = 0.0;
 
