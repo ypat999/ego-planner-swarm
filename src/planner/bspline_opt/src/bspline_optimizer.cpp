@@ -1369,8 +1369,9 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
         }
         if (j >= cps_.size) // fail to get the obs free point
         {
-          RCLCPP_WARN(rclcpp::get_logger("check_collision_and_rebound"), 
-                      "WARN! terminal point of the current trajectory is in obstacle, skip this planning.");
+          static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+          RCLCPP_WARN_THROTTLE(rclcpp::get_logger("check_collision_and_rebound"), steady_clock, 5000,
+                              "WARN! terminal point of the current trajectory is in obstacle, skip this planning.");
 
           force_stop_type_ = STOP_FOR_ERROR;
           return false;
