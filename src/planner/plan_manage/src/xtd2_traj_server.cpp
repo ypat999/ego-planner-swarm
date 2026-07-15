@@ -17,6 +17,7 @@ rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub;
 rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub;
 rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr reset_traj_sub;
+rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_planning_sub;
 
 quadrotor_msgs::msg::PositionCommand pos_cmd;
 geometry_msgs::msg::PoseStamped goal_pose;
@@ -102,6 +103,16 @@ void resetTrajCallback(const std_msgs::msg::Empty::ConstPtr msg)
     start_time_ = clock.now();
     RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Trajectory start time reset to now");
   }
+}
+
+void stopPlanningCallback(const std_msgs::msg::Empty::ConstPtr msg)
+{
+  (void)msg;
+  RCLCPP_WARN(rclcpp::get_logger("traj_server"), "Received /stop_planning, stopping trajectory publishing");
+  receive_traj_ = false;
+  szd_active_ = false;
+  szd_phase_ = SZD_NONE;
+  szd_ref_pos_initialized_ = false;
 }
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
@@ -802,6 +813,11 @@ int main(int argc, char **argv)
       std::string("/xtdrone2") + ros_ns + "reset_traj_time",
       10,
       resetTrajCallback);
+
+  stop_planning_sub = node->create_subscription<std_msgs::msg::Empty>(
+      "/stop_planning",
+      1,
+      stopPlanningCallback);
 
   auto cmd_timer = node->create_wall_timer(
       std::chrono::milliseconds(50),

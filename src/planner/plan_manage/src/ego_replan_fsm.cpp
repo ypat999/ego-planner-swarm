@@ -124,6 +124,15 @@ namespace ego_planner
     bspline_pub_ = node_->create_publisher<traj_utils::msg::Bspline>("planning/bspline", 10);
     data_disp_pub_ = node_->create_publisher<traj_utils::msg::DataDisp>("planning/data_display", 100);
 
+    // 停止规划接口：收到后回到WAIT_TARGET，等待下次goal触发
+    stop_planning_sub_ = node_->create_subscription<std_msgs::msg::Empty>(
+        "/stop_planning",
+        1,
+        [this](const std::shared_ptr<const std_msgs::msg::Empty> &msg)
+        {
+          this->stopPlanningCallback(msg);
+        });
+
     if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
     {
       waypoint_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -884,6 +893,21 @@ namespace ego_planner
     {
       changeFSMExecState(REPLAN_TRAJ, "TRAJ_CHECK");
     }
+  }
+
+  void EGOReplanFSM::stopPlanningCallback(const std::shared_ptr<const std_msgs::msg::Empty> &msg)
+  {
+    (void)msg;
+    RCLCPP_WARN(node_->get_logger(), "Received /stop_planning, returning to WAIT_TARGET state");
+    have_target_ = false;
+    have_trigger_ = false;
+    goal_switch_in_progress_ = false;
+    // 生成紧急停止轨迹（悬停），然后回到WAIT_TARGET等待新目标
+    if (exec_state_ != INIT && exec_state_ != WAIT_TARGET)
+    {
+      callEmergencyStop(odom_pos_);
+    }
+    changeFSMExecState(WAIT_TARGET, "STOP_PLANNING");
   }
 
   void EGOReplanFSM::swarmTrajsCallback(const std::shared_ptr<const traj_utils::msg::MultiBsplines> &msg)
