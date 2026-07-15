@@ -589,9 +589,12 @@ namespace ego_planner
     {
       if (is_same_goal)
       {
-        // 同点重规划：跳过急停和流程重置，直接从当前状态生成新轨迹，实现顺畅过渡
+        // 同点重规划：跳过急停，但需重置状态到 WAIT_TARGET
+        // 避免 planNextWaypoint 进入 while+spin_some 循环导致 "Node already added" 崩溃
         RCLCPP_INFO(node_->get_logger(), "同点重规划，跳过急停，从当前状态直接生成轨迹");
-        has_valid_goal_ = false; // 标记旧目标无效，以便 planNextWaypoint 接受新目标
+        has_valid_goal_ = false;
+        have_new_target_ = false;
+        changeFSMExecState(WAIT_TARGET, "SAME_GOAL_RETRIG");
       }
       else
       {
