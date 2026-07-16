@@ -314,24 +314,18 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
 {
   constexpr double PI = 3.1415926;                 // 圆周率
   constexpr double YAW_DOT_MAX_PER_SEC = PI / 2;         // 最大偏航角速度（rad/s）
-  constexpr double GOAL_DISTANCE_THRESHOLD = 2.0;        // 目标点距离阈值（米）
-  // constexpr double YAW_DOT_DOT_MAX_PER_SEC = PI; // 最大偏航角加速度（未使用）
   std::pair<double, double> yaw_yawdot(0, 0);      // 返回的偏航角与偏航角速度
   double yaw = 0;                                    // 当前偏航角
   double yawdot = 0;                                 // 当前偏航角速度
 
-  // 计算当前位置到目标点的水平距离（只考虑x和y方向）
-  Eigen::Vector2d pos_xy(pos(0), pos(1));
-  Eigen::Vector2d goal_xy(current_goal_pos_(0), current_goal_pos_(1));
-  double horizontal_distance = (pos_xy - goal_xy).norm();
-
   // 计算目标偏航角
   double yaw_temp;
-  if (horizontal_distance <= GOAL_DISTANCE_THRESHOLD && have_goal_) {
-    // 当距离目标点水平距离2m以内时，直接使用预先计算的目标偏航角
+  // 轨迹执行中（t_cur在有效范围内）始终用轨迹方向，不跳变到目标yaw
+  // 轨迹结束后才使用目标偏航角
+  if (t_cur >= traj_duration_ && have_goal_) {
     yaw_temp = target_yaw_;
   } else {
-    // 否则，使用轨迹的前瞻点计算方向
+    // 使用轨迹的前瞻点计算方向
     Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_
               ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos
               : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
