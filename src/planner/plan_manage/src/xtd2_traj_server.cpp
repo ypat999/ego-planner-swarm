@@ -331,7 +331,15 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
               : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
     yaw_temp = dir.norm() > 0.001 ? atan2(dir(1), dir(0)) : last_yaw_;
   }
-  
+
+  static int yaw_debug_cnt = 0;
+  yaw_debug_cnt++;
+  if (yaw_debug_cnt % 40 == 0) // 每2秒（40*50ms）打印一次
+  {
+    printf("[yaw calc] t=%.2f last_yaw=%.2f yaw_temp=%.2f diff=%.2f\n",
+           t_cur, last_yaw_, yaw_temp, yaw_temp - last_yaw_);
+  }
+
   // 根据时间差计算本周期允许的最大偏航角变化量
   double max_yaw_change = YAW_DOT_MAX_PER_SEC * (time_now - time_last).seconds();
 
@@ -641,6 +649,7 @@ void cmdCallback()
       // yaw 通过 calculate_yaw 走速率限制，避免跳变
       // t_cur >= traj_duration_ 时会自动使用 target_yaw_
       yaw_yawdot = calculate_yaw(t_cur, pos_flu, time_now, time_last);
+      // 在轨迹结束后的位置保持阶段也需要发布，让yaw有时间过渡完成
     }
     else
     {
