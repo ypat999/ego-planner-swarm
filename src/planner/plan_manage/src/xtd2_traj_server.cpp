@@ -635,39 +635,15 @@ void cmdCallback()
   }
   else if (t_cur >= traj_duration_)
   {
-    /* use goal pose when finish traj_ */
-    if (have_goal_)
-    {
-      // 如果目标点在原点附近（距离0.5m以内），不再持续输出该点
-      if (goal_near_origin_)
-      {
-        return;
-      }
-      
-      // 使用目标点的位置
-      pos_flu(0) = goal_pose.pose.position.x;
-      pos_flu(1) = goal_pose.pose.position.y;
-      pos_flu(2) = goal_pose.pose.position.z;
-
-      // yaw 通过 calculate_yaw 走速率限制，避免跳变
-      // t_cur >= traj_duration_ 时会自动使用 target_yaw_
-      yaw_yawdot = calculate_yaw(t_cur, pos_flu, time_now, time_last);
-      // 在轨迹结束后的位置保持阶段也需要发布，让yaw有时间过渡完成
-    }
-    else
-    {
-      // 如果没有目标点，使用轨迹终点
-      pos_flu = traj_[0].evaluateDeBoorT(traj_duration_);
-      yaw_yawdot.first = last_yaw_;
-      yaw_yawdot.second = 0;
-      
-      RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Using trajectory end point: (%.2f, %.2f, %.2f)", 
-                  pos_flu(0), pos_flu(1), pos_flu(2));
-    }
-    
+    // 轨迹结束，使用轨迹终点悬停不跳变到goal_pose
+    // （急停/打断场景 goal_pose 可能指向障碍物内的不可达目标）
+    pos_flu = traj_[0].evaluateDeBoorT(traj_duration_);
     vel.setZero();
     acc.setZero();
     pos_f = pos_flu;
+
+    // yaw 通过 calculate_yaw 限速过渡
+    yaw_yawdot = calculate_yaw(t_cur, pos_flu, time_now, time_last);
   }
   else
   {
