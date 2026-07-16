@@ -1226,6 +1226,15 @@ namespace ego_planner
 
   bool EGOReplanFSM::planFromGlobalTraj(const int trial_times /*=1*/) // zx-todo
   {
+    // 目标点在障碍物中，拒绝规划，避免飞入膨胀区
+    if (planner_manager_->grid_map_->getInflateOccupancy(end_pt_))
+    {
+      RCLCPP_WARN(node_->get_logger(),
+          "目标点(%.2f,%.2f,%.2f)在障碍物中，放弃规划",
+          end_pt_(0), end_pt_(1), end_pt_(2));
+      return false;
+    }
+
     start_pt_ = odom_pos_;
     start_vel_ = odom_vel_;
     start_acc_.setZero();
