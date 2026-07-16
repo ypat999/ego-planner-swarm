@@ -1085,7 +1085,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
   {
     cost = 0.0;
 
-    // zero cost and gradient in hard constraints
+    // 终点位置约束
     Eigen::Vector3d q_3, q_2, q_1, dq;
     q_3 = q.col(q.cols() - 3);
     q_2 = q.col(q.cols() - 2);
@@ -1097,6 +1097,14 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     gradient.col(q.cols() - 3) += 2 * dq * (1 / 6.0);
     gradient.col(q.cols() - 2) += 2 * dq * (4 / 6.0);
     gradient.col(q.cols() - 1) += 2 * dq * (1 / 6.0);
+
+    // 终点速度约束：惩罚非零终速，让轨迹自然减速到零
+    Eigen::Vector3d end_vel = (q_1 - q_3) / (2.0 * bspline_interval_);
+    cost += end_vel.squaredNorm();
+
+    gradient.col(q.cols() - 3) += 2 * end_vel * (-1.0 / (2.0 * bspline_interval_));
+    gradient.col(q.cols() - 2) += Eigen::Vector3d::Zero(); // q_2 不影响终速
+    gradient.col(q.cols() - 1) += 2 * end_vel * ( 1.0 / (2.0 * bspline_interval_));
   }
 
   void BsplineOptimizer::calcFeasibilityCost(const Eigen::MatrixXd &q, double &cost,
@@ -1559,8 +1567,8 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
   {
     iter_num_ = 0;
     int start_id = order_ + 1;  // 锁定Q3，防止优化器反转初始轨迹方向造成后退急刹
-    int end_id = this->cps_.size - order_; //Fixed end: 锁定尾部control points保证终速为0
-    // int end_id = this->cps_.size; // Free end
+    // int end_id = this->cps_.size - order_; //Fixed end
+    int end_id = this->cps_.size; // Free end
     // 变量个数
     variable_num_ = 3 * (end_id - start_id);
 
