@@ -121,34 +121,31 @@ namespace ego_planner
         PolynomialTraj gl_traj;
 
         double dist = (start_pt - local_target_pt).norm();
-        // 计算初始速度在目标方向上的投影，用于调整多项式时间
-        Eigen::Vector3d dir_to_target = (local_target_pt - start_pt).normalized();
-        double v0_proj = start_vel.dot(dir_to_target);
-        if (v0_proj < 0.0) v0_proj = 0.0;  // 反向速度视为静止
+        // 用全速（而非仅目标方向投影）计算减速时间/距离
+        // 多项式匹配完整 start_vel 矢量，横向速度也需要时间阻尼
+        double v0 = start_vel.norm();
+        if (v0 < 0.1) v0 = 0.0;  // 极低速视为静止
 
         double time;
-        double d_decel = v0_proj * v0_proj / (2.0 * pp_.max_acc_);  // 从v0减速到0所需的距离
-        double t_decel = v0_proj / pp_.max_acc_;                    // 减速时间
+        double d_decel = v0 * v0 / (2.0 * pp_.max_acc_);  // 减速距离
+        double t_decel = v0 / pp_.max_acc_;                // 减速时间
         double d_remain = dist - d_decel;
         if (d_remain <= 0.0)
         {
-          // 目标在减速距离内，仅需刹车
           time = t_decel;
         }
         else if (pow(pp_.max_vel_, 2) / pp_.max_acc_ > d_remain)
         {
-          // 剩余距离内达不到最高速，加速+减速
           time = t_decel + sqrt(d_remain / pp_.max_acc_);
         }
         else
         {
-          // 加速到最高速 + 巡航 + 减速
           time = t_decel + 2.0 * pp_.max_vel_ / pp_.max_acc_
                + (d_remain - pow(pp_.max_vel_, 2) / pp_.max_acc_) / pp_.max_vel_;
         }
 
-        printf("[poly init] dist=%.2f v0_proj=%.2f d_decel=%.2f d_remain=%.2f time=%.2f\n",
-               dist, v0_proj, d_decel, d_remain, time);
+        printf("[poly init] dist=%.2f v0=%.2f d_decel=%.2f d_remain=%.2f time=%.2f\n",
+               dist, v0, d_decel, d_remain, time);
 
         if (!flag_randomPolyTraj)
         // false生成一段单一的多项式轨迹，true生成一个包含随机插入点的轨迹
