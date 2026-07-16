@@ -95,8 +95,9 @@ double normalizeAngle(double angle)
   return angle;
 }
 
-void resetTrajCallback(const std_msgs::msg::Empty::ConstPtr msg)
+void resetTrajCallback(const std_msgs::msg::Empty::ConstSharedPtr msg)
 {
+  (void)msg;
   if (receive_traj_)
   {
     rclcpp::Clock clock(RCL_ROS_TIME);
@@ -105,7 +106,7 @@ void resetTrajCallback(const std_msgs::msg::Empty::ConstPtr msg)
   }
 }
 
-void stopPlanningCallback(const std_msgs::msg::Empty::ConstPtr msg)
+void stopPlanningCallback(const std_msgs::msg::Empty::ConstSharedPtr msg)
 {
   (void)msg;
   RCLCPP_WARN(rclcpp::get_logger("traj_server"), "Received /stop_planning, stopping trajectory publishing");
@@ -115,7 +116,7 @@ void stopPlanningCallback(const std_msgs::msg::Empty::ConstPtr msg)
   szd_ref_pos_initialized_ = false;
 }
 
-void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
+void bsplineCallback(traj_utils::msg::Bspline::ConstSharedPtr msg)
 {
   // parse _ traj
 
@@ -159,7 +160,7 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   receive_traj_ = true;
 }
 
-void odomCallback(const nav_msgs::msg::Odometry::ConstPtr &msg)
+void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
 {
   current_pos_(0) = msg->pose.pose.position.x;
   current_pos_(1) = msg->pose.pose.position.y;
@@ -175,7 +176,7 @@ void odomCallback(const nav_msgs::msg::Odometry::ConstPtr &msg)
   have_odom_ = true;
 }
 
-void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
+void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
 {
   // 检查目标点数据的有效性
   bool data_valid = true;
@@ -758,7 +759,7 @@ int main(int argc, char **argv)
   node->get_parameter("safe_zone_descent/position_threshold", szd_position_threshold_);
 
   // 参数运行时修改回调
-  node->add_on_set_parameters_callback(
+  auto param_handle = node->add_on_set_parameters_callback(
     [](const std::vector<rclcpp::Parameter> & params) {
       for (const auto & p : params) {
         const auto & name = p.get_name();
