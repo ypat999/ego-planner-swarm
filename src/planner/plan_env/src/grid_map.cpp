@@ -847,8 +847,8 @@ void GridMap::updateOccupancyCallback()
   is_map_updating_ = false;
 }
 
-void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,
-                                const geometry_msgs::msg::PoseStamped::ConstPtr &pose)
+void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr &img,
+                                const geometry_msgs::msg::PoseStamped::ConstSharedPtr &pose)
 {
   /* get depth image */
   cv_bridge::CvImagePtr cv_ptr;
@@ -895,7 +895,7 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
   md_.has_odom_ = true;
 }
 
-void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
+void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img)
 {
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
   
@@ -1216,7 +1216,7 @@ void GridMap::getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size)
   ori = mp_.map_origin_, size = mp_.map_size_;
 }
 
-void GridMap::extrinsicCallback(const nav_msgs::msg::Odometry::ConstPtr &odom)
+void GridMap::extrinsicCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &odom)
 {
   Eigen::Quaterniond cam2body_q = Eigen::Quaterniond(odom->pose.pose.orientation.w,
                                                      odom->pose.pose.orientation.x,
@@ -1230,8 +1230,8 @@ void GridMap::extrinsicCallback(const nav_msgs::msg::Odometry::ConstPtr &odom)
   md_.cam2body_(3, 3) = 1.0;
 }
 
-void GridMap::depthOdomCallback(const sensor_msgs::msg::Image::ConstPtr &img,
-                                const nav_msgs::msg::Odometry::ConstPtr &odom)
+void GridMap::depthOdomCallback(const sensor_msgs::msg::Image::ConstSharedPtr &img,
+                                const nav_msgs::msg::Odometry::ConstSharedPtr &odom)
 {
   /* get pose */
   Eigen::Quaterniond body_q = Eigen::Quaterniond(odom->pose.pose.orientation.w,

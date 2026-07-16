@@ -24,7 +24,7 @@ int traj_id_;
 double last_yaw_, last_yaw_dot_;
 double time_forward_;
 
-void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
+void bsplineCallback(traj_utils::msg::Bspline::ConstSharedPtr msg)
 {
   // parse pos traj
 
