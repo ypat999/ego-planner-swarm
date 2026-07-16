@@ -635,9 +635,22 @@ void cmdCallback()
   }
   else if (t_cur >= traj_duration_)
   {
-    // 轨迹结束，使用轨迹终点悬停不跳变到goal_pose
-    // （急停/打断场景 goal_pose 可能指向障碍物内的不可达目标）
     pos_flu = traj_[0].evaluateDeBoorT(traj_duration_);
+    // 正常完成：终点接近goal → 输出精确goal位置消除B样条近似误差
+    // 急停打断：终点远离goal → 保持悬停避免飞向障碍物内目标
+    if (have_goal_ && !goal_near_origin_)
+    {
+      double dist_to_goal = (pos_flu - Eigen::Vector3d(
+          goal_pose.pose.position.x,
+          goal_pose.pose.position.y,
+          goal_pose.pose.position.z)).norm();
+      if (dist_to_goal < 0.5)
+      {
+        pos_flu(0) = goal_pose.pose.position.x;
+        pos_flu(1) = goal_pose.pose.position.y;
+        pos_flu(2) = goal_pose.pose.position.z;
+      }
+    }
     vel.setZero();
     acc.setZero();
     pos_f = pos_flu;
