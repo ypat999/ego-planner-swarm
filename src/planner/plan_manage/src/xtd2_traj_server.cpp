@@ -320,16 +320,26 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
 
   // 计算目标偏航角
   double yaw_temp;
-  // 轨迹执行中（t_cur在有效范围内）始终用轨迹方向，不跳变到目标yaw
-  // 轨迹结束后才使用目标偏航角
+  // 轨迹结束后使用目标偏航角
   if (t_cur >= traj_duration_ && have_goal_) {
     yaw_temp = target_yaw_;
   } else {
-    // 使用轨迹的前瞻点计算方向
-    Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_
-              ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos
-              : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
-    yaw_temp = dir.norm() > 0.001 ? atan2(dir(1), dir(0)) : last_yaw_;
+    // 轨迹执行中：接近目标时提前转向目标偏航角，否则跟随轨迹方向
+    if (have_goal_) {
+      double dist_to_goal = (Eigen::Vector2d(pos(0), pos(1))
+                           - Eigen::Vector2d(current_goal_pos_(0), current_goal_pos_(1))).norm();
+      if (dist_to_goal < 2.0) {
+        yaw_temp = target_yaw_;  // 距目标2m内提前旋转到目标yaw
+      } else {
+        goto use_traj_yaw;
+      }
+    } else {
+      use_traj_yaw:
+      Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_
+                ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos
+                : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
+      yaw_temp = dir.norm() > 0.001 ? atan2(dir(1), dir(0)) : last_yaw_;
+    }
   }
 
   // 根据时间差计算本周期允许的最大偏航角变化量
