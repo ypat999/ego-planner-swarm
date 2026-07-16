@@ -850,6 +850,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
   // 急停情况下提前退出
   int BsplineOptimizer::earlyExit(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls)
   {
+    (void)x; (void)g; (void)fx; (void)xnorm; (void)gnorm; (void)step; (void)n; (void)k; (void)ls;
     BsplineOptimizer *opt = reinterpret_cast<BsplineOptimizer *>(func_data);
     // cout << "k=" << k << endl;
     // cout << "opt->flag_continue_to_optimize_=" << opt->flag_continue_to_optimize_ << endl;
@@ -1580,8 +1581,8 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
       success = false;
 
       // 控制点数组初始化
-      double q[variable_num_];
-      memcpy(q, cps_.points.data() + 3 * start_id, variable_num_ * sizeof(q[0]));
+      std::vector<double> q(variable_num_);
+      memcpy(q.data(), cps_.points.data() + 3 * start_id, variable_num_ * sizeof(q[0]));
 
       // 初始化L-BFGS算法的参数
       lbfgs::lbfgs_parameter_t lbfgs_params;
@@ -1593,7 +1594,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
       /* ---------- optimize ---------- */
       t1 = rclcpp::Clock().now();
       // 执行优化
-      int result = lbfgs::lbfgs_optimize(variable_num_, q, &final_cost, BsplineOptimizer::costFunctionRebound, NULL, BsplineOptimizer::earlyExit, this, &lbfgs_params);
+      int result = lbfgs::lbfgs_optimize(variable_num_, q.data(), &final_cost, BsplineOptimizer::costFunctionRebound, NULL, BsplineOptimizer::earlyExit, this, &lbfgs_params);
       t2 = rclcpp::Clock().now();
       double time_ms = (t2 - t1).seconds() * 1000;
       double total_time_ms = (t2 - t0).seconds() * 1000;
@@ -1745,10 +1746,10 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     int end_id = this->cps_.points.cols() - order_;
     variable_num_ = 3 * (end_id - start_id);
 
-    double q[variable_num_];
+    std::vector<double> q(variable_num_);
     double final_cost;
 
-    memcpy(q, cps_.points.data() + 3 * start_id, variable_num_ * sizeof(q[0]));
+    memcpy(q.data(), cps_.points.data() + 3 * start_id, variable_num_ * sizeof(q[0]));
 
     double origin_lambda4 = lambda4_;
     bool flag_safe = true;
@@ -1761,7 +1762,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
       lbfgs_params.max_iterations = 200;
       lbfgs_params.g_epsilon = 0.001;
 
-      int result = lbfgs::lbfgs_optimize(variable_num_, q, &final_cost, BsplineOptimizer::costFunctionRefine, NULL, NULL, this, &lbfgs_params);
+      int result = lbfgs::lbfgs_optimize(variable_num_, q.data(), &final_cost, BsplineOptimizer::costFunctionRefine, NULL, NULL, this, &lbfgs_params);
       if (result == lbfgs::LBFGS_CONVERGENCE ||
           result == lbfgs::LBFGSERR_MAXIMUMITERATION ||
           result == lbfgs::LBFGS_ALREADY_MINIMIZED ||
