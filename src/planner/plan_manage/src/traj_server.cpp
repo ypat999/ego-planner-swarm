@@ -262,7 +262,7 @@ int main(int argc, char **argv)
   node->get_parameter("traj_server/time_forward", time_forward_);
 
   // 参数运行时修改回调
-  node->add_on_set_parameters_callback(
+  auto param_handle = node->add_on_set_parameters_callback(
     [](const std::vector<rclcpp::Parameter> & params) {
       for (const auto & p : params) {
         const auto & name = p.get_name();
