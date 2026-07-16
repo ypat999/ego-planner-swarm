@@ -147,6 +147,9 @@ namespace ego_planner
                + (d_remain - pow(pp_.max_vel_, 2) / pp_.max_acc_) / pp_.max_vel_;
         }
 
+        printf("[poly init] dist=%.2f v0_proj=%.2f d_decel=%.2f d_remain=%.2f time=%.2f\n",
+               dist, v0_proj, d_decel, d_remain, time);
+
         if (!flag_randomPolyTraj)
         // false生成一段单一的多项式轨迹，true生成一个包含随机插入点的轨迹
         {

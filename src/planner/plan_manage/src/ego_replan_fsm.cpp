@@ -1214,6 +1214,11 @@ namespace ego_planner
     start_vel_ = odom_vel_;
     start_acc_.setZero();
 
+    RCLCPP_INFO(node_->get_logger(),
+        "planFromGlobalTraj: odom_pos=(%.2f,%.2f,%.2f) odom_vel=(%.2f,%.2f,%.2f) norm=%.2f",
+        start_pt_(0), start_pt_(1), start_pt_(2),
+        start_vel_(0), start_vel_(1), start_vel_(2), start_vel_.norm());
+
     bool flag_random_poly_init;
     if (timesOfConsecutiveStateCalls().first == 1)
       flag_random_poly_init = false;
