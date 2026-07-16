@@ -1309,6 +1309,16 @@ namespace ego_planner
     // double t_cur_global = ros::Time::now().toSec();
     double t_cur_global = rclcpp::Clock().now().seconds();
 
+    // 优先检查终点是否在障碍物内，若目标本身不可达则立即急停
+    double t_end = info->duration_;
+    bool end_occ = map->getInflateOccupancy(info->position_traj_.evaluateDeBoorT(t_end));
+    if (end_occ)
+    {
+      RCLCPP_WARN(node_->get_logger(), "轨迹终点在膨胀区内，EMERGENCY_STOP");
+      changeFSMExecState(EMERGENCY_STOP, "END_IN_OBS");
+      return;
+    }
+
     double t_2_3 = info->duration_ * 2 / 3;
     for (double t = t_cur; t < info->duration_; t += time_step)
     {
