@@ -1226,12 +1226,13 @@ namespace ego_planner
 
   bool EGOReplanFSM::planFromGlobalTraj(const int trial_times /*=1*/) // zx-todo
   {
-    // 目标点在障碍物中，拒绝规划，避免飞入膨胀区
+    // 目标点在障碍物中，拒绝规划，重置目标避免反复重试穿透grid_map时序
     if (planner_manager_->grid_map_->getInflateOccupancy(end_pt_))
     {
       RCLCPP_WARN(node_->get_logger(),
           "目标点(%.2f,%.2f,%.2f)在障碍物中，放弃规划",
           end_pt_(0), end_pt_(1), end_pt_(2));
+      have_target_ = false;
       return false;
     }
 
