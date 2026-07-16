@@ -332,14 +332,6 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
     yaw_temp = dir.norm() > 0.001 ? atan2(dir(1), dir(0)) : last_yaw_;
   }
 
-  static int yaw_debug_cnt = 0;
-  yaw_debug_cnt++;
-  if (yaw_debug_cnt % 40 == 0) // 每2秒（40*50ms）打印一次
-  {
-    printf("[yaw calc] t=%.2f last_yaw=%.2f yaw_temp=%.2f diff=%.2f\n",
-           t_cur, last_yaw_, yaw_temp, yaw_temp - last_yaw_);
-  }
-
   // 根据时间差计算本周期允许的最大偏航角变化量
   double max_yaw_change = YAW_DOT_MAX_PER_SEC * (time_now - time_last).seconds();
 
