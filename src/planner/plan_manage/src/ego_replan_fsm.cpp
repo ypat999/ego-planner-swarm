@@ -371,6 +371,15 @@ namespace ego_planner
 
   void EGOReplanFSM::planNextWaypoint(const Eigen::Vector3d next_wp)
   {
+    // 目标点在障碍物中，拒绝接受，避免反复重试
+    if (planner_manager_->grid_map_->getInflateOccupancy(next_wp))
+    {
+      RCLCPP_WARN(node_->get_logger(),
+          "planNextWaypoint: 目标(%.2f,%.2f,%.2f)在障碍物中，拒绝接受",
+          next_wp(0), next_wp(1), next_wp(2));
+      return;
+    }
+
     bool success = false;
     success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), next_wp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
