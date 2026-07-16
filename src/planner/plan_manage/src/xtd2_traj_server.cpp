@@ -633,22 +633,14 @@ void cmdCallback()
         return;
       }
       
-      // 使用目标点的位置和姿态
+      // 使用目标点的位置
       pos_flu(0) = goal_pose.pose.position.x;
       pos_flu(1) = goal_pose.pose.position.y;
       pos_flu(2) = goal_pose.pose.position.z;
-      
-      // 从目标点的四元数中提取偏航角
-      Eigen::Quaterniond q_goal(goal_pose.pose.orientation.w, 
-                               goal_pose.pose.orientation.x, 
-                               goal_pose.pose.orientation.y, 
-                               goal_pose.pose.orientation.z);
-      Eigen::Vector3d euler = q_goal.toRotationMatrix().eulerAngles(0, 1, 2);
-      yaw_yawdot.first = euler(2);
-      yaw_yawdot.second = 0;
-      
-      // RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Using goal pose: (%.2f, %.2f, %.2f), yaw: %.2f", 
-      //             pos_flu(0), pos_flu(1), pos_flu(2), yaw_yawdot.first);
+
+      // yaw 通过 calculate_yaw 走速率限制，避免跳变
+      // t_cur >= traj_duration_ 时会自动使用 target_yaw_
+      yaw_yawdot = calculate_yaw(t_cur, pos_flu, time_now, time_last);
     }
     else
     {
