@@ -1742,7 +1742,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
   bool BsplineOptimizer::refine_optimize()
   {
     iter_num_ = 0;
-    int start_id = order_;
+    int start_id = order_ + 1;  // 锁定Q3，与 rebound_optimize 一致，防止REFINE阶段反转初始方向
     int end_id = this->cps_.points.cols() - order_;
     variable_num_ = 3 * (end_id - start_id);
 
