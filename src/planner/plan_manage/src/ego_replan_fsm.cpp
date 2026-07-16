@@ -1194,7 +1194,22 @@ namespace ego_planner
       else
       {
         if (enable_fail_safe_ && odom_vel_.norm() < 0.1)
-          changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        {
+          // 检查目标点是否在障碍物中，避免恢复后再次撞墙
+          if (planner_manager_->grid_map_->getInflateOccupancy(end_pt_))
+          {
+            RCLCPP_WARN(node_->get_logger(),
+                "目标点(%.2f,%.2f,%.2f)在障碍物中，放弃规划，等待新目标",
+                end_pt_(0), end_pt_(1), end_pt_(2));
+            have_target_ = false;
+            have_trigger_ = false;
+            changeFSMExecState(WAIT_TARGET, "TARGET_IN_OBS");
+          }
+          else
+          {
+            changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+          }
+        }
       }
 
       flag_escape_emergency_ = false;
