@@ -590,20 +590,21 @@ namespace ego_planner
                     position_diff, same_goal_skip_threshold_);
         is_same_goal = true;
       }
-      // 差异 ≥ 1m：检查是否为同方向延伸，是则也跳过急停
-      else if (have_odom_ && odom_vel_.norm() > 0.5)
+      // 差异 ≥ 1m：检查是否为同方向延伸（新旧目标相对无人机方向一致）
+      else if (have_odom_)
       {
-        // 当前速度方向 vs 新旧目标方向
-        Eigen::Vector3d vel_dir = odom_vel_.normalized();
-        Eigen::Vector3d dir_to_new = (new_goal - odom_pos_).normalized();
-        double dot = vel_dir.dot(dir_to_new);
-
-        if (dot > 0.7) // 同方向（约45°以内）
+        Eigen::Vector3d dir_to_new = (new_goal - odom_pos_);
+        Eigen::Vector3d dir_to_old = (current_transformed_goal_ - odom_pos_);
+        if (dir_to_new.norm() > 0.01 && dir_to_old.norm() > 0.01)
         {
-          RCLCPP_INFO(node_->get_logger(),
-              "新目标点与当前速度同方向(dot=%.2f)，差异%.2fm，跳过急停直接重规划",
-              dot, position_diff);
-          is_same_goal = true;
+          double dot = dir_to_new.normalized().dot(dir_to_old.normalized());
+          if (dot > 0.5) // 同方向（约60°以内）
+          {
+            RCLCPP_INFO(node_->get_logger(),
+                "新目标与当前目标同方向(dot=%.2f)，差异%.2fm，跳过急停直接重规划",
+                dot, position_diff);
+            is_same_goal = true;
+          }
         }
       }
       // 否则 is_same_goal 保持 false，走完整急停+重置
