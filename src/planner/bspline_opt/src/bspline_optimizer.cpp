@@ -1559,8 +1559,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
   {
     iter_num_ = 0;
     int start_id = order_ + 1;  // 锁定Q3，防止优化器反转初始轨迹方向造成后退急刹
-    // int end_id = this->cps_.size - order_; //Fixed end
-    int end_id = this->cps_.size; // Free end
+    int end_id = this->cps_.size - order_; // 锁定末段控制点，确保终速逐步减为0而非急刹
     // 变量个数
     variable_num_ = 3 * (end_id - start_id);
 
