@@ -388,7 +388,9 @@ namespace ego_planner
     t_refine = rclcpp::Clock().now() - t_start;
 
     // save planned results
-    updateTrajInfo(pos, rclcpp::Clock().now());
+    // 用规划开始时刻作为 start_time，让 traj_server 计算 t_cur 时自然包含优化延迟，
+    // 轨迹位置与飞机实际位置对齐，避免因时间差导致拉回
+    updateTrajInfo(pos, t_start);
 
     static double sum_time = 0;
     static int count_success = 0;
