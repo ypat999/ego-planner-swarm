@@ -1098,13 +1098,13 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     gradient.col(q.cols() - 2) += 2 * dq * (4 / 6.0);
     gradient.col(q.cols() - 1) += 2 * dq * (1 / 6.0);
 
-    // 终点速度约束：惩罚非零终速，让轨迹自然减速到零
+    // 终点速度约束：惩罚非零终速，高权重强制轨迹自然减速到零
     Eigen::Vector3d end_vel = (q_1 - q_3) / (2.0 * bspline_interval_);
-    cost += end_vel.squaredNorm();
+    cost += 10.0 * end_vel.squaredNorm();
 
-    gradient.col(q.cols() - 3) += 2 * end_vel * (-1.0 / (2.0 * bspline_interval_));
+    gradient.col(q.cols() - 3) += 20.0 * end_vel * (-1.0 / (2.0 * bspline_interval_));
     gradient.col(q.cols() - 2) += Eigen::Vector3d::Zero(); // q_2 不影响终速
-    gradient.col(q.cols() - 1) += 2 * end_vel * ( 1.0 / (2.0 * bspline_interval_));
+    gradient.col(q.cols() - 1) += 20.0 * end_vel * ( 1.0 / (2.0 * bspline_interval_));
   }
 
   void BsplineOptimizer::calcFeasibilityCost(const Eigen::MatrixXd &q, double &cost,
