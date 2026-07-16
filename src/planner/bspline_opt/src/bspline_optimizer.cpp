@@ -1098,13 +1098,19 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     gradient.col(q.cols() - 2) += 2 * dq * (4 / 6.0);
     gradient.col(q.cols() - 1) += 2 * dq * (1 / 6.0);
 
-    // 终点速度约束：惩罚非零终速，高权重强制轨迹自然减速到零
-    Eigen::Vector3d end_vel = (q_1 - q_3) / (2.0 * bspline_interval_);
-    cost += 10.0 * end_vel.squaredNorm();
-
-    gradient.col(q.cols() - 3) += 20.0 * end_vel * (-1.0 / (2.0 * bspline_interval_));
-    gradient.col(q.cols() - 2) += Eigen::Vector3d::Zero(); // q_2 不影响终速
-    gradient.col(q.cols() - 1) += 20.0 * end_vel * ( 1.0 / (2.0 * bspline_interval_));
+    // 末段多级速度约束：最后4段逐步减速，避免尾段冲刺
+    const int n = q.cols();
+    const double weights[] = {10.0, 5.0, 2.0, 0.5};
+    for (int k = 0; k < 4 && n - 3 - k >= 0; k++)
+    {
+      int i1 = n - 1 - k;      // Q_{n-1}, Q_{n-2}, Q_{n-3}, Q_{n-4}
+      int i3 = n - 3 - k;      // Q_{n-3}, Q_{n-4}, Q_{n-5}, Q_{n-6}
+      double w = weights[k];
+      Eigen::Vector3d vel = (q.col(i1) - q.col(i3)) / (2.0 * bspline_interval_);
+      cost += w * vel.squaredNorm();
+      gradient.col(i3) += 2.0 * w * vel * (-1.0 / (2.0 * bspline_interval_));
+      gradient.col(i1) += 2.0 * w * vel * ( 1.0 / (2.0 * bspline_interval_));
+    }
   }
 
   void BsplineOptimizer::calcFeasibilityCost(const Eigen::MatrixXd &q, double &cost,
