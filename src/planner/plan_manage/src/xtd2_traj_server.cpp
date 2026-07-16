@@ -290,7 +290,8 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstPtr &msg)
       szd_active_ = false;
       szd_phase_ = SZD_NONE;
     }
-    receive_traj_ = false;
+    // 不再设置 receive_traj_ = false，避免中断当前轨迹执行
+    // 新 bspline 到达后会自然替换当前轨迹
   }
 
   // 从目标点的四元数中提取偏航角，存储到 target_yaw_ 供后续使用
