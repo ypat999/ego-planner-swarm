@@ -57,6 +57,7 @@ double time_forward_ = 0.5;
 bool szd_enabled_ = false;
 double szd_speed_ = 0.5;
 Eigen::Vector3d szd_zone_size_ = Eigen::Vector3d(2.0, 2.0, 2.0);
+double szd_z_offset_ = 0.0;  // SZD目标z偏移，负值表示再下降(补偿定位误差)
 double szd_position_threshold_ = 0.05;
 
 // Safe zone descent state
@@ -266,7 +267,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
   {
     szd_active_ = true;
     szd_phase_ = SZD_HORIZONTAL;
-    szd_target_ = new_goal_pos;
+    szd_target_ = new_goal_pos + Eigen::Vector3d(0, 0, szd_z_offset_);
     szd_ref_pos_initialized_ = false;
     szd_cmd_count_ = 0;  // 重置命令计数器
     receive_traj_ = false;
@@ -747,6 +748,8 @@ int main(int argc, char **argv)
   node->declare_parameter("safe_zone_descent/position_threshold", 0.05);
   node->get_parameter("safe_zone_descent/position_threshold", szd_position_threshold_);
 
+  node->declare_parameter("safe_zone_descent/z_offset", 0.0);
+  node->get_parameter("safe_zone_descent/z_offset", szd_z_offset_);
   // 参数运行时修改回调
   auto param_handle = node->add_on_set_parameters_callback(
     [](const std::vector<rclcpp::Parameter> & params) {
@@ -761,6 +764,7 @@ int main(int argc, char **argv)
         else if (name == "safe_zone_descent/zone_size_y") szd_zone_size_(1) = p.as_double();
         else if (name == "safe_zone_descent/zone_size_z") szd_zone_size_(2) = p.as_double();
         else if (name == "safe_zone_descent/position_threshold") szd_position_threshold_ = p.as_double();
+        else if (name == "safe_zone_descent/z_offset") szd_z_offset_ = p.as_double();
       }
       rcl_interfaces::msg::SetParametersResult result;
       result.successful = true;
@@ -817,9 +821,9 @@ int main(int argc, char **argv)
   RCLCPP_INFO(node->get_logger(), "Subscribed to goal pose: /goal_pose_3d");
   RCLCPP_INFO(node->get_logger(), "Subscribed to grid map cloud: %s", grid_map_cloud_topic.c_str());
   RCLCPP_INFO(node->get_logger(), "Subscribed to grid map pose: %s", grid_map_pose_topic.c_str());
-  RCLCPP_INFO(node->get_logger(), "Safe zone descent: enabled=%s, speed=%.2f m/s, yaw_speed=%.2f rad/s, zone_size=[%.2f, %.2f, %.2f], threshold=%.3f",
+  RCLCPP_INFO(node->get_logger(), "Safe zone descent: enabled=%s, speed=%.2f m/s, yaw_speed=%.2f rad/s, zone_size=[%.2f, %.2f, %.2f], threshold=%.3f, z_offset=%.2f",
               szd_enabled_ ? "true" : "false", szd_speed_, szd_yaw_speed_,
-              szd_zone_size_(0), szd_zone_size_(1), szd_zone_size_(2), szd_position_threshold_);
+              szd_zone_size_(0), szd_zone_size_(1), szd_zone_size_(2), szd_position_threshold_, szd_z_offset_);
 
   rclcpp::spin(node);
   rclcpp::shutdown();
