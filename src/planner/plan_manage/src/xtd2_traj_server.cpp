@@ -594,9 +594,34 @@ void cmdCallback()
   /* no publishing before receive traj_ */
   if (!receive_traj_)
   {
-    if (have_goal_)
+    if (have_odom_)
     {
-      RCLCPP_DEBUG(rclcpp::get_logger("traj_server"), "Received goal pose but waiting for trajectory (bspline)...");
+      // 放弃规划或无轨迹时，持续发送当前位置使无人机悬停
+      pos_cmd.header.stamp = time_now;
+      pos_cmd.header.frame_id = "world";
+      pos_cmd.trajectory_flag = quadrotor_msgs::msg::PositionCommand::TRAJECTORY_STATUS_READY;
+      pos_cmd.trajectory_id = traj_id_;
+
+      pos_cmd.position.x = current_pos_(0);
+      pos_cmd.position.y = current_pos_(1);
+      pos_cmd.position.z = current_pos_(2);
+
+      pos_cmd.velocity.x = 0.0;
+      pos_cmd.velocity.y = 0.0;
+      pos_cmd.velocity.z = 0.0;
+
+      pos_cmd.acceleration.x = 0.0;
+      pos_cmd.acceleration.y = 0.0;
+      pos_cmd.acceleration.z = 0.0;
+
+      // 从当前姿态提取yaw保持朝向
+      Eigen::Matrix3d rot = current_orientation_.toRotationMatrix();
+      double yaw = atan2(rot(1, 0), rot(0, 0));
+      pos_cmd.yaw = yaw;
+      pos_cmd.yaw_dot = 0.0;
+      last_yaw_ = yaw;
+
+      pos_cmd_pub->publish(pos_cmd);
     }
     return;
   }
