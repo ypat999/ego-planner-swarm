@@ -1328,22 +1328,13 @@ namespace ego_planner
     // double t_cur_global = ros::Time::now().toSec();
     double t_cur_global = rclcpp::Clock().now().seconds();
 
-    // 优先检查终点是否在障碍物内，若终点在膨胀区且飞机也已触及膨胀区则急停
-    // 仅终点在膨胀区但飞机尚未触及时不触发急停，继续飞行等待重规划绕开
+    // 优先检查终点是否在障碍物内，若目标本身不可达则立即急停
     double t_end = info->duration_;
     bool end_occ = map->getInflateOccupancy(info->position_traj_.evaluateDeBoorT(t_end));
     if (end_occ)
     {
-      bool cur_occ = map->getInflateOccupancy(p_cur);
-      if (cur_occ)
-      {
-        RCLCPP_WARN(node_->get_logger(), "轨迹终点在膨胀区内且飞机已触及膨胀区，EMERGENCY_STOP");
-        changeFSMExecState(EMERGENCY_STOP, "END_IN_OBS");
-      }
-      else
-      {
-        RCLCPP_WARN(node_->get_logger(), "轨迹终点暂时在膨胀区内，但飞机尚未触及，继续飞行等待重规划绕开");
-      }
+      RCLCPP_WARN(node_->get_logger(), "轨迹终点在膨胀区内，EMERGENCY_STOP");
+      changeFSMExecState(EMERGENCY_STOP, "END_IN_OBS");
       return;
     }
 
