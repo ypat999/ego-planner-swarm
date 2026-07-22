@@ -115,6 +115,10 @@ void stopPlanningCallback(const std_msgs::msg::Empty::ConstSharedPtr msg)
   szd_active_ = false;
   szd_phase_ = SZD_NONE;
   szd_ref_pos_initialized_ = false;
+  has_valid_goal_ = false;  // 重置目标点状态，允许后续相同目标点重新触发
+  have_goal_ = false;       // 重置目标点标志
+  goal_near_origin_ = false; // 重置安全区标志
+  szd_cmd_count_ = 0;       // 重置命令计数器
 }
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstSharedPtr msg)
@@ -157,6 +161,17 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstSharedPtr msg)
   traj_.push_back(traj_[1].getDerivative());
 
   traj_duration_ = traj_[0].getTimeSum();
+
+  // 新轨迹开始时，将last_yaw_设置为当前无人机的yaw角
+  // 这样第一个点的yaw会从当前yaw开始，然后平滑过渡到轨迹方向
+  if (have_odom_)
+  {
+    Eigen::Matrix3d rot = current_orientation_.toRotationMatrix();
+    last_yaw_ = atan2(rot(1, 0), rot(0, 0));
+    RCLCPP_DEBUG(rclcpp::get_logger("traj_server"),
+                "新轨迹开始，初始化yaw为当前无人机朝向: %.2f rad (%.2f deg)",
+                last_yaw_, last_yaw_ * 180.0 / M_PI);
+  }
 
   receive_traj_ = true;
 }
