@@ -594,7 +594,7 @@ void cmdCallback()
     // 添加详细日志，前10次命令输出详细信息
     if (szd_cmd_count_ < 10)
     {
-      RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+      RCLCPP_DEBUG(rclcpp::get_logger("traj_server"),
                   "SZD cmd #%d: phase=%d, pos=(%.2f, %.2f, %.2f), yaw=%.2f rad (%.2f deg), yaw_dot=%.2f rad/s",
                   szd_cmd_count_, szd_phase_,
                   pos_flu(0), pos_flu(1), pos_flu(2),

@@ -826,7 +826,7 @@ namespace ego_planner
     }
     
     // 定期输出数据质量统计
-    if (odom_count % 1000 == 0 && odom_count > 1)
+    if (odom_count % 10000 == 0 && odom_count > 1)
     {
       double avg_pos_error = total_position_error / (odom_count - 1);
       double avg_vel_error = total_velocity_error / (odom_count - 1);
