@@ -123,7 +123,7 @@ def generate_launch_description():
             {'fsm/thresh_no_replan_meter': 1.0},
             {'fsm/planning_horizon': planning_horizon},
             {'fsm/planning_horizen_time': 3.0},
-            {'fsm/emergency_time': 1.0},
+            {'fsm/emergency_time': 0.5},
             {'fsm/realworld_experiment': False},
             {'fsm/fail_safe': True},
             
