@@ -740,7 +740,7 @@ int main(int argc, char **argv)
   gethostname(hostname, HOST_NAME_MAX);
   std::string hostname_str(hostname);
 
-  if (hostname_str == "ywj-B250-D3A" || hostname_str == "DESKTOP-ypat")
+  if (hostname_str == "ywj-B250-D3A" || hostname_str == "DESKTOP-ypat" || hostname_str == "DESKTOP-4LS1SSN")
   {
     default_namespace = "/x500_depth_0/";
     default_use_sim_time = true;
