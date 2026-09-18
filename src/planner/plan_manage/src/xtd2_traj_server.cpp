@@ -8,7 +8,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Geometry>
 #include <tf2_ros/transform_listener.h>
-#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <unistd.h>
@@ -40,7 +40,7 @@ double target_yaw_ = 0.0;
 // TF transform variables
 std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_static_broadcaster_;
 std::string target_frame_ = "world"; // 目标坐标系frame_id
 
 using ego_planner::UniformBspline;
@@ -461,9 +461,11 @@ void cmdCallback()
   }
   log_counter++;
 
-  // 降落阶段：以更高频率发布 map->odom 恒等TF（完全重合），
-  // 用最新时间戳压制 lidar_localization 的地图匹配TF，避免降落点受匹配偏差影响
-  if (szd_active_ && tf_broadcaster_)
+  // 降落阶段：通过 /tf_static 持续发布 map->odom 恒等TF（完全重合），
+  // 与 lidar_localization 的 static 发布同类型，后到消息覆盖其匹配结果；
+  // 20Hz 重发保证覆盖时效性，避免快落地时又被匹配TF拉偏。
+  // 降落后不再重发，下次起飞由 lidar_localization 重新匹配即可。
+  if (szd_active_ && tf_static_broadcaster_)
   {
     geometry_msgs::msg::TransformStamped map_odom_tf;
     map_odom_tf.header.stamp = time_now;
@@ -476,7 +478,7 @@ void cmdCallback()
     map_odom_tf.transform.rotation.y = 0.0;
     map_odom_tf.transform.rotation.z = 0.0;
     map_odom_tf.transform.rotation.w = 1.0;
-    tf_broadcaster_->sendTransform(map_odom_tf);
+    tf_static_broadcaster_->sendTransform(map_odom_tf);
   }
 
   if (szd_active_ && have_odom_)
@@ -837,8 +839,8 @@ int main(int argc, char **argv)
   // Initialize TF buffer and listener
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-  // TF broadcaster，用于降落阶段发布 map->odom 恒等TF
-  tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(node);
+  // 静态TF broadcaster，用于降落阶段在 /tf_static 上发布 map->odom 恒等TF
+  tf_static_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(node);
   
   if (ros_ns.empty()) {
     RCLCPP_WARN(node->get_logger(), "ROS namespace not specified, using default topics");
