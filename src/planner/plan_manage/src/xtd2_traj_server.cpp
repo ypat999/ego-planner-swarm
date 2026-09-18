@@ -59,7 +59,7 @@ double time_forward_ = 0.5;
 bool szd_enabled_ = false;
 double szd_speed_ = 0.5;
 Eigen::Vector3d szd_zone_size_ = Eigen::Vector3d(2.0, 2.0, 2.0);
-double szd_z_offset_ = 0.0;  // SZD目标z偏移，负值表示再下降(补偿定位误差)
+double szd_z_offset_ = -2.0;  // SZD目标z偏移，负值表示再下降(补偿定位误差)
 double szd_position_threshold_ = 0.05;
 
 // Safe zone descent state
@@ -285,7 +285,7 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
     szd_active_ = true;
     szd_phase_ = SZD_HORIZONTAL;
     // 降落点强制取 world 坐标系 (0,0)，z 沿用目标点高度+偏移，避免地图匹配偏差
-    szd_target_ = Eigen::Vector3d(0.0, 0.0, new_goal_pos(2) + szd_z_offset_);
+    szd_target_ = Eigen::Vector3d(0.0, 0.0, szd_z_offset_);
     szd_ref_pos_initialized_ = false;
     szd_cmd_count_ = 0;  // 重置命令计数器
     receive_traj_ = false;
