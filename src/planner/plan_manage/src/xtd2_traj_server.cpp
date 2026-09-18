@@ -8,6 +8,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Geometry>
 #include <tf2_ros/transform_listener.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <unistd.h>
@@ -39,6 +40,7 @@ double target_yaw_ = 0.0;
 // TF transform variables
 std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 std::string target_frame_ = "world"; // 目标坐标系frame_id
 
 using ego_planner::UniformBspline;
@@ -282,13 +284,16 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
   {
     szd_active_ = true;
     szd_phase_ = SZD_HORIZONTAL;
-    szd_target_ = new_goal_pos + Eigen::Vector3d(0, 0, szd_z_offset_);
+    // 降落点强制取 world 坐标系 (0,0)，z 沿用目标点高度+偏移，避免地图匹配偏差
+    szd_target_ = Eigen::Vector3d(0.0, 0.0, new_goal_pos(2) + szd_z_offset_);
     szd_ref_pos_initialized_ = false;
     szd_cmd_count_ = 0;  // 重置命令计数器
     receive_traj_ = false;
     RCLCPP_INFO(rclcpp::get_logger("traj_server"),
-                "Target (%.2f, %.2f, %.2f) is in safe zone, activating safe zone descent mode (speed=%.2f)",
-                new_goal_pos(0), new_goal_pos(1), new_goal_pos(2), szd_speed_);
+                "Target (%.2f, %.2f, %.2f) is in safe zone, activating safe zone descent mode (speed=%.2f), "
+                "landing point forced to world origin: (%.2f, %.2f, %.2f)",
+                new_goal_pos(0), new_goal_pos(1), new_goal_pos(2), szd_speed_,
+                szd_target_(0), szd_target_(1), szd_target_(2));
     RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                 "Safe zone descent activated: szd_active_=%s, have_odom_=%s, current_pos_=(%.2f, %.2f, %.2f)",
                 szd_active_ ? "true" : "false", have_odom_ ? "true" : "false",
@@ -455,6 +460,24 @@ void cmdCallback()
                          "Safe zone descent active but no odometry data received yet!");
   }
   log_counter++;
+
+  // 降落阶段：以更高频率发布 map->odom 恒等TF（完全重合），
+  // 用最新时间戳压制 lidar_localization 的地图匹配TF，避免降落点受匹配偏差影响
+  if (szd_active_ && tf_broadcaster_)
+  {
+    geometry_msgs::msg::TransformStamped map_odom_tf;
+    map_odom_tf.header.stamp = time_now;
+    map_odom_tf.header.frame_id = "map";
+    map_odom_tf.child_frame_id = "odom";
+    map_odom_tf.transform.translation.x = 0.0;
+    map_odom_tf.transform.translation.y = 0.0;
+    map_odom_tf.transform.translation.z = 0.0;
+    map_odom_tf.transform.rotation.x = 0.0;
+    map_odom_tf.transform.rotation.y = 0.0;
+    map_odom_tf.transform.rotation.z = 0.0;
+    map_odom_tf.transform.rotation.w = 1.0;
+    tf_broadcaster_->sendTransform(map_odom_tf);
+  }
 
   if (szd_active_ && have_odom_)
   {
@@ -814,6 +837,8 @@ int main(int argc, char **argv)
   // Initialize TF buffer and listener
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+  // TF broadcaster，用于降落阶段发布 map->odom 恒等TF
+  tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(node);
   
   if (ros_ns.empty()) {
     RCLCPP_WARN(node->get_logger(), "ROS namespace not specified, using default topics");
