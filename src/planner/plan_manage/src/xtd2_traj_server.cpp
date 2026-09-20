@@ -55,7 +55,8 @@ double time_forward_ = 0.5;
 
 // Safe zone descent configuration
 bool szd_enabled_ = false;
-double szd_speed_ = 0.5;
+double szd_speed_ = 0.5;          // 水平(xy)修正速度上限，仅作用于水平段
+double szd_descend_speed_ = 0.5;  // 垂直(z)下降速度上限，独立于水平速度调节
 Eigen::Vector3d szd_zone_size_ = Eigen::Vector3d(2.0, 2.0, 2.0);
 double szd_z_offset_ = -2.0;  // SZD目标z偏移，负值表示再下降(补偿定位误差)
 double szd_position_threshold_ = 0.05;
@@ -571,11 +572,11 @@ void cmdCallback()
       else
       {
         // xy 直接钉死在降落点上方（最强修正，边降边拉回），
-        // z 按前视限速下降，到底前速度按 |dz|/T 自然收敛
+        // z 按前视限速下降（速度上限用独立的 descend_speed），到底前按 |dz|/T 自然收敛
         const double v_z = std::copysign(
-          min(szd_speed_, fabs(dz) / szd_lookahead_time_), dz);
+          min(szd_descend_speed_, fabs(dz) / szd_lookahead_time_), dz);
         const double lead_z = std::copysign(
-          min(fabs(dz), szd_speed_ * szd_lookahead_time_), dz);
+          min(fabs(dz), szd_descend_speed_ * szd_lookahead_time_), dz);
         pos_flu = Eigen::Vector3d(szd_target_(0), szd_target_(1),
                                   current_pos_(2) + lead_z);
         vel = Eigen::Vector3d(0.0, 0.0, v_z);
@@ -798,6 +799,8 @@ int main(int argc, char **argv)
   node->get_parameter("safe_zone_descent/enabled", szd_enabled_);
   node->declare_parameter("safe_zone_descent/speed", 0.5);
   node->get_parameter("safe_zone_descent/speed", szd_speed_);
+  node->declare_parameter("safe_zone_descent/descend_speed", 0.5);
+  node->get_parameter("safe_zone_descent/descend_speed", szd_descend_speed_);
   node->declare_parameter("safe_zone_descent/yaw_speed", 1.0);
   node->get_parameter("safe_zone_descent/yaw_speed", szd_yaw_speed_);
   node->declare_parameter("safe_zone_descent/zone_size_x", 2.0);
@@ -823,6 +826,7 @@ int main(int argc, char **argv)
         else if (name == "traj_server/frame_id") target_frame_ = p.as_string();
         else if (name == "safe_zone_descent/enabled") szd_enabled_ = p.as_bool();
         else if (name == "safe_zone_descent/speed") szd_speed_ = p.as_double();
+        else if (name == "safe_zone_descent/descend_speed") szd_descend_speed_ = p.as_double();
         else if (name == "safe_zone_descent/yaw_speed") szd_yaw_speed_ = p.as_double();
         else if (name == "safe_zone_descent/zone_size_x") szd_zone_size_(0) = p.as_double();
         else if (name == "safe_zone_descent/zone_size_y") szd_zone_size_(1) = p.as_double();
@@ -889,8 +893,8 @@ int main(int argc, char **argv)
   RCLCPP_INFO(node->get_logger(), "Subscribed to goal pose: /goal_pose_3d");
   RCLCPP_INFO(node->get_logger(), "Subscribed to grid map cloud: %s", grid_map_cloud_topic.c_str());
   RCLCPP_INFO(node->get_logger(), "Subscribed to grid map pose: %s", grid_map_pose_topic.c_str());
-  RCLCPP_INFO(node->get_logger(), "Safe zone descent: enabled=%s, speed=%.2f m/s, yaw_speed=%.2f rad/s, zone_size=[%.2f, %.2f, %.2f], threshold=%.3f, z_offset=%.2f, lookahead=%.2fs",
-              szd_enabled_ ? "true" : "false", szd_speed_, szd_yaw_speed_,
+  RCLCPP_INFO(node->get_logger(), "Safe zone descent: enabled=%s, xy_speed=%.2f m/s, descend_speed=%.2f m/s, yaw_speed=%.2f rad/s, zone_size=[%.2f, %.2f, %.2f], threshold=%.3f, z_offset=%.2f, lookahead=%.2fs",
+              szd_enabled_ ? "true" : "false", szd_speed_, szd_descend_speed_, szd_yaw_speed_,
               szd_zone_size_(0), szd_zone_size_(1), szd_zone_size_(2), szd_position_threshold_, szd_z_offset_, szd_lookahead_time_);
 
   rclcpp::spin(node);
