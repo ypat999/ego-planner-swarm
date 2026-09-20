@@ -59,6 +59,9 @@ double szd_speed_ = 0.5;
 Eigen::Vector3d szd_zone_size_ = Eigen::Vector3d(2.0, 2.0, 2.0);
 double szd_z_offset_ = -2.0;  // SZD目标z偏移，负值表示再下降(补偿定位误差)
 double szd_position_threshold_ = 0.05;
+// 前视时间(s)：闭环制导中设定点相对飞机实际位置的提前量 T，
+// 指令速度 = min(szd_speed_, 距离/T)，兼具"满速纠偏"与"到点自然减速"
+double szd_lookahead_time_ = 0.5;
 
 // Safe zone descent state
 bool szd_active_ = false;
@@ -492,9 +495,13 @@ void cmdCallback()
 
     if (szd_phase_ == SZD_HORIZONTAL)
     {
-      Eigen::Vector3d target(szd_target_(0), szd_target_(1), szd_ref_pos_(2));
-      Eigen::Vector3d dir = target - szd_ref_pos_;
-      double dist = dir.norm();
+      // 闭环前视制导：设定点相对"飞机实际位置"朝降落点(0,0)前伸 lead 距离。
+      // 漂移/偏移立即反映为指令误差 -> 以 szd_speed_ 上限满力修正；
+      // 接近目标时 lead 与 vel 按 距离/T 收缩 -> 自然减速，不会冲过头。
+      // （旧开环爬行：参考点自说自话按 dt 推进，不看飞机，漂了不修、到了刹不住）
+      const Eigen::Vector2d err_xy(szd_target_(0) - current_pos_(0),
+                                   szd_target_(1) - current_pos_(1));
+      const double d_xy = err_xy.norm();
 
       double yaw_diff = target_yaw_ - szd_current_yaw_;
       yaw_diff = normalizeAngle(yaw_diff);
@@ -522,49 +529,57 @@ void cmdCallback()
         yaw_dot = (yaw_diff > 0 ? 1.0 : -1.0) * szd_yaw_speed_;
       }
 
-      if (dist < szd_position_threshold_)
+      if (d_xy < szd_position_threshold_)
       {
-        szd_ref_pos_ = target;
         szd_phase_ = SZD_VERTICAL;
         RCLCPP_INFO(rclcpp::get_logger("traj_server"),
-                    "Safe zone descent: horizontal phase complete at (%.2f, %.2f, %.2f), starting vertical descent to z=%.2f",
-                    szd_ref_pos_(0), szd_ref_pos_(1), szd_ref_pos_(2), szd_target_(2));
+                    "Safe zone descent: horizontal phase complete, aircraft at (%.2f, %.2f) within %.2fm of (%.2f, %.2f), starting vertical descent to z=%.2f",
+                    current_pos_(0), current_pos_(1), szd_position_threshold_,
+                    szd_target_(0), szd_target_(1), szd_target_(2));
       }
       else
       {
-        dir.normalize();
-        double step = min(szd_speed_ * dt, dist);
-        szd_ref_pos_ += dir * step;
-        vel = dir * szd_speed_;
+        const Eigen::Vector2d dir2 = err_xy / d_xy;
+        const double v_xy = min(szd_speed_, d_xy / szd_lookahead_time_);
+        const double lead = min(d_xy, szd_speed_ * szd_lookahead_time_);
+        pos_flu = Eigen::Vector3d(current_pos_(0) + dir2.x() * lead,
+                                  current_pos_(1) + dir2.y() * lead,
+                                  szd_ref_pos_(2));  // 高度保持激活值
+        vel = Eigen::Vector3d(dir2.x() * v_xy, dir2.y() * v_xy, 0.0);
       }
-      pos_flu = szd_ref_pos_;
     }
     else if (szd_phase_ == SZD_VERTICAL)
     {
-      Eigen::Vector3d target = szd_target_;
-      Eigen::Vector3d dir = target - szd_ref_pos_;
-      double dist = dir.norm();
-
       yaw = target_yaw_;
       yaw_dot = 0.0;
 
-      if (dist < szd_position_threshold_)
+      const double dz = szd_target_(2) - current_pos_(2);
+      const double d_xy = std::hypot(szd_target_(0) - current_pos_(0),
+                                     szd_target_(1) - current_pos_(1));
+
+      if (fabs(dz) < szd_position_threshold_ && d_xy < szd_position_threshold_)
       {
-        szd_ref_pos_ = target;
+        szd_ref_pos_ = szd_target_;
         szd_phase_ = SZD_DONE;
         szd_active_ = false;
+        pos_flu = szd_target_;
+        vel.setZero();
         RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                     "Safe zone descent: vertical descent complete, reached target (%.2f, %.2f, %.2f)",
                     szd_target_(0), szd_target_(1), szd_target_(2));
       }
       else
       {
-        dir.normalize();
-        double step = min(szd_speed_ * dt, dist);
-        szd_ref_pos_ += dir * step;
-        vel = dir * szd_speed_;
+        // xy 直接钉死在降落点上方（最强修正，边降边拉回），
+        // z 按前视限速下降，到底前速度按 |dz|/T 自然收敛
+        const double v_z = std::copysign(
+          min(szd_speed_, fabs(dz) / szd_lookahead_time_), dz);
+        const double lead_z = std::copysign(
+          min(fabs(dz), szd_speed_ * szd_lookahead_time_), dz);
+        pos_flu = Eigen::Vector3d(szd_target_(0), szd_target_(1),
+                                  current_pos_(2) + lead_z);
+        vel = Eigen::Vector3d(0.0, 0.0, v_z);
       }
-      pos_flu = szd_ref_pos_;
     }
     else
     {
@@ -793,6 +808,9 @@ int main(int argc, char **argv)
   node->get_parameter("safe_zone_descent/zone_size_z", szd_zone_size_(2));
   node->declare_parameter("safe_zone_descent/position_threshold", 0.05);
   node->get_parameter("safe_zone_descent/position_threshold", szd_position_threshold_);
+  node->declare_parameter("safe_zone_descent/lookahead_time", 0.5);
+  node->get_parameter("safe_zone_descent/lookahead_time", szd_lookahead_time_);
+  if (szd_lookahead_time_ < 0.1) szd_lookahead_time_ = 0.1;
 
   node->declare_parameter("safe_zone_descent/z_offset", 0.0);
   node->get_parameter("safe_zone_descent/z_offset", szd_z_offset_);
@@ -810,6 +828,10 @@ int main(int argc, char **argv)
         else if (name == "safe_zone_descent/zone_size_y") szd_zone_size_(1) = p.as_double();
         else if (name == "safe_zone_descent/zone_size_z") szd_zone_size_(2) = p.as_double();
         else if (name == "safe_zone_descent/position_threshold") szd_position_threshold_ = p.as_double();
+        else if (name == "safe_zone_descent/lookahead_time") {
+          szd_lookahead_time_ = p.as_double();
+          if (szd_lookahead_time_ < 0.1) szd_lookahead_time_ = 0.1;
+        }
         else if (name == "safe_zone_descent/z_offset") szd_z_offset_ = p.as_double();
       }
       rcl_interfaces::msg::SetParametersResult result;
@@ -867,9 +889,9 @@ int main(int argc, char **argv)
   RCLCPP_INFO(node->get_logger(), "Subscribed to goal pose: /goal_pose_3d");
   RCLCPP_INFO(node->get_logger(), "Subscribed to grid map cloud: %s", grid_map_cloud_topic.c_str());
   RCLCPP_INFO(node->get_logger(), "Subscribed to grid map pose: %s", grid_map_pose_topic.c_str());
-  RCLCPP_INFO(node->get_logger(), "Safe zone descent: enabled=%s, speed=%.2f m/s, yaw_speed=%.2f rad/s, zone_size=[%.2f, %.2f, %.2f], threshold=%.3f, z_offset=%.2f",
+  RCLCPP_INFO(node->get_logger(), "Safe zone descent: enabled=%s, speed=%.2f m/s, yaw_speed=%.2f rad/s, zone_size=[%.2f, %.2f, %.2f], threshold=%.3f, z_offset=%.2f, lookahead=%.2fs",
               szd_enabled_ ? "true" : "false", szd_speed_, szd_yaw_speed_,
-              szd_zone_size_(0), szd_zone_size_(1), szd_zone_size_(2), szd_position_threshold_, szd_z_offset_);
+              szd_zone_size_(0), szd_zone_size_(1), szd_zone_size_(2), szd_position_threshold_, szd_z_offset_, szd_lookahead_time_);
 
   rclcpp::spin(node);
   rclcpp::shutdown();
