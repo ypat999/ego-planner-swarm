@@ -865,7 +865,8 @@ int main(int argc, char **argv)
 
   // Subscribe to goal pose
   goal_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>(
-      "/goal_pose_3d",
+      // "/goal_pose_3d",
+      "/move_base_simple/goal",
       10,
       goalCallback);
 
