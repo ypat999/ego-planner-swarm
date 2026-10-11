@@ -2,6 +2,7 @@
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <sstream>
 
 namespace ego_planner
 {
@@ -123,6 +124,8 @@ namespace ego_planner
 
     bspline_pub_ = node_->create_publisher<traj_utils::msg::Bspline>("planning/bspline", 10);
     data_disp_pub_ = node_->create_publisher<traj_utils::msg::DataDisp>("planning/data_display", 100);
+    // 失效降级互通：/mission_event（String+JSON，复用方案 §14 字段）
+    mission_event_pub_ = node_->create_publisher<std_msgs::msg::String>("/mission_event", 10);
 
     // 停止规划接口：收到后回到WAIT_TARGET，等待下次goal触发
     stop_planning_sub_ = node_->create_subscription<std_msgs::msg::Empty>(
@@ -377,6 +380,9 @@ namespace ego_planner
       RCLCPP_WARN(node_->get_logger(),
           "planNextWaypoint: 目标(%.2f,%.2f,%.2f)在障碍物中，拒绝接受",
           next_wp(0), next_wp(1), next_wp(2));
+      // 失效降级互通：目标在障碍内 → 上报 GOAL_UNREACHABLE（reason=OBSTACLE）
+      publishMissionEvent("GOAL_UNREACHABLE",
+          "\"reason\":\"OBSTACLE\",\"goal_seq\":\"NA\",\"flight_epoch\":\"NA\"");
       return;
     }
 
@@ -1034,6 +1040,36 @@ namespace ego_planner
     // cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
   }
 
+  void EGOReplanFSM::publishMissionEvent(const std::string &event, const std::string &json_fields)
+  {
+    // 发布 /mission_event（String+JSON），复用完整方案 §14 字段。
+    // event: GOAL_UNREACHABLE 等；json_fields: 已拼好的 JSON 键值串（不含外层花括号），
+    //   如 "\"reason\":\"OBSTACLE\",\"goal_seq\":\"NA\",\"flight_epoch\":\"NA\""
+    if (!mission_event_pub_)
+      return;
+    try
+    {
+      std_msgs::msg::String msg;
+      std::ostringstream oss;
+      oss << "{\"event\":\"" << event << "\",\"source\":\"planner\","
+          << "\"ts\":" << (node_->now().nanoseconds() / 1000000.0) << ",";
+      if (!json_fields.empty())
+        oss << json_fields;
+      // 去掉可能留下的尾部逗号
+      std::string s = oss.str();
+      if (!s.empty() && s.back() == ',')
+        s.pop_back();
+      s += "}";
+      msg.data = s;
+      mission_event_pub_->publish(msg);
+      RCLCPP_INFO(node_->get_logger(), "[mission_event] %s", msg.data.c_str());
+    }
+    catch (const std::exception &e)
+    {
+      RCLCPP_WARN(node_->get_logger(), "publish mission_event failed: %s", e.what());
+    }
+  }
+
   std::pair<int, EGOReplanFSM::FSM_EXEC_STATE> EGOReplanFSM::timesOfConsecutiveStateCalls()
   {
     return std::pair<int, FSM_EXEC_STATE>(continously_called_times_, exec_state_);
@@ -1334,9 +1370,17 @@ namespace ego_planner
     {
       RCLCPP_WARN(node_->get_logger(), "最终目标点(%.2f,%.2f,%.2f)在膨胀区内，EMERGENCY_STOP",
           end_pt_(0), end_pt_(1), end_pt_(2));
+      // 失效降级互通：目标在障碍内 → 上报 GOAL_UNREACHABLE（reason=OBSTACLE），去重只发一次
+      if (!last_goal_obstacle_pub_)
+      {
+        last_goal_obstacle_pub_ = true;
+        publishMissionEvent("GOAL_UNREACHABLE",
+            "\"reason\":\"OBSTACLE\",\"goal_seq\":\"NA\",\"flight_epoch\":\"NA\"");
+      }
       changeFSMExecState(EMERGENCY_STOP, "END_IN_OBS");
       return;
     }
+    last_goal_obstacle_pub_ = false;
 
     double t_2_3 = info->duration_ * 2 / 3;
     for (double t = t_cur; t < info->duration_; t += time_step)

@@ -9,6 +9,7 @@
 #include "sensor_msgs/msg/imu.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/empty.hpp"
+#include "std_msgs/msg/string.hpp"
 #include <vector>
 #include "visualization_msgs/msg/marker.hpp"
 
@@ -85,6 +86,7 @@ namespace ego_planner
     bool has_valid_goal_{false}; // 标记是否有有效的目标点
 
     bool flag_escape_emergency_;
+    bool last_goal_obstacle_pub_ = false; // /mission_event 去重：目标进膨胀区只发一次
 
     /* ROS utils */
     rclcpp::Node::SharedPtr node_;
@@ -105,6 +107,7 @@ namespace ego_planner
     rclcpp::Publisher<traj_utils::msg::DataDisp>::SharedPtr data_disp_pub_;
     rclcpp::Publisher<traj_utils::msg::MultiBsplines>::SharedPtr swarm_trajs_pub_;
     rclcpp::Publisher<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mission_event_pub_; // 失效降级互通：/mission_event
 
     /* helper functions */
     bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method
@@ -114,6 +117,7 @@ namespace ego_planner
 
     /* return value: std::pair< Times of the same state be continuously called, current continuously called state > */
     void changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call);
+    void publishMissionEvent(const std::string &event, const std::string &json_fields); // 发 /mission_event
     std::pair<int, EGOReplanFSM::FSM_EXEC_STATE> timesOfConsecutiveStateCalls();
     void printFSMExecState();
 
