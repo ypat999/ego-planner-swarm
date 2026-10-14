@@ -424,12 +424,31 @@ namespace ego_planner
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
       else
       {
+        // 有界等待 EXEC_TRAJ：若 FSM 卡在重规划死循环永远回不到 EXEC_TRAJ，
+        // 无限等待会把目标回调卡死（回调内 spin_some 在单线程执行器下无效），新目标点被忽略
+        bool reached_exec = true;
+        auto t_wait0 = std::chrono::steady_clock::now();
         while (exec_state_ != EXEC_TRAJ)
         {
+          if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t_wait0).count() > 2000)
+          {
+            reached_exec = false;
+            break;
+          }
           rclcpp::spin_some(node_);
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        changeFSMExecState(REPLAN_TRAJ, "TRIG");
+        if (reached_exec)
+        {
+          changeFSMExecState(REPLAN_TRAJ, "TRIG");
+        }
+        else
+        {
+          RCLCPP_WARN(node_->get_logger(),
+                      "planNextWaypoint: 等待EXEC_TRAJ超时(2s)，直接切GEN_NEW_TRAJ生成新轨迹");
+          changeFSMExecState(GEN_NEW_TRAJ, "TRIG_TIMEOUT");
+        }
       }
 
       visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
@@ -1192,6 +1211,21 @@ namespace ego_planner
       else
       {
         changeFSMExecState(REPLAN_TRAJ, "FSM");
+        // 连续失败逃逸：飞行中重规划一直失败时会无限停留在 REPLAN_TRAJ，
+        // 且新目标在 planNextWaypoint 里要等 EXEC_TRAJ 而被卡死；
+        // 连续 3 次失败后放弃当前轨迹，急停悬停并回到 WAIT_TARGET 等待新目标
+        if (timesOfConsecutiveStateCalls().first >= 4)
+        {
+          RCLCPP_WARN(node_->get_logger(),
+                      "REPLAN_TRAJ 连续重规划失败，放弃当前轨迹，急停悬停并回到等待目标");
+          publishMissionEvent("GOAL_UNREACHABLE",
+              "\"reason\":\"REPLAN_FAILED\",\"goal_seq\":\"NA\",\"flight_epoch\":\"NA\"");
+          callEmergencyStop(odom_pos_);
+          have_target_ = false;
+          have_new_target_ = false;
+          has_valid_goal_ = false;
+          changeFSMExecState(WAIT_TARGET, "REPLAN_FAILED");
+        }
       }
 
       break;
