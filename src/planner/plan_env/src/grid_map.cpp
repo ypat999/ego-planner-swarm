@@ -1070,7 +1070,9 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
       if (ray_len > mp_.max_ray_length_)
         pt_w = (pt_w - md_.camera_pos_) / ray_len * mp_.max_ray_length_ + md_.camera_pos_;
 
-      raycaster.setInput(pt_w / mp_.resolution_, md_.camera_pos_ / mp_.resolution_);
+      // 方向必须为 相机→命中点：step() 不输出 end 格，天然不清命中格本身（由后面的标记遍置 1），
+      // 且射线从盒中心单调向外，出盒 break 前已清完盒内近端格；远处命中点也能清理近端射线
+      raycaster.setInput(md_.camera_pos_ / mp_.resolution_, pt_w / mp_.resolution_);
 
       while (raycaster.step(ray_pt))
       {
