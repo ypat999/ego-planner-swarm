@@ -11,6 +11,29 @@ AStar::~AStar()
                 delete GridNodeMap_[i][j][k];
 }
 
+void AStar::setDistPenalty(double weight, double radius)
+{
+    gpen_offsets_.clear();
+    if (weight <= 0.0 || radius <= 0.0)
+    {
+        gpen_weight_ = 0.0;
+        return;
+    }
+    gpen_weight_ = weight;
+    // 14 个采样方向：6 个轴向 + 8 个立方体角，均匀覆盖球面，全部位于半径 radius 处
+    for (int axis = 0; axis < 3; ++axis)
+        for (int sgn = -1; sgn <= 1; sgn += 2)
+        {
+            Eigen::Vector3d d = Eigen::Vector3d::Zero();
+            d(axis) = sgn * radius;
+            gpen_offsets_.push_back(d);
+        }
+    for (int sx : {-1, 1})
+        for (int sy : {-1, 1})
+            for (int sz : {-1, 1})
+                gpen_offsets_.push_back(Eigen::Vector3d(sx, sy, sz).normalized() * radius);
+}
+
 void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
 {
     POOL_SIZE_ = pool_size;
@@ -217,6 +240,9 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
                     }
 
                     double static_cost = sqrt(dx * dx + dy * dy + dz * dz);
+                    // 距离最大化惩罚：邻格周围障碍越多，穿越该格的代价越大，路径被推向自由空间中部
+                    if (gpen_weight_ > 0)
+                        static_cost *= (1.0 + gpen_weight_ * distPenalty(Index2Coord(neighborPtr->index)));
                     tentative_gScore = current->gScore + static_cost;
 
                     if (!flag_explored)

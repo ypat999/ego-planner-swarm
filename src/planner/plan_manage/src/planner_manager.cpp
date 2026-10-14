@@ -20,6 +20,8 @@ namespace ego_planner
     node->declare_parameter("manager/planning_horizon", 5.0);
     node->declare_parameter("manager/use_distinctive_trajs", false);
     node->declare_parameter("manager/drone_id", -1);
+    node->declare_parameter("manager/astar_penalty_weight", 0.0);
+    node->declare_parameter("manager/astar_penalty_radius", 1.0);
 
     node->get_parameter("manager/max_vel", pp_.max_vel_);
     node->get_parameter("manager/max_acc", pp_.max_acc_);
@@ -76,6 +78,13 @@ namespace ego_planner
     bspline_optimizer_->setEnvironment(grid_map_, obj_predictor_);
     bspline_optimizer_->a_star_.reset(new AStar);
     bspline_optimizer_->a_star_->initGridMap(grid_map_, Eigen::Vector3i(100, 100, 100));
+
+    // A* 距离最大化惩罚：让种子路径偏向自由空间中部（如窗心），weight=0 关闭
+    double astar_pen_w, astar_pen_r;
+    node->get_parameter("manager/astar_penalty_weight", astar_pen_w);
+    node->get_parameter("manager/astar_penalty_radius", astar_pen_r);
+    bspline_optimizer_->a_star_->setDistPenalty(astar_pen_w, astar_pen_r);
+    RCLCPP_INFO(node->get_logger(), "A* 距离惩罚: weight=%.2f, radius=%.2f m (0=关闭)", astar_pen_w, astar_pen_r);
 
     visualization_ = vis;
   }

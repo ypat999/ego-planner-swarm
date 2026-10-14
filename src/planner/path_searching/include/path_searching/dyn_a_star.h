@@ -60,6 +60,22 @@ private:
 
 	inline bool checkOccupancy(const Eigen::Vector3d &pos) { return (bool)grid_map_->getInflateOccupancy(pos); }
 
+	/* 距离最大化惩罚：边代价乘以 (1 + weight * 采样占用比例)，
+	   在半径 radius 的球面采样点(6轴向+8角共14点)上检查膨胀占据格，
+	   离障碍越近采样命中越多、边代价越大，使搜索路径偏向自由空间中部（如窗心）。
+	   weight<=0 时完全关闭，零额外开销 */
+	double gpen_weight_{0.0};
+	std::vector<Eigen::Vector3d> gpen_offsets_;
+
+	inline double distPenalty(const Eigen::Vector3d &pos)
+	{
+		int occ_cnt = 0;
+		for (const auto &off : gpen_offsets_)
+			if (checkOccupancy(pos + off))
+				++occ_cnt;
+		return (double)occ_cnt / (double)gpen_offsets_.size();
+	}
+
 	std::vector<GridNodePtr> retrievePath(GridNodePtr current);
 
 	double step_size_, inv_step_size_;
@@ -107,6 +123,9 @@ public:
 	~AStar();
 
 	void initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size);
+
+	/* 配置距离最大化惩罚：weight=惩罚强度(0关闭)，radius=采样球半径(米) */
+	void setDistPenalty(double weight, double radius);
 
 	bool AstarSearch(const double step_size, Eigen::Vector3d start_pt, Eigen::Vector3d end_pt);
 
