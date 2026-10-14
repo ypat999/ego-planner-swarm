@@ -29,9 +29,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/local_update_range_x", -1.0);
   node_->declare_parameter("grid_map/local_update_range_y", -1.0);
   node_->declare_parameter("grid_map/local_update_range_z", -1.0);
-  node_->declare_parameter("grid_map/mark_range_x", -1.0);
-  node_->declare_parameter("grid_map/mark_range_y", -1.0);
-  node_->declare_parameter("grid_map/mark_range_z", -1.0);
   node_->declare_parameter("grid_map/clear_range_x", -1.0);
   node_->declare_parameter("grid_map/clear_range_y", -1.0);
   node_->declare_parameter("grid_map/clear_range_z", -1.0);
@@ -78,30 +75,25 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/local_update_range_x", mp_.local_update_range_(0));
   node_->get_parameter("grid_map/local_update_range_y", mp_.local_update_range_(1));
   node_->get_parameter("grid_map/local_update_range_z", mp_.local_update_range_(2));
-  // 点云模式：大范围加(mark)以保持障碍记忆，小范围减(clear)以兼顾近端动态。
-  // 未配置(<=0)时退化为 local_update_range，保持原行为；clear 不得超过 mark，避免擦掉未被重标的记忆
-  double mark_x, mark_y, mark_z, clear_x, clear_y, clear_z;
-  node_->get_parameter("grid_map/mark_range_x", mark_x);
-  node_->get_parameter("grid_map/mark_range_y", mark_y);
-  node_->get_parameter("grid_map/mark_range_z", mark_z);
+  // 点云模式：加(mark)复用 local_update_range，减(clear)用小范围以兼顾近端动态。
+  // clear 未配置(<=0)时退化为 local_update_range，保持原行为；clear 不得超过 local_update_range，
+  // 否则会擦掉未被重新标记的记忆，形成安全空洞
+  double clear_x, clear_y, clear_z;
   node_->get_parameter("grid_map/clear_range_x", clear_x);
   node_->get_parameter("grid_map/clear_range_y", clear_y);
   node_->get_parameter("grid_map/clear_range_z", clear_z);
-  mp_.mark_range_(0) = mark_x > 0.0 ? mark_x : mp_.local_update_range_(0);
-  mp_.mark_range_(1) = mark_y > 0.0 ? mark_y : mp_.local_update_range_(1);
-  mp_.mark_range_(2) = mark_z > 0.0 ? mark_z : mp_.local_update_range_(2);
   mp_.clear_range_(0) = clear_x > 0.0 ? clear_x : mp_.local_update_range_(0);
   mp_.clear_range_(1) = clear_y > 0.0 ? clear_y : mp_.local_update_range_(1);
   mp_.clear_range_(2) = clear_z > 0.0 ? clear_z : mp_.local_update_range_(2);
-  if (mp_.clear_range_(0) > mp_.mark_range_(0))
-    mp_.clear_range_(0) = mp_.mark_range_(0);
-  if (mp_.clear_range_(1) > mp_.mark_range_(1))
-    mp_.clear_range_(1) = mp_.mark_range_(1);
-  if (mp_.clear_range_(2) > mp_.mark_range_(2))
-    mp_.clear_range_(2) = mp_.mark_range_(2);
+  if (mp_.clear_range_(0) > mp_.local_update_range_(0))
+    mp_.clear_range_(0) = mp_.local_update_range_(0);
+  if (mp_.clear_range_(1) > mp_.local_update_range_(1))
+    mp_.clear_range_(1) = mp_.local_update_range_(1);
+  if (mp_.clear_range_(2) > mp_.local_update_range_(2))
+    mp_.clear_range_(2) = mp_.local_update_range_(2);
   RCLCPP_INFO(node_->get_logger(),
-              "点云更新范围: mark=[%.1f, %.1f, %.1f], clear=[%.1f, %.1f, %.1f]",
-              mp_.mark_range_(0), mp_.mark_range_(1), mp_.mark_range_(2),
+              "点云更新范围: mark(local_update)=[%.1f, %.1f, %.1f], clear=[%.1f, %.1f, %.1f]",
+              mp_.local_update_range_(0), mp_.local_update_range_(1), mp_.local_update_range_(2),
               mp_.clear_range_(0), mp_.clear_range_(1), mp_.clear_range_(2));
   node_->get_parameter("grid_map/obstacles_inflation", mp_.obstacles_inflation_);
   node_->get_parameter("grid_map/fx", mp_.fx_);
@@ -1074,12 +1066,12 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     pt = latest_cloud.points[i];
     p3d(0) = pt.x, p3d(1) = pt.y, p3d(2) = pt.z;
 
-    /* 大范围加：落在 mark_range 内的点才标记，超出范围的旧标记保留（记忆） */
+    /* 加：落在 local_update_range 内的点才标记，超出范围的旧标记保留（记忆） */
     Eigen::Vector3d devi = p3d - md_.camera_pos_;
     Eigen::Vector3i inf_pt;
 
-    if (fabs(devi(0)) < mp_.mark_range_(0) && fabs(devi(1)) < mp_.mark_range_(1) &&
-        fabs(devi(2)) < mp_.mark_range_(2))
+    if (fabs(devi(0)) < mp_.local_update_range_(0) && fabs(devi(1)) < mp_.local_update_range_(1) &&
+        fabs(devi(2)) < mp_.local_update_range_(2))
     {
 
       /* inflate the point */
