@@ -1128,7 +1128,7 @@ namespace ego_planner
       {
         if (have_odom_ && have_target_ && have_trigger_)
         {
-          bool success = planFromGlobalTraj(10); // zx-todo
+          bool success = planFromGlobalTraj(1);
           if (success)
           {
             changeFSMExecState(EXEC_TRAJ, "FSM");
@@ -1152,7 +1152,7 @@ namespace ego_planner
 
     case GEN_NEW_TRAJ:
     {
-      bool success = planFromGlobalTraj(10); // zx-todo
+      bool success = planFromGlobalTraj(1);
       if (success)
       {
         changeFSMExecState(EXEC_TRAJ, "FSM");
@@ -1162,6 +1162,22 @@ namespace ego_planner
       else
       {
         changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        // 失败逃逸：目标不可达时（如穿墙）reboundReplan 内的走廊 A* 每次会烧满 0.2s 超时，
+        // 单线程执行器被占死，waypointCallback 等新目标消息会被饿死丢弃。
+        // 连续失败 3 次后判定目标不可达：急停悬停并回到 WAIT_TARGET，等待新目标。
+        if (timesOfConsecutiveStateCalls().first >= 4)
+        {
+          RCLCPP_WARN(node_->get_logger(),
+                      "GEN_NEW_TRAJ 连续规划失败，判定目标(%.2f,%.2f,%.2f)不可达，急停悬停并回到等待目标",
+                      end_pt_(0), end_pt_(1), end_pt_(2));
+          publishMissionEvent("GOAL_UNREACHABLE",
+              "\"reason\":\"PLAN_FAILED\",\"goal_seq\":\"NA\",\"flight_epoch\":\"NA\"");
+          callEmergencyStop(odom_pos_);
+          have_target_ = false;
+          have_new_target_ = false;
+          has_valid_goal_ = false;
+          changeFSMExecState(WAIT_TARGET, "PLAN_FAILED");
+        }
       }
       break;
     }
