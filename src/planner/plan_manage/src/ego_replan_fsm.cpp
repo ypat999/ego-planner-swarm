@@ -1181,10 +1181,17 @@ namespace ego_planner
       else
       {
         changeFSMExecState(GEN_NEW_TRAJ, "FSM");
-        // 失败逃逸：目标不可达时（如穿墙）reboundReplan 内的走廊 A* 每次会烧满 0.2s 超时，
+        // 失败逃逸：目标不可达时（如穿墙）reboundReplan 内的走廊 A* 每次会烧满 0.5s 超时，
         // 单线程执行器被占死，waypointCallback 等新目标消息会被饿死丢弃。
         // 连续失败 3 次后判定目标不可达：急停悬停并回到 WAIT_TARGET，等待新目标。
-        if (timesOfConsecutiveStateCalls().first >= 4)
+        // 另加 3s 墙上时钟时间帽：单次状态调用内部可能烧多次片段 A* 超时（次数×0.5s），
+        // 仅按次数判定尾窗会拖到 5~6s，时间帽保证失败尾窗封顶约 3~4.5s。
+        int fail_cnt = timesOfConsecutiveStateCalls().first;
+        auto fail_now = std::chrono::steady_clock::now();
+        if (fail_cnt == 2)
+          fail_streak_start_ = fail_now; // 本轮首次失败，记录起点
+        if (fail_cnt >= 4 ||
+            std::chrono::duration_cast<std::chrono::milliseconds>(fail_now - fail_streak_start_).count() >= 3000)
         {
           RCLCPP_WARN(node_->get_logger(),
                       "GEN_NEW_TRAJ 连续规划失败，判定目标(%.2f,%.2f,%.2f)不可达，急停悬停并回到等待目标",
@@ -1213,8 +1220,14 @@ namespace ego_planner
         changeFSMExecState(REPLAN_TRAJ, "FSM");
         // 连续失败逃逸：飞行中重规划一直失败时会无限停留在 REPLAN_TRAJ，
         // 且新目标在 planNextWaypoint 里要等 EXEC_TRAJ 而被卡死；
-        // 连续 3 次失败后放弃当前轨迹，急停悬停并回到 WAIT_TARGET 等待新目标
-        if (timesOfConsecutiveStateCalls().first >= 4)
+        // 连续 3 次失败后放弃当前轨迹，急停悬停并回到 WAIT_TARGET 等待新目标。
+        // 同样加 3s 墙上时钟时间帽，避免单次调用内多次片段 A* 超时把尾窗拖长。
+        int replan_fail_cnt = timesOfConsecutiveStateCalls().first;
+        auto replan_fail_now = std::chrono::steady_clock::now();
+        if (replan_fail_cnt == 2)
+          fail_streak_start_ = replan_fail_now; // 本轮首次失败，记录起点
+        if (replan_fail_cnt >= 4 ||
+            std::chrono::duration_cast<std::chrono::milliseconds>(replan_fail_now - fail_streak_start_).count() >= 3000)
         {
           RCLCPP_WARN(node_->get_logger(),
                       "REPLAN_TRAJ 连续重规划失败，放弃当前轨迹，急停悬停并回到等待目标");

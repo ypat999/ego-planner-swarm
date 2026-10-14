@@ -72,6 +72,9 @@ namespace ego_planner
     bool goal_switch_in_progress_; // 标记目标点切换是否正在进行
     FSM_EXEC_STATE exec_state_;
     int continously_called_times_{0};
+    // 本轮连续规划失败的墙上时钟起点（逃逸时间帽用：单次状态调用可能烧多次 A* 超时，
+    // 仅按次数判定会让尾窗拖到 5~6s，加 3s 时间帽封顶）
+    std::chrono::steady_clock::time_point fail_streak_start_{};
     std::string target_frame_; // 目标坐标系frame_id
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
