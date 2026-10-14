@@ -1246,8 +1246,17 @@ void GridMap::publishMapInflate(bool all_info){
   pcl::PointXYZ pt;
   pcl::PointCloud<pcl::PointXYZ> cloud;
 
+  // 显示窗口 = 本帧点云包围盒(local_bound) 与 camera±local_update_range 滚动窗口的并集。
+  // 只用包围盒时，贴墙等点云收缩场景会把未删除的历史记忆格"隐藏"在话题之外；
+  // 并入滚动窗口后，RViz 显示范围与地图记忆/更新范围一致，纯显示层改动。
   Eigen::Vector3i min_cut = md_.local_bound_min_;
   Eigen::Vector3i max_cut = md_.local_bound_max_;
+
+  Eigen::Vector3i win_min, win_max;
+  posToIndex(md_.camera_pos_ - mp_.local_update_range_, win_min);
+  posToIndex(md_.camera_pos_ + mp_.local_update_range_, win_max);
+  min_cut = min_cut.cwiseMin(win_min);
+  max_cut = max_cut.cwiseMax(win_max);
 
   if (all_info)
   {
