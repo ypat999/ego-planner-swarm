@@ -1037,11 +1037,58 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     }
   }
   
-  // 小范围减：只清除相机附近一小块，远处保留历史障碍信息（记忆）
+  // 小范围减：复用 RayCaster 做射线雕刻清除。
+  // 对本帧每个回波点，从相机向命中点打射线，只清除落在 clear 盒内的沿途栅格，
+  // 即「本帧回波确认是自由空间的地方」才清空；射线打不到、无回波确认的区域保留历史记忆。
+  // 远处的点同样参与雕刻（射线截断到 max_ray_length_），用远端命中清理近端射线。
+  // 后面的标记循环为第二遍，命中点会被重新置 1，保证「击中赢」。
   if (mp_.reset_buffer_enabled_)
   {
-    this->resetBuffer(md_.camera_pos_ - mp_.clear_range_,
-                      md_.camera_pos_ + mp_.clear_range_);
+    RayCaster raycaster;
+    Eigen::Vector3d half = Eigen::Vector3d(0.5, 0.5, 0.5);
+    Eigen::Vector3d ray_pt, pt_w;
+
+    // clear 盒的索引边界（与 resetBuffer 相同的取整+钳制方式）
+    Eigen::Vector3i clear_min_id, clear_max_id;
+    posToIndex(md_.camera_pos_ - mp_.clear_range_, clear_min_id);
+    posToIndex(md_.camera_pos_ + mp_.clear_range_, clear_max_id);
+    boundIndex(clear_min_id);
+    boundIndex(clear_max_id);
+
+    for (size_t i = 0; i < latest_cloud.points.size(); ++i)
+    {
+      const pcl::PointXYZ &cpt = latest_cloud.points[i];
+      if (!std::isfinite(cpt.x) || !std::isfinite(cpt.y) || !std::isfinite(cpt.z))
+        continue;
+      pt_w(0) = cpt.x, pt_w(1) = cpt.y, pt_w(2) = cpt.z;
+
+      // 越界点截断到地图边界，超长射线截断到 max_ray_length_（与 raycastProcess 一致）
+      if (!isInMap(pt_w))
+        pt_w = closetPointInMap(pt_w, md_.camera_pos_);
+
+      double ray_len = (pt_w - md_.camera_pos_).norm();
+      if (ray_len > mp_.max_ray_length_)
+        pt_w = (pt_w - md_.camera_pos_) / ray_len * mp_.max_ray_length_ + md_.camera_pos_;
+
+      raycaster.setInput(pt_w / mp_.resolution_, md_.camera_pos_ / mp_.resolution_);
+
+      while (raycaster.step(ray_pt))
+      {
+        Eigen::Vector3d tmp = (ray_pt + half) * mp_.resolution_;
+
+        Eigen::Vector3i id;
+        posToIndex(tmp, id);
+
+        // 相机位于 clear 盒中心，射线单调向外：一旦出盒即可终止
+        if (id(0) < clear_min_id(0) || id(0) > clear_max_id(0) ||
+            id(1) < clear_min_id(1) || id(1) > clear_max_id(1) ||
+            id(2) < clear_min_id(2) || id(2) > clear_max_id(2))
+          break;
+
+        // 写 0 幂等，无需帧戳去重
+        md_.occupancy_buffer_inflate_[toAddress(id)] = 0;
+      }
+    }
   }
 
   pcl::PointXYZ pt;
