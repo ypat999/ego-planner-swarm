@@ -60,6 +60,8 @@ struct MappingParameters
   Eigen::Vector3d map_min_boundary_, map_max_boundary_; // map range in pos
   Eigen::Vector3i map_voxel_num_;                       // map range in index
   Eigen::Vector3d local_update_range_;
+  /* 点云模式更新范围：大范围加(mark，保持记忆) / 小范围减(clear，近端动态) */
+  Eigen::Vector3d mark_range_, clear_range_;
   double resolution_, resolution_inv_;
   double obstacles_inflation_;
   string frame_id_;
@@ -96,6 +98,9 @@ struct MappingParameters
 
   /* buffer reset control */
   bool reset_buffer_enabled_;
+
+  /* depth raycast buffers (disable in cloud mode to save memory) */
+  bool enable_depth_raycast_;
 
   /* origin safe zone for landing */
   bool origin_safe_zone_enabled_;

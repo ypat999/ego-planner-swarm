@@ -29,6 +29,12 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/local_update_range_x", -1.0);
   node_->declare_parameter("grid_map/local_update_range_y", -1.0);
   node_->declare_parameter("grid_map/local_update_range_z", -1.0);
+  node_->declare_parameter("grid_map/mark_range_x", -1.0);
+  node_->declare_parameter("grid_map/mark_range_y", -1.0);
+  node_->declare_parameter("grid_map/mark_range_z", -1.0);
+  node_->declare_parameter("grid_map/clear_range_x", -1.0);
+  node_->declare_parameter("grid_map/clear_range_y", -1.0);
+  node_->declare_parameter("grid_map/clear_range_z", -1.0);
   node_->declare_parameter("grid_map/obstacles_inflation", -1.0);
   node_->declare_parameter("grid_map/fx", -1.0);
   node_->declare_parameter("grid_map/fy", -1.0);
@@ -59,6 +65,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/ground_height", 1.0);
   node_->declare_parameter("grid_map/odom_depth_timeout", 1.0);
   node_->declare_parameter("grid_map/reset_buffer_enabled", true);
+  node_->declare_parameter("grid_map/enable_depth_raycast", true);
   node_->declare_parameter("grid_map/origin_safe_zone_enabled", true);
   node_->declare_parameter("grid_map/origin_safe_zone_size_x", 1.0);
   node_->declare_parameter("grid_map/origin_safe_zone_size_y", 1.0);
@@ -71,6 +78,31 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/local_update_range_x", mp_.local_update_range_(0));
   node_->get_parameter("grid_map/local_update_range_y", mp_.local_update_range_(1));
   node_->get_parameter("grid_map/local_update_range_z", mp_.local_update_range_(2));
+  // 点云模式：大范围加(mark)以保持障碍记忆，小范围减(clear)以兼顾近端动态。
+  // 未配置(<=0)时退化为 local_update_range，保持原行为；clear 不得超过 mark，避免擦掉未被重标的记忆
+  double mark_x, mark_y, mark_z, clear_x, clear_y, clear_z;
+  node_->get_parameter("grid_map/mark_range_x", mark_x);
+  node_->get_parameter("grid_map/mark_range_y", mark_y);
+  node_->get_parameter("grid_map/mark_range_z", mark_z);
+  node_->get_parameter("grid_map/clear_range_x", clear_x);
+  node_->get_parameter("grid_map/clear_range_y", clear_y);
+  node_->get_parameter("grid_map/clear_range_z", clear_z);
+  mp_.mark_range_(0) = mark_x > 0.0 ? mark_x : mp_.local_update_range_(0);
+  mp_.mark_range_(1) = mark_y > 0.0 ? mark_y : mp_.local_update_range_(1);
+  mp_.mark_range_(2) = mark_z > 0.0 ? mark_z : mp_.local_update_range_(2);
+  mp_.clear_range_(0) = clear_x > 0.0 ? clear_x : mp_.local_update_range_(0);
+  mp_.clear_range_(1) = clear_y > 0.0 ? clear_y : mp_.local_update_range_(1);
+  mp_.clear_range_(2) = clear_z > 0.0 ? clear_z : mp_.local_update_range_(2);
+  if (mp_.clear_range_(0) > mp_.mark_range_(0))
+    mp_.clear_range_(0) = mp_.mark_range_(0);
+  if (mp_.clear_range_(1) > mp_.mark_range_(1))
+    mp_.clear_range_(1) = mp_.mark_range_(1);
+  if (mp_.clear_range_(2) > mp_.mark_range_(2))
+    mp_.clear_range_(2) = mp_.mark_range_(2);
+  RCLCPP_INFO(node_->get_logger(),
+              "点云更新范围: mark=[%.1f, %.1f, %.1f], clear=[%.1f, %.1f, %.1f]",
+              mp_.mark_range_(0), mp_.mark_range_(1), mp_.mark_range_(2),
+              mp_.clear_range_(0), mp_.clear_range_(1), mp_.clear_range_(2));
   node_->get_parameter("grid_map/obstacles_inflation", mp_.obstacles_inflation_);
   node_->get_parameter("grid_map/fx", mp_.fx_);
   node_->get_parameter("grid_map/fy", mp_.fy_);
@@ -101,6 +133,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/ground_height", mp_.ground_height_);
   node_->get_parameter("grid_map/odom_depth_timeout", mp_.odom_depth_timeout_);
   node_->get_parameter("grid_map/reset_buffer_enabled", mp_.reset_buffer_enabled_);
+  node_->get_parameter("grid_map/enable_depth_raycast", mp_.enable_depth_raycast_);
   node_->get_parameter("grid_map/origin_safe_zone_enabled", mp_.origin_safe_zone_enabled_);
   node_->get_parameter("grid_map/origin_safe_zone_size_x", mp_.origin_safe_zone_size_(0));
   node_->get_parameter("grid_map/origin_safe_zone_size_y", mp_.origin_safe_zone_size_(1));
@@ -138,13 +171,17 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
 
   int buffer_size = mp_.map_voxel_num_(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2);
 
-  md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
 
-  md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
-  md_.count_hit_ = vector<short>(buffer_size, 0);
-  md_.flag_rayend_ = vector<char>(buffer_size, -1);
-  md_.flag_traverse_ = vector<char>(buffer_size, -1);
+  // 点云模式下不启用深度射线投射：不分配这几块随全图尺寸增长的大缓冲，避免无谓内存占用
+  if (mp_.enable_depth_raycast_)
+  {
+    md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
+    md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
+    md_.count_hit_ = vector<short>(buffer_size, 0);
+    md_.flag_rayend_ = vector<char>(buffer_size, -1);
+    md_.flag_traverse_ = vector<char>(buffer_size, -1);
+  }
 
   md_.raycast_num_ = 0;
 
@@ -303,11 +340,12 @@ void GridMap::clearOriginSafeZone()
       for (int z = min_id(2); z <= max_id(2); ++z)
       {
         int idx = toAddress(x, y, z);
-        if (md_.occupancy_buffer_inflate_[idx] != 0 || 
-            md_.occupancy_buffer_[idx] > mp_.clamp_min_log_)
+        if (md_.occupancy_buffer_inflate_[idx] != 0 ||
+            (mp_.enable_depth_raycast_ && md_.occupancy_buffer_[idx] > mp_.clamp_min_log_))
         {
           md_.occupancy_buffer_inflate_[idx] = 0;
-          md_.occupancy_buffer_[idx] = mp_.clamp_min_log_;
+          if (mp_.enable_depth_raycast_)
+            md_.occupancy_buffer_[idx] = mp_.clamp_min_log_;
           cleared_count++;
         }
       }
@@ -821,13 +859,16 @@ void GridMap::updateOccupancyCallback()
   // ros::Time t1, t2, t3, t4;
   // t1 = ros::Time::now();
 
-  projectDepthImage();
-  // t2 = ros::Time::now();
-  raycastProcess();
-  // t3 = ros::Time::now();
+  if (mp_.enable_depth_raycast_)
+  {
+    projectDepthImage();
+    // t2 = ros::Time::now();
+    raycastProcess();
+    // t3 = ros::Time::now();
 
-  if (md_.local_updated_)
-    clearAndInflateLocalMap();
+    if (md_.local_updated_)
+      clearAndInflateLocalMap();
+  }
 
   // t4 = ros::Time::now();
 
@@ -1004,11 +1045,11 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     }
   }
   
-  // 在世界坐标系中重置缓冲区   如果不重置，保留后方障碍信息
+  // 小范围减：只清除相机附近一小块，远处保留历史障碍信息（记忆）
   if (mp_.reset_buffer_enabled_)
   {
-    this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
-                      md_.camera_pos_ + mp_.local_update_range_);
+    this->resetBuffer(md_.camera_pos_ - mp_.clear_range_,
+                      md_.camera_pos_ + mp_.clear_range_);
   }
 
   pcl::PointXYZ pt;
@@ -1033,12 +1074,12 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     pt = latest_cloud.points[i];
     p3d(0) = pt.x, p3d(1) = pt.y, p3d(2) = pt.z;
 
-    /* point inside update range */
+    /* 大范围加：落在 mark_range 内的点才标记，超出范围的旧标记保留（记忆） */
     Eigen::Vector3d devi = p3d - md_.camera_pos_;
     Eigen::Vector3i inf_pt;
 
-    if (fabs(devi(0)) < mp_.local_update_range_(0) && fabs(devi(1)) < mp_.local_update_range_(1) &&
-        fabs(devi(2)) < mp_.local_update_range_(2))
+    if (fabs(devi(0)) < mp_.mark_range_(0) && fabs(devi(1)) < mp_.mark_range_(1) &&
+        fabs(devi(2)) < mp_.mark_range_(2))
     {
 
       /* inflate the point */
@@ -1105,6 +1146,12 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
 
 void GridMap::publishMap()
 {
+  // 点云模式下未分配 occupancy_buffer_，且该话题无订阅者，直接跳过
+  if (!mp_.enable_depth_raycast_ || md_.occupancy_buffer_.empty())
+  {
+    return;
+  }
+
   if (map_pub_->get_subscription_count() <= 0)
   {
     return;
