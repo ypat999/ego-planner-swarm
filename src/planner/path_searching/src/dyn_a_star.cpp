@@ -236,9 +236,9 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
                     }
                 }
         rclcpp::Time time_2 = rclcpp::Clock().now();
-        if ((time_2 - time_1).seconds() > 0.2)
+        if ((time_2 - time_1).seconds() > 0.5)
         {
-            RCLCPP_WARN(rclcpp::get_logger("AstarSearch"), "Failed in A star path searching !!! 0.2 seconds time limit exceeded.");
+            RCLCPP_WARN(rclcpp::get_logger("AstarSearch"), "Failed in A star path searching !!! 0.5 seconds time limit exceeded.");
             return false;
         }
     }
