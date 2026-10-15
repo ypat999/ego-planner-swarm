@@ -10,6 +10,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/empty.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include <vector>
 #include "visualization_msgs/msg/marker.hpp"
 
@@ -103,6 +104,8 @@ namespace ego_planner
     rclcpp::Subscription<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr trigger_sub_;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_planning_sub_;
+    // 实时调速：请求话题 /goal_vel_max 与其确认话题 /goal_vel_max_ack（均 std_msgs/Float32）
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr goal_vel_sub_;
 
     // rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr replan_pub_;
     // rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr new_pub_;
@@ -111,6 +114,8 @@ namespace ego_planner
     rclcpp::Publisher<traj_utils::msg::MultiBsplines>::SharedPtr swarm_trajs_pub_;
     rclcpp::Publisher<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mission_event_pub_; // 失效降级互通：/mission_event
+    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr goal_vel_ack_pub_;  // 实时调速确认：/goal_vel_max_ack
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_; // 参数通道调速回调句柄
 
     /* helper functions */
     bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method
@@ -137,6 +142,7 @@ namespace ego_planner
     void swarmTrajsCallback(const std::shared_ptr<const traj_utils::msg::MultiBsplines> &msg);
     void BroadcastBsplineCallback(const std::shared_ptr<const traj_utils::msg::Bspline> &msg);
     void stopPlanningCallback(const std::shared_ptr<const std_msgs::msg::Empty> &msg);
+    void goalVelCallback(const std::shared_ptr<const std_msgs::msg::Float32> &msg);
     void checkTopicData();
     void printStartupDiagnostics();
 

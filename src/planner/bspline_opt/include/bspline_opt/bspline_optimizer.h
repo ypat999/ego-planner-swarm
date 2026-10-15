@@ -110,6 +110,15 @@ namespace ego_planner
                       const vector<int> &waypt_idx); // N-2 constraints at most
     void setLocalTargetPt(const Eigen::Vector3d local_target_pt) { local_target_pt_ = local_target_pt; };
 
+    // 运行期实时调速：同步更新优化器的速度/加速度限值
+    // （优化器持有独立的 optimization/max_vel，若只改 pp_.max_vel_ 会出现
+    //  “时间按新速度排、优化器仍按旧速度”的不一致）
+    void setDynamicLimits(const double &max_vel, const double &max_acc)
+    {
+      max_vel_ = max_vel;
+      max_acc_ = max_acc;
+    }
+
     void optimize();
 
     ControlPoints getControlPoints() { return cps_; };

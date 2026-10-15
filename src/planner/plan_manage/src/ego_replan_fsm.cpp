@@ -3,6 +3,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <sstream>
+#include <cmath>
 
 namespace ego_planner
 {
@@ -134,6 +135,40 @@ namespace ego_planner
         [this](const std::shared_ptr<const std_msgs::msg::Empty> &msg)
         {
           this->stopPlanningCallback(msg);
+        });
+
+    // 实时调速接口：/goal_vel_max 请求，/goal_vel_max_ack 回确认（QoS: reliable + keep_last(1) + volatile）
+    // 注意使用绝对话题名，相对名会被加上节点命名空间前缀导致与网页面板/dispatcher 失配
+    auto vel_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
+    goal_vel_ack_pub_ = node_->create_publisher<std_msgs::msg::Float32>("/goal_vel_max_ack", vel_qos);
+    goal_vel_sub_ = node_->create_subscription<std_msgs::msg::Float32>(
+        "/goal_vel_max",
+        vel_qos,
+        [this](const std::shared_ptr<const std_msgs::msg::Float32> &msg)
+        {
+          this->goalVelCallback(msg);
+        });
+
+    // 参数通道兼容：ros2 param set manager/max_vel 与 /goal_vel_max 同义，
+    // 都是「设定 ego 当前速度」，请求值直接采纳（manager/max_vel 不是对外部输入的限制）。
+    // （manager/max_vel 由 planner_manager 在同一个节点上声明，节点级回调同样会收到）
+    param_cb_handle_ = node_->add_on_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter> &params) -> rcl_interfaces::msg::SetParametersResult
+        {
+          rcl_interfaces::msg::SetParametersResult result;
+          result.successful = true;
+          for (const auto &p : params)
+          {
+            if (p.get_name() == "manager/max_vel" && planner_manager_)
+            {
+              double adopted = planner_manager_->setMaxVel(p.as_double());
+              result.reason = "ego speed set to " + std::to_string(adopted) + " m/s";
+              RCLCPP_INFO(node_->get_logger(),
+                          "[param] manager/max_vel %.3f -> 当前速度 %.3f m/s",
+                          p.as_double(), adopted);
+            }
+          }
+          return result;
         });
 
     if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
@@ -960,6 +995,31 @@ namespace ego_planner
       callEmergencyStop(odom_pos_);
     }
     changeFSMExecState(WAIT_TARGET, "STOP_PLANNING");
+  }
+
+  void EGOReplanFSM::goalVelCallback(const std::shared_ptr<const std_msgs::msg::Float32> &msg)
+  {
+    if (!planner_manager_)
+    {
+      RCLCPP_WARN(node_->get_logger(), "[goal_vel] planner manager 未就绪，忽略速度请求");
+      return;
+    }
+
+    double v = static_cast<double>(msg->data);
+    if (!std::isfinite(v) || v <= 0.0)
+    {
+      RCLCPP_WARN(node_->get_logger(), "[goal_vel] 非法速度 %f，回退默认 2.0 m/s", v);
+      v = 2.0;
+    }
+
+    double adopted = planner_manager_->setMaxVel(v);
+
+    // 无论是否变化都回 ack，携带实际采纳值，供调用方确认
+    std_msgs::msg::Float32 ack;
+    ack.data = static_cast<float>(adopted);
+    goal_vel_ack_pub_->publish(ack);
+
+    RCLCPP_INFO(node_->get_logger(), "[goal_vel] 请求 %.3f -> 采纳 %.3f m/s (已回 ack)", v, adopted);
   }
 
   void EGOReplanFSM::swarmTrajsCallback(const std::shared_ptr<const traj_utils::msg::MultiBsplines> &msg)

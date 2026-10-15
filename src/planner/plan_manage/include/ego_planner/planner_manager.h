@@ -42,6 +42,12 @@ namespace ego_planner
 
     void setDroneIdtoOpt(void) { bspline_optimizer_->setDroneId(pp_.drone_id); }
 
+    // 运行期实时调速：同时写入 pp_.max_vel_ 与优化器限值，返回实际采纳速度
+    // manager/max_vel 仅为 ego 默认速度，不作为外部请求的上限，请求值直接采纳
+    double setMaxVel(double max_vel);
+
+    double getMaxVel(void) { return pp_.max_vel_; }
+
     double getSwarmClearance(void) { return bspline_optimizer_->getSwarmClearance(); }
 
     bool checkCollision(int drone_id);
@@ -61,6 +67,9 @@ namespace ego_planner
     // ros::Publisher obj_pub_; //zx-todo 
 
     BsplineOptimizer::Ptr bspline_optimizer_;
+
+    // 保存节点句柄：运行期调速后需回写 optimization/max_vel，避免参数读出陈旧值
+    rclcpp::Node::SharedPtr node_;
 
     int continous_failures_count_{0};
 

@@ -1,6 +1,8 @@
 // #include <fstream>
 #include <ego_planner/planner_manager.h>
 #include <thread>
+#include <cmath>
+#include <algorithm>
 #include "visualization_msgs/msg/marker.hpp" // zx-todo
 
 namespace ego_planner
@@ -12,6 +14,7 @@ namespace ego_planner
 
   void EGOPlannerManager::initPlanModules(rclcpp::Node::SharedPtr &node, PlanningVisualization::Ptr vis)
   {
+    node_ = node;
     node->declare_parameter("manager/max_vel", -1.0);
     node->declare_parameter("manager/max_acc", -1.0);
     node->declare_parameter("manager/max_jerk", -1.0);
@@ -57,7 +60,7 @@ namespace ego_planner
 
     // 输出重要参数配置
     RCLCPP_INFO(node->get_logger(), "=== EGO Planner 参数配置 ===");
-    RCLCPP_INFO(node->get_logger(), "最大速度: %.2f m/s", pp_.max_vel_);
+    RCLCPP_INFO(node->get_logger(), "最大速度: %.2f m/s (ego 默认速度，非外部输入上限)", pp_.max_vel_);
     RCLCPP_INFO(node->get_logger(), "最大加速度: %.2f m/s^2", pp_.max_acc_);
     RCLCPP_INFO(node->get_logger(), "最大加加速度: %.2f m/s^3", pp_.max_jerk_);
     RCLCPP_INFO(node->get_logger(), "控制点距离: %.2f m", pp_.ctrl_pt_dist);
@@ -642,6 +645,31 @@ namespace ego_planner
       point_set.push_back(bspline.evaluateDeBoorT(time));
     }
     UniformBspline::parameterizeToBspline(dt, point_set, start_end_derivative, ctrl_pts);
+  }
+
+  double EGOPlannerManager::setMaxVel(double max_vel)
+  {
+    double v = max_vel;
+    // manager/max_vel 只是 ego 自身默认速度，不构成对外部输入的上限：
+    // 外部请求（/goal_vel_max、ros2 param set）直接采纳，仅做合法性防御。
+    if (!std::isfinite(v) || v <= 0.0)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("EGOPlannerManager"),
+                  "Invalid requested max_vel (%f). Fallback to default 2.0 m/s.", v);
+      v = 2.0;
+    }
+
+    pp_.max_vel_ = v;
+    // 同步优化器限值，避免“时间按新速度排、优化器仍按旧速度”的不一致
+    bspline_optimizer_->setDynamicLimits(v, pp_.max_acc_);
+
+    // 回写 optimization/max_vel，使参数读出值与实际生效值一致（该参数无 on-set 回调，不会递归）
+    if (node_)
+    {
+      node_->set_parameter(rclcpp::Parameter("optimization/max_vel", v));
+    }
+
+    return v;
   }
 
 } // namespace ego_planner
