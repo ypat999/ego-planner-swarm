@@ -947,6 +947,30 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
 
   md_.has_cloud_ = true;
 
+  // 近距回波过滤：gz-sim 7.9.0 的 gpu_lidar 在扫描网格的边界行/列（方位 ±180°、俯仰 max_angle）
+  // 会取到无效深度 0，并把小于 <range><min> 的距离钳制到 min 量程，于是每帧都出现一圈
+  // 半径恰好等于 min 的假点。该假环随传感器移动、在仿真世界中无对应物体，因本机 gz 版本
+  // 未给 Lidar 接线 visibility_mask 而无法在模型侧屏蔽，只能在消费端剔除。
+  // 注意：阈值 min_ray_length 必须大于雷达 SDF 里的 <range><min>。
+  std::string source_frame = img->header.frame_id;
+  const bool cloud_in_world = (source_frame == mp_.frame_id_ || source_frame == "map" ||
+                               source_frame == "world" || source_frame == "odom");
+  if (!cloud_in_world && mp_.min_ray_length_ > 0.0)
+  {
+    size_t write = 0;
+    for (size_t i = 0; i < latest_cloud.points.size(); ++i)
+    {
+      const auto &p = latest_cloud.points[i];
+      const double d = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+      if (!std::isfinite(d) || d < mp_.min_ray_length_)
+        continue;
+      latest_cloud.points[write++] = p;
+    }
+    // resize() 会同步 width/height；若只改 points.size()，后续 pcl::transformPointCloud
+    // 会按旧的 width(=水平线数 360) 重新 assign，点数除不尽时报 "Mismatch in assignment"
+    latest_cloud.resize(write);
+  }
+
   if (!md_.has_odom_)
   {
     RCLCPP_WARN(node_->get_logger(), "点云数据接收但odom数据缺失");
@@ -975,9 +999,8 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   pcl::PointCloud<pcl::PointXYZ> world_cloud;
   
   // 检查点云是否已经在world frame
-  std::string source_frame = img->header.frame_id;
   static bool first_time = true;
-  if (source_frame == mp_.frame_id_ or source_frame == "map" or source_frame == "world" or source_frame == "odom")
+  if (cloud_in_world)
   {
     if (first_time)
     {
