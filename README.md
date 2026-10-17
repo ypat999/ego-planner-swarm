@@ -36,6 +36,54 @@
 配套：返航阶段的 `map->odom` 厘米级校正由 `lidar_localization_ros2` 的
 "原点基准匹配"负责（见其 README），两者共同构成精准降落链路。
 
+### 穿窗居中与狭窄通道自动减速
+
+面向 1.8 m × 1.2 m 窗洞的穿越场景，目标是**宁可绕远也走窗心**，并降低贴边擦碰风险。
+
+**1. A* 种子路径居中（`dyn_a_star`）**
+
+`setDistPenalty(weight, radius)` 在节点周围球面采样 14 点查膨胀占据，离障碍越近边代价越大，
+使 A* 种子路径偏向自由空间中部。参数见主仓 launch：
+
+| 参数 | 当前值 | 说明 |
+|---|---|---|
+| `manager/astar_penalty_weight` | 3.0 | 惩罚强度；0 关闭（零额外开销）；过大导致过度绕路 |
+| `manager/astar_penalty_radius` | 1.0 | 采样球半径 (m)，应小于规划视野 |
+
+**2. 优化权重配套（控制点加密到 0.2 m 后重标定）**
+
+`calcSmoothnessCost` 用的是**未按 ts 归一化**的四阶差分，代价 ∝ 控制点间距⁷；
+`calcFeasibilityCost` 的速度项含 `1/ts²`。因此 `manager/control_points_distance`
+从 0.5 降到 0.2 后必须同步重标定：
+
+| 参数 | 当前值 | 原因 |
+|---|---|---|
+| `optimization/lambda_smooth` | 10.0（原 1.0） | 0.2 m 时间距使平滑代价缩小约两个数量级，需补偿 |
+| `optimization/lambda_feasibility` | 0.1（原 0.5） | `ts` 缩小 2.5 倍使速度项等效放大 6.25 倍，需抵消 |
+| `optimization/lambda_fitness` | 0.5 | 米制，不受间距影响；调低让碰撞代价主导居中 |
+
+> 代价：控制点数约 2~2.5 倍，单次重规划耗时约为 0.5 m 时的 2.5~3.5 倍。
+> FSM 以 1 s 周期重规划、traj_server 独立 100 Hz 发布，几十至一百余毫秒的规划耗时可接受；
+> 实际值看日志 `total time:...,optimize:...,refine:...`。
+
+**3. B-spline 生成后按最小余量自动减速（`BsplineOptimizer::getMinClearance()`）**
+
+- 实现：`reboundReplan` 在 STEP2（rebound 优化）之后、构造 `UniformBspline` 之前，
+  遍历 `cps_.base_point` / `cps_.direction` 求沿轨迹到膨胀障碍面的最小有符号距离。
+- 控制点是纯几何量，`ts`（结点间隔）决定时间尺度：**放大 `ts` 只降速、不改路径**。
+  余量从阈值线性降到 0 时，速度比例从 1.0 降到 `narrow_vel_ratio`。
+- 日志：`[narrow] min_clearance=... < ... , 减速到 ...% (ts=...)`。
+
+| 参数（主仓 launch） | 当前值 | 说明 |
+|---|---|---|
+| `manager/narrow_clearance_threshold` | 1.0 | 自由余量阈值 (m)，低于此值开始减速 |
+| `manager/narrow_vel_ratio` | 0.4 | 余量→0 时的速度比例（默认速度的 40%） |
+
+**4. 不使用「窗口中心航点」强制居中**
+
+定位存在偏差，书面航点无法保证落在真实窗心；居中完全依赖 A* 距离惩罚 + 碰撞代价
+（必须经避障通过），航点只负责给出穿窗方向。
+
 ### 其他既有本地改动
 
 - `planning/avoid.h`：Fast-DDS XML 静态加载路径按主机名自适应；

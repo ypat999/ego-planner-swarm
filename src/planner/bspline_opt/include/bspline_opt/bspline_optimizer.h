@@ -123,6 +123,10 @@ namespace ego_planner
 
     ControlPoints getControlPoints() { return cps_; };
 
+    // 返回当前优化后控制点沿轨迹到最近障碍（膨胀面）的最小自由余量（米）。
+    // 无 base_point（附近无障碍）时返回远大于阈值的大值，表示不触发减速。
+    double getMinClearance();
+
     AStar::Ptr a_star_;
     std::vector<Eigen::Vector3d> ref_pts_;
 

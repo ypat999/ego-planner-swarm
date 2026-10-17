@@ -56,6 +56,26 @@ namespace ego_planner
 
   void BsplineOptimizer::setDroneId(const int drone_id) { drone_id_ = drone_id; }
 
+  // 返回当前优化后控制点沿轨迹到最近障碍（膨胀面）的最小自由余量（米）。
+  // base_point/direction 由 initControlPoints 与 check_collision_and_rebound 维护：
+  // dist = (points - base_point)·direction 即控制点到膨胀障碍面的有符号距离。
+  double BsplineOptimizer::getMinClearance()
+  {
+    double min_clearance = 1e9;
+    for (int i = 0; i < cps_.size; ++i)
+    {
+      for (size_t j = 0; j < cps_.base_point[i].size(); ++j)
+      {
+        const double dist = (cps_.points.col(i) - cps_.base_point[i][j]).dot(cps_.direction[i][j]);
+        if (dist < min_clearance)
+        {
+          min_clearance = dist;
+        }
+      }
+    }
+    return min_clearance;
+  }
+
   // 返回多个安全的控制点集
   std::vector<ControlPoints> BsplineOptimizer::distinctiveTrajs(vector<std::pair<int, int>> segments)
   {
