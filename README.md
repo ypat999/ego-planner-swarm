@@ -40,15 +40,25 @@
 
 面向 1.8 m × 1.2 m 窗洞的穿越场景，目标是**宁可绕远也走窗心**，并降低贴边擦碰风险。
 
-**1. A* 种子路径居中（`dyn_a_star`）**
+**1. 走廊余量回中（`corridor_margin`，主机制）**
 
-`setDistPenalty(weight, radius)` 在节点周围球面采样 14 点查膨胀占据，离障碍越近边代价越大，
-使 A* 种子路径偏向自由空间中部。参数见主仓 launch：
+原碰撞代价只对「初值路径已进入膨胀区」的片段生成 `base_point`，路径不碰撞时
+`cps_.direction[i]` 为空、碰撞代价为 0，窗内位置完全由初值（起点→目标的多项式或上一次轨迹）
+继承，没有任何回中力。叠加竖直方向膨胀后净空仅 0.4 m（2 格），表现为「特别爱贴窗框上沿」。
 
-| 参数 | 当前值 | 说明 |
+`updateCorridorConstraints()` 在每个控制点沿 ±x/±y/±z 六向探测膨胀面，记录最后一个自由
+采样点与方向；`calcCorridorCost()` 对距离小于 `corridor_margin` 的方向施加二次型排斥。
+该代价**不依赖 `base_point`、路径不碰撞时也生效**，通道两侧不足 margin 时梯度在中心抵消，
+形成稳定平衡点。约束在每次重规划初始化时计算一次，优化期间冻结。
+
+| 参数（主仓 launch） | 当前值 | 说明 |
 |---|---|---|
-| `manager/astar_penalty_weight` | 3.0 | 惩罚强度；0 关闭（零额外开销）；过大导致过度绕路 |
-| `manager/astar_penalty_radius` | 1.0 | 采样球半径 (m)，应小于规划视野 |
+| `optimization/corridor_margin` | 0.5 | 到膨胀面的期望余量 (m)；0 关闭。需覆盖通道半宽/半高才能回中 |
+| `optimization/corridor_weight` | 20.0 | 排斥权重；过大与平滑项冲突会导致抖动（建议 10~40） |
+
+`optimization/dist0` 已恢复默认 0.5：它只负责「初值已碰撞」片段的脱困，通道内的持续余量
+由 `corridor_margin` 负责。原 A* 距离最大化惩罚（`setDistPenalty`）已删除——A* 种子只在
+初值碰撞时才计算，无法提供持续回中力。
 
 **2. 优化权重配套（控制点加密到 0.2 m 后重标定）**
 
@@ -60,7 +70,7 @@
 |---|---|---|
 | `optimization/lambda_smooth` | 10.0（原 1.0） | 0.2 m 时间距使平滑代价缩小约两个数量级，需补偿 |
 | `optimization/lambda_feasibility` | 0.1（原 0.5） | `ts` 缩小 2.5 倍使速度项等效放大 6.25 倍，需抵消 |
-| `optimization/lambda_fitness` | 0.5 | 米制，不受间距影响；调低让碰撞代价主导居中 |
+| `optimization/lambda_fitness` | 1.0（原 0.5） | 只作用于 refine 时间重分配阶段；rebound 优化里没有 fitness 项 |
 
 > 代价：控制点数约 2~2.5 倍，单次重规划耗时约为 0.5 m 时的 2.5~3.5 倍。
 > FSM 以 1 s 周期重规划、traj_server 独立 100 Hz 发布，几十至一百余毫秒的规划耗时可接受；
@@ -81,7 +91,7 @@
 
 **4. 不使用「窗口中心航点」强制居中**
 
-定位存在偏差，书面航点无法保证落在真实窗心；居中完全依赖 A* 距离惩罚 + 碰撞代价
+定位存在偏差，书面航点无法保证落在真实窗心；居中完全依赖走廊余量代价 + 碰撞代价
 （必须经避障通过），航点只负责给出穿窗方向。
 
 ### 其他既有本地改动
@@ -91,4 +101,4 @@
 
 ## 部署提醒
 
-launch 配置属主仓库；本仓库改动需在上机环境 `colcon build --packages-select ego_planner` 后生效。
+launch 配置属主仓库；本仓库改动需在上机环境 `colcon build --packages-select bspline_opt ego_planner` 后生效。

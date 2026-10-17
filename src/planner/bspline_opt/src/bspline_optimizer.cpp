@@ -18,6 +18,8 @@ namespace ego_planner
     node->declare_parameter("optimization/swarm_clearance", -1.0);
     node->declare_parameter("optimization/max_vel", -1.0);
     node->declare_parameter("optimization/max_acc", -1.0);
+    node->declare_parameter("optimization/corridor_margin", 0.0);
+    node->declare_parameter("optimization/corridor_weight", 20.0);
 
     node->declare_parameter("optimization/order", 3);
 
@@ -30,6 +32,8 @@ namespace ego_planner
     node->get_parameter("optimization/swarm_clearance", swarm_clearance_);
     node->get_parameter("optimization/max_vel", max_vel_);
     node->get_parameter("optimization/max_acc", max_acc_);
+    node->get_parameter("optimization/corridor_margin", corridor_margin_);
+    node->get_parameter("optimization/corridor_weight", corridor_weight_);
 
     node->get_parameter("optimization/order", order_);
   }
@@ -74,6 +78,80 @@ namespace ego_planner
       }
     }
     return min_clearance;
+  }
+
+  // 预计算"走廊余量"约束：对每个控制点沿 ±x/±y/±z 六向以半个格子的步长探测膨胀面，
+  // 记录最后一个自由采样点及其方向。与原 base_point 机制不同，这里不要求路径已经碰撞，
+  // 因此能在窗、门等狭窄通道内提供持续的"回中"力。
+  // 只在每次重规划的初始化阶段调用一次（与 base_point 一样在优化期间冻结）。
+  void BsplineOptimizer::updateCorridorConstraints()
+  {
+    corridor_base_.assign(cps_.size, {});
+    corridor_dir_.assign(cps_.size, {});
+
+    if (corridor_margin_ <= 0.0)
+      return;
+
+    const double step = 0.5 * grid_map_->getResolution();
+    const int n_step = std::max(1, (int)std::ceil(corridor_margin_ / step));
+    Eigen::Vector3d dirs[6] = {Eigen::Vector3d::UnitX(),  -Eigen::Vector3d::UnitX(),
+                               Eigen::Vector3d::UnitY(),  -Eigen::Vector3d::UnitY(),
+                               Eigen::Vector3d::UnitZ(),  -Eigen::Vector3d::UnitZ()};
+
+    int constrained = 0;
+    for (int i = order_; i < cps_.size - order_; ++i)
+    {
+      const Eigen::Vector3d p = cps_.points.col(i);
+
+      for (int a = 0; a < 6; ++a)
+      {
+        int hit_k = -1;
+        for (int k = 1; k <= n_step; ++k)
+        {
+          if (grid_map_->getInflateOccupancy(p + dirs[a] * (k * step)) == 1)
+          {
+            hit_k = k;
+            break;
+          }
+        }
+        if (hit_k > 0)
+        {
+          const double free_dist = (hit_k - 1) * step; // 到膨胀面的距离（误差 <= step）
+          corridor_base_[i].push_back(p + dirs[a] * free_dist);
+          corridor_dir_[i].push_back(-dirs[a]); // 由障碍指向自由空间
+          ++constrained;
+        }
+      }
+    }
+
+    if (shouldLogNow("updateCorridorConstraints"))
+    {
+      RCLCPP_INFO(rclcpp::get_logger("BsplineOptimizer"),
+                  "[corridor] margin=%.2fm, constrained rays=%d", corridor_margin_, constrained);
+    }
+  }
+
+  // 二次型走廊余量代价：dist 为控制点到膨胀面的距离，只对 dist < margin 的方向生效。
+  // 两侧都不足 margin 时（如窗内上下沿），两侧梯度在通道中心相互抵消，形成稳定平衡点。
+  void BsplineOptimizer::calcCorridorCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient)
+  {
+    cost = 0.0;
+    if (corridor_margin_ <= 0.0 || corridor_base_.empty())
+      return;
+
+    const int end_idx = q.cols() - order_;
+    for (int i = order_; i < end_idx && i < (int)corridor_base_.size(); ++i)
+    {
+      for (size_t j = 0; j < corridor_base_[i].size(); ++j)
+      {
+        const double dist = (q.col(i) - corridor_base_[i][j]).dot(corridor_dir_[i][j]);
+        const double err = corridor_margin_ - dist;
+        if (err <= 0.0)
+          continue;
+        cost += 0.5 * err * err;
+        gradient.col(i) += -err * corridor_dir_[i][j];
+      }
+    }
   }
 
   // 返回多个安全的控制点集
@@ -515,6 +593,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
       cps_.clearance = dist0_;
       cps_.resize(init_points.cols());
       cps_.points = init_points;
+      updateCorridorConstraints();
     }
 
     /*** Segment the initial trajectory according to obstacles ***/
@@ -1858,7 +1937,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     memcpy(cps_.points.data() + 3 * order_, x, n * sizeof(x[0]));
 
     /* ---------- evaluate cost and gradient ---------- */
-    double f_smoothness, f_distance, f_feasibility /*, f_mov_objs*/, f_swarm, f_terminal;
+    double f_smoothness, f_distance, f_feasibility /*, f_mov_objs*/, f_swarm, f_terminal, f_corridor;
 
     Eigen::MatrixXd g_smoothness = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_distance = Eigen::MatrixXd::Zero(3, cps_.size);
@@ -1866,6 +1945,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     // Eigen::MatrixXd g_mov_objs = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_swarm = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_terminal = Eigen::MatrixXd::Zero(3, cps_.size);
+    Eigen::MatrixXd g_corridor = Eigen::MatrixXd::Zero(3, cps_.size);
 
     calcSmoothnessCost(cps_.points, f_smoothness, g_smoothness);
     calcDistanceCostRebound(cps_.points, f_distance, g_distance, iter_num_, f_smoothness);
@@ -1873,12 +1953,13 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     // calcMovingObjCost(cps_.points, f_mov_objs, g_mov_objs);
     calcSwarmCost(cps_.points, f_swarm, g_swarm);
     calcTerminalCost(cps_.points, f_terminal, g_terminal);
+    calcCorridorCost(cps_.points, f_corridor, g_corridor);
 
-    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal;
+    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal + corridor_weight_ * f_corridor;
     // f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_mov_objs;
     // printf("origin %f %f %f %f\n", f_smoothness, f_distance, f_feasibility, f_combine);
 
-    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal;
+    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal + corridor_weight_ * g_corridor;
     // Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_mov_objs;
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }

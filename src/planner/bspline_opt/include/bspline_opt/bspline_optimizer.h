@@ -178,6 +178,13 @@ namespace ego_planner
     double dist0_, swarm_clearance_; // safe distance
     double max_vel_, max_acc_;       // dynamic limits
 
+    // 走廊余量代价：对每个控制点沿 ±x/±y/±z 六向探到膨胀面，距离小于 margin 时施加
+    // 二次型排斥。margin<=0 关闭；weight 为代价权重。
+    // 注意：该代价不依赖 base_point，路径不碰撞时也生效，用于把轨迹拉回通道中心。
+    double corridor_margin_, corridor_weight_;
+    std::vector<std::vector<Eigen::Vector3d>> corridor_base_; // 膨胀面上的基点（沿该方向最后一个自由采样点）
+    std::vector<std::vector<Eigen::Vector3d>> corridor_dir_;  // 由障碍指向自由空间的单位方向
+
     int variable_num_;              // optimization variables
     int iter_num_;                  // iteration of the solver
     Eigen::VectorXd best_variable_; //
@@ -234,6 +241,8 @@ namespace ego_planner
     void calcMovingObjCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     void calcSwarmCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     void calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
+    void updateCorridorConstraints();
+    void calcCorridorCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     bool check_collision_and_rebound(void);
 
     static int earlyExit(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls);
