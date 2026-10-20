@@ -1566,8 +1566,12 @@ namespace ego_planner
 
     getLocalTarget();
 
+    // 只有局部目标就是最终目标时，才在优化器里启用“末段减速到 0”；
+    // 7.5m 视野边界只是阶段终点，应保持巡航，避免压出折返尾巴
+    const bool flag_final_target = (local_target_pt_ - end_pt_).norm() < 1e-3;
+
     bool plan_and_refine_success =
-        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
+        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj, flag_final_target);
     have_new_target_ = false;
 
     // cout << "refine_success=" << plan_and_refine_success << endl;

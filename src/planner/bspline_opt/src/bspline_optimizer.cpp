@@ -1266,18 +1266,24 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     gradient.col(q.cols() - 2) += 2 * dq * (4 / 6.0);
     gradient.col(q.cols() - 1) += 2 * dq * (1 / 6.0);
 
-    // 末段多级速度约束：最后4段逐步减速，避免尾段冲刺
-    const int n = q.cols();
-    const double weights[] = {10.0, 5.0, 2.0, 0.5};
-    for (int k = 0; k < 4 && n - 3 - k >= 0; k++)
+    // 末段多级速度约束：最后4段逐步减速到 0，避免尾段冲刺后急停。
+    // 只在局部目标就是最终目标时启用：此时需要平顺停机，防止终点速度不为零绕圈。
+    // 中间局部目标（7.5m 视野边界）处应保持巡航，若同样压到 0，
+    // 会与终点位置约束联立把尾部控制点压成折返，形成随重规划前移的“刹车尾巴”。
+    if (flag_final_target_)
     {
-      int i1 = n - 1 - k;      // Q_{n-1}, Q_{n-2}, Q_{n-3}, Q_{n-4}
-      int i3 = n - 3 - k;      // Q_{n-3}, Q_{n-4}, Q_{n-5}, Q_{n-6}
-      double w = weights[k];
-      Eigen::Vector3d vel = (q.col(i1) - q.col(i3)) / (2.0 * bspline_interval_);
-      cost += w * vel.squaredNorm();
-      gradient.col(i3) += 2.0 * w * vel * (-1.0 / (2.0 * bspline_interval_));
-      gradient.col(i1) += 2.0 * w * vel * ( 1.0 / (2.0 * bspline_interval_));
+      const int n = q.cols();
+      const double weights[] = {10.0, 5.0, 2.0, 0.5};
+      for (int k = 0; k < 4 && n - 3 - k >= 0; k++)
+      {
+        int i1 = n - 1 - k;      // Q_{n-1}, Q_{n-2}, Q_{n-3}, Q_{n-4}
+        int i3 = n - 3 - k;      // Q_{n-3}, Q_{n-4}, Q_{n-5}, Q_{n-6}
+        double w = weights[k];
+        Eigen::Vector3d vel = (q.col(i1) - q.col(i3)) / (2.0 * bspline_interval_);
+        cost += w * vel.squaredNorm();
+        gradient.col(i3) += 2.0 * w * vel * (-1.0 / (2.0 * bspline_interval_));
+        gradient.col(i1) += 2.0 * w * vel * ( 1.0 / (2.0 * bspline_interval_));
+      }
     }
   }
 

@@ -92,7 +92,8 @@ namespace ego_planner
 
   bool EGOPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
+                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj,
+                                        bool flag_final_target)
   {
     static int count = 0;
     // printf("\033[47;30m\n[drone %d replan %d]==============================================\033[0m\n", pp_.drone_id, count++);
@@ -105,6 +106,8 @@ namespace ego_planner
     }
 
     bspline_optimizer_->setLocalTargetPt(local_target_pt);
+    // 仅当局部目标就是最终目标时，末段才强制减速到 0；阶段终点保持巡航
+    bspline_optimizer_->setFinalTargetFlag(flag_final_target);
 
     rclcpp::Time t_start = rclcpp::Clock().now();
     rclcpp::Duration t_init(0, 0), t_opt(0, 0), t_refine(0, 0);

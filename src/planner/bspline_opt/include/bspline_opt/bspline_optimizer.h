@@ -109,6 +109,9 @@ namespace ego_planner
     void setWaypoints(const vector<Eigen::Vector3d> &waypts,
                       const vector<int> &waypt_idx); // N-2 constraints at most
     void setLocalTargetPt(const Eigen::Vector3d local_target_pt) { local_target_pt_ = local_target_pt; };
+    // 局部目标是否为最终目标：只有此时才在末段把速度压到 0（平顺停机）；
+    // 7.5m 视野边界上的阶段终点应保持巡航速度，否则会压出折返尾巴。
+    void setFinalTargetFlag(const bool flag_final_target) { flag_final_target_ = flag_final_target; };
 
     // 运行期实时调速：同步更新优化器的速度/加速度限值
     // （优化器持有独立的 optimization/max_vel，若只改 pp_.max_vel_ 会出现
@@ -196,6 +199,7 @@ namespace ego_planner
     double min_cost_;               //
 
     Eigen::Vector3d local_target_pt_; 
+    bool flag_final_target_ = false; // 局部目标是否为最终目标（true 才启用末段减速）
 
 #define INIT_min_ellip_dist_ 123456789.0123456789
     double min_ellip_dist_;
