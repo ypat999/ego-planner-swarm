@@ -74,7 +74,7 @@ namespace ego_planner
     int continous_failures_count_{0};
 
     // 狭窄通道自动减速参数（见 initPlanModules 读取）
-    double narrow_clearance_threshold_{1.0};  // 单侧拥挤阈值(米)：左右同时低于此值才减速
+    double narrow_clearance_threshold_{1.0};  // 单侧拥挤阈值(米)：左右或上下同时低于此值才减速
     double narrow_vel_ratio_{0.4};            // 最窄处的速度比例下限（0.4 = 降到默认速度的 40%）
 
     void updateTrajInfo(const UniformBspline &position_traj, const rclcpp::Time time_now);

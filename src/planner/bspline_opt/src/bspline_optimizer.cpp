@@ -60,13 +60,17 @@ namespace ego_planner
 
   void BsplineOptimizer::setDroneId(const int drone_id) { drone_id_ = drone_id; }
 
-  // 沿优化后的 B 样条逐点测量水平左右余量：只有左右两侧同时小于 threshold 的采样点
-  // 才视为“窄口”，返回其中最窄处的左右余量之和；否则返回 1e9（不减速）。
-  // 射线只取水平面内与轨迹切线垂直的方向，因此地板/天花板、沿墙平行飞行、
-  // 单侧贴墙都不会被误判为窄通道。
-  double BsplineOptimizer::getMinLateralWidth(const double ts, const double threshold, double &l_out, double &r_out)
+  // 沿优化后的 B 样条逐点测量“左右”与“上下”两个轴向的自由宽度：
+  // 每个采样点取水平法向 ±n 与竖直 ±z 各打一条射线，得到 l/r 与 u/d 余量；
+  // 某个轴向只有两侧同时小于 threshold 才算窄口，取两轴向中最窄的那个 l+r 或 u+d。
+  // 返回值为最窄自由宽度（米），无窄口时返回 1e9；各向余量与胜出轴向仅用于日志。
+  // 单侧贴墙/贴地/贴顶、开阔空域都不会被误判为窄通道。
+  double BsplineOptimizer::getMinNarrowWidth(const double ts, const double threshold,
+                                             double &l_out, double &r_out,
+                                             double &u_out, double &d_out, bool &vertical_out)
   {
-    l_out = r_out = 0.0;
+    l_out = r_out = u_out = d_out = 0.0;
+    vertical_out = false;
     if (threshold <= 0.0 || ts <= 1e-4 || cps_.points.cols() < 4)
       return 1e9;
 
@@ -84,6 +88,18 @@ namespace ego_planner
     const Eigen::Vector3d z(0, 0, 1);
     double min_width = 1e9;
 
+    // 从 p 沿 dir 探测第一个膨胀格的距离，未命中返回 max_search
+    auto probe = [&](const Eigen::Vector3d &p, const Eigen::Vector3d &dir) -> double
+    {
+      for (int k = 1; k <= n_step; ++k)
+      {
+        const double d = k * step;
+        if (grid_map_->getInflateOccupancy(p + dir * d) > 0)
+          return d;
+      }
+      return max_search;
+    };
+
     for (double t = 0.0; t <= dur + 1e-6; t += dt_samp)
     {
       const double tc = std::min(t, dur);
@@ -100,30 +116,33 @@ namespace ego_planner
         continue;
       const Eigen::Vector3d n = tangent.normalized().cross(z).normalized();
 
-      double l = max_search, r = max_search;
-      bool l_hit = false, r_hit = false;
-      for (int k = 1; k <= n_step; ++k)
+      const double l = probe(p, n);
+      const double r = probe(p, -n);
+      const double u = probe(p, z);
+      const double d = probe(p, -z);
+
+      // 每个轴向只有两侧同时拥挤才算窄口，两轴向取更窄者
+      double width = 1e9;
+      bool vertical = false;
+      if (l < threshold && r < threshold)
       {
-        const double d = k * step;
-        if (!l_hit && grid_map_->getInflateOccupancy(p + n * d) > 0)
-        {
-          l = d;
-          l_hit = true;
-        }
-        if (!r_hit && grid_map_->getInflateOccupancy(p - n * d) > 0)
-        {
-          r = d;
-          r_hit = true;
-        }
-        if (l_hit && r_hit)
-          break;
+        width = l + r;
+        vertical = false;
+      }
+      if (u < threshold && d < threshold && u + d < width)
+      {
+        width = u + d;
+        vertical = true;
       }
 
-      if (l < threshold && r < threshold && l + r < min_width)
+      if (width < min_width)
       {
-        min_width = l + r;
+        min_width = width;
         l_out = l;
         r_out = r;
+        u_out = u;
+        d_out = d;
+        vertical_out = vertical;
       }
     }
 

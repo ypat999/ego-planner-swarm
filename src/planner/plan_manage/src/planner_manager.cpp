@@ -354,22 +354,24 @@ namespace ego_planner
 
     t_start = rclcpp::Clock().now();
 
-    // ==== 狭窄通道自动减速：只有左右两侧同时拥挤才降速 ====
-    // 沿 B 样条逐点测水平左右余量 l/r（已含膨胀层），只有 l、r 同时小于阈值才视为窄口，
-    // 单侧贴墙、开阔空域、沿墙平行飞行均不触发。
+    // ==== 狭窄通道自动减速：左右或上下两侧同时拥挤才降速 ====
+    // 沿 B 样条逐点测水平左右余量 l/r 与竖直上下余量 u/d（已含膨胀层），任一轴向两侧
+    // 同时小于阈值即视为窄口；取左右与上下中最窄者换算减速比例，单侧贴墙/贴地/贴顶不触发。
     // 控制点是纯几何量，ts（结点间隔）决定时间尺度：增大 ts 不改路径、只放慢速度。
-    double l_clearance = 0.0, r_clearance = 0.0;
-    double lateral_width = bspline_optimizer_->getMinLateralWidth(ts, narrow_clearance_threshold_,
-                                                                 l_clearance, r_clearance);
-    if (lateral_width < 1e8)
+    double l_clearance = 0.0, r_clearance = 0.0, u_clearance = 0.0, d_clearance = 0.0;
+    bool narrow_vertical = false;
+    double narrow_width = bspline_optimizer_->getMinNarrowWidth(ts, narrow_clearance_threshold_,
+                                                               l_clearance, r_clearance,
+                                                               u_clearance, d_clearance, narrow_vertical);
+    if (narrow_width < 1e8)
     {
       double v_ratio = std::max(narrow_vel_ratio_,
-                                std::min(1.0, lateral_width / (2.0 * narrow_clearance_threshold_)));
+                                std::min(1.0, narrow_width / (2.0 * narrow_clearance_threshold_)));
       ts /= v_ratio;                                                           // ts 变大 → 同路径走得更慢
       RCLCPP_INFO(node_->get_logger(),
-                  "[narrow] l=%.2fm r=%.2fm width=%.2fm < %.2fm, 减速到 %.0f%% (ts=%.3fs)",
-                  l_clearance, r_clearance, lateral_width, 2.0 * narrow_clearance_threshold_,
-                  v_ratio * 100.0, ts);
+                  "[narrow] %s最窄 width=%.2fm < %.2fm (左右 %.2f/%.2f, 上下 %.2f/%.2f), 减速到 %.0f%% (ts=%.3fs)",
+                  narrow_vertical ? "上下" : "左右", narrow_width, 2.0 * narrow_clearance_threshold_,
+                  l_clearance, r_clearance, u_clearance, d_clearance, v_ratio * 100.0, ts);
     }
 
     UniformBspline pos = UniformBspline(ctrl_pts, 3, ts);
