@@ -36,6 +36,13 @@ bool have_odom_ = false;
 // Target yaw from goal pose orientation
 double target_yaw_ = 0.0;
 
+// 当前轨迹对应的目标点与目标yaw：仅在收到新bspline时生效。
+// 目标点回调与轨迹生成之间存在延迟，若直接使用目标点回调里的yaw，
+// 会在轨迹尚未生成时提前转向新目标（原地转头），故yaw跟随轨迹而非目标点。
+double traj_target_yaw_ = 0.0;
+Eigen::Vector3d traj_goal_pos_ = Eigen::Vector3d::Zero();
+bool traj_yaw_pending_ = false;
+
 // TF transform variables
 std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -178,6 +185,11 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstSharedPtr msg)
   }
 
   receive_traj_ = true;
+
+  // 新轨迹到达后才让目标yaw/目标点生效，避免"目标已更新、轨迹未生成"期间提前转头
+  traj_target_yaw_ = target_yaw_;
+  traj_goal_pos_ = current_goal_pos_;
+  traj_yaw_pending_ = false;
 }
 
 void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
@@ -326,6 +338,8 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
   // 使用更可靠的atan2方法提取yaw，避免eulerAngles的不稳定性
   Eigen::Matrix3d rot_goal = q_goal.toRotationMatrix();
   target_yaw_ = atan2(rot_goal(1, 0), rot_goal(0, 0));
+  // 目标yaw待新轨迹到达后再生效（安全区降落直接使用target_yaw_，不经过轨迹）
+  traj_yaw_pending_ = true;
   
   RCLCPP_INFO(rclcpp::get_logger("traj_server"), 
               "Received new goal pose: (%.2f, %.2f, %.2f), target yaw from orientation: %.2f rad (%.2f deg)", 
@@ -346,14 +360,16 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
   double yaw_temp;
   // 轨迹结束后使用目标偏航角
   if (t_cur >= traj_duration_ && have_goal_) {
-    yaw_temp = target_yaw_;
+    // 新目标已收到但新轨迹尚未到达：保持当前yaw，避免悬停等待期间提前转向新目标
+    yaw_temp = traj_yaw_pending_ ? last_yaw_ : traj_target_yaw_;
   } else {
     // 轨迹执行中：接近目标时提前转向目标偏航角，否则跟随轨迹方向
     if (have_goal_) {
+      // 距离与yaw均取自当前轨迹对应的目标，而非刚收到的新目标
       double dist_to_goal = (Eigen::Vector2d(pos(0), pos(1))
-                           - Eigen::Vector2d(current_goal_pos_(0), current_goal_pos_(1))).norm();
+                           - Eigen::Vector2d(traj_goal_pos_(0), traj_goal_pos_(1))).norm();
       if (dist_to_goal < 2.0) {
-        yaw_temp = target_yaw_;  // 距目标2m内提前旋转到目标yaw
+        yaw_temp = traj_target_yaw_;  // 距目标2m内提前旋转到目标yaw
       } else {
         goto use_traj_yaw;
       }
