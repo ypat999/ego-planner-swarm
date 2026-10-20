@@ -123,9 +123,12 @@ namespace ego_planner
 
     ControlPoints getControlPoints() { return cps_; };
 
-    // 返回当前优化后控制点沿轨迹到最近障碍（膨胀面）的最小自由余量（米）。
-    // 无 base_point（附近无障碍）时返回远大于阈值的大值，表示不触发减速。
-    double getMinClearance();
+    // 沿当前优化后的 B 样条逐点测量“左右两侧同时拥挤”的水平自由宽度：
+    // 在每个采样点取轨迹水平法向 ±n 各打一条射线，得到左右余量 l / r，
+    // 只有 l、r 同时小于 threshold 的采样点才算窄口，返回其中最小的 l + r（米）。
+    // 单侧贴墙、开阔空域、沿墙平行飞行都不触发，此时返回大值 1e9。
+    // l_out / r_out 返回最窄处的左右余量，仅用于日志。
+    double getMinLateralWidth(const double ts, const double threshold, double &l_out, double &r_out);
 
     AStar::Ptr a_star_;
     std::vector<Eigen::Vector3d> ref_pts_;

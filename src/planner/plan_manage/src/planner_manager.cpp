@@ -354,18 +354,22 @@ namespace ego_planner
 
     t_start = rclcpp::Clock().now();
 
-    // ==== 狭窄通道自动减速：B-spline 几何已定，取沿轨迹最小自由余量，窄则拉长时间步长 ====
+    // ==== 狭窄通道自动减速：只有左右两侧同时拥挤才降速 ====
+    // 沿 B 样条逐点测水平左右余量 l/r（已含膨胀层），只有 l、r 同时小于阈值才视为窄口，
+    // 单侧贴墙、开阔空域、沿墙平行飞行均不触发。
     // 控制点是纯几何量，ts（结点间隔）决定时间尺度：增大 ts 不改路径、只放慢速度。
-    // 余量从阈值线性降到 0 时，速度比例从 1.0 降到 narrow_vel_ratio_。
-    double min_clearance = bspline_optimizer_->getMinClearance();
-    if (min_clearance < narrow_clearance_threshold_)
+    double l_clearance = 0.0, r_clearance = 0.0;
+    double lateral_width = bspline_optimizer_->getMinLateralWidth(ts, narrow_clearance_threshold_,
+                                                                 l_clearance, r_clearance);
+    if (lateral_width < 1e8)
     {
-      double scale = min_clearance / narrow_clearance_threshold_;              // [0, 1)
-      double v_ratio = std::max(narrow_vel_ratio_, std::min(1.0, scale));
+      double v_ratio = std::max(narrow_vel_ratio_,
+                                std::min(1.0, lateral_width / (2.0 * narrow_clearance_threshold_)));
       ts /= v_ratio;                                                           // ts 变大 → 同路径走得更慢
       RCLCPP_INFO(node_->get_logger(),
-                  "[narrow] min_clearance=%.2fm < %.2fm, 减速到 %.0f%% (ts=%.3fs)",
-                  min_clearance, narrow_clearance_threshold_, v_ratio * 100.0, ts);
+                  "[narrow] l=%.2fm r=%.2fm width=%.2fm < %.2fm, 减速到 %.0f%% (ts=%.3fs)",
+                  l_clearance, r_clearance, lateral_width, 2.0 * narrow_clearance_threshold_,
+                  v_ratio * 100.0, ts);
     }
 
     UniformBspline pos = UniformBspline(ctrl_pts, 3, ts);

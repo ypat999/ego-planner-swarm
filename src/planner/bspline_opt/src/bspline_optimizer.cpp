@@ -60,24 +60,74 @@ namespace ego_planner
 
   void BsplineOptimizer::setDroneId(const int drone_id) { drone_id_ = drone_id; }
 
-  // 返回当前优化后控制点沿轨迹到最近障碍（膨胀面）的最小自由余量（米）。
-  // base_point/direction 由 initControlPoints 与 check_collision_and_rebound 维护：
-  // dist = (points - base_point)·direction 即控制点到膨胀障碍面的有符号距离。
-  double BsplineOptimizer::getMinClearance()
+  // 沿优化后的 B 样条逐点测量水平左右余量：只有左右两侧同时小于 threshold 的采样点
+  // 才视为“窄口”，返回其中最窄处的左右余量之和；否则返回 1e9（不减速）。
+  // 射线只取水平面内与轨迹切线垂直的方向，因此地板/天花板、沿墙平行飞行、
+  // 单侧贴墙都不会被误判为窄通道。
+  double BsplineOptimizer::getMinLateralWidth(const double ts, const double threshold, double &l_out, double &r_out)
   {
-    double min_clearance = 1e9;
-    for (int i = 0; i < cps_.size; ++i)
+    l_out = r_out = 0.0;
+    if (threshold <= 0.0 || ts <= 1e-4 || cps_.points.cols() < 4)
+      return 1e9;
+
+    const double res = grid_map_->getResolution();
+    const double step = std::max(0.5 * res, 1e-2);
+    const double max_search = 2.0 * threshold;  // 单侧封顶：开放的一侧饱和后不会满足“同时拥挤”
+    const int n_step = std::max(1, (int)std::ceil(max_search / step));
+
+    UniformBspline traj(cps_.points, 3, ts);
+    const double dur = traj.getTimeSum();
+    if (dur < 1e-3)
+      return 1e9;
+
+    const double dt_samp = std::max(0.05, dur / 100.0);
+    const Eigen::Vector3d z(0, 0, 1);
+    double min_width = 1e9;
+
+    for (double t = 0.0; t <= dur + 1e-6; t += dt_samp)
     {
-      for (size_t j = 0; j < cps_.base_point[i].size(); ++j)
+      const double tc = std::min(t, dur);
+      const Eigen::Vector3d p = traj.evaluateDeBoorT(tc);
+      if (grid_map_->getInflateOccupancy(p) > 0)
+        continue;  // 点在膨胀区里属于碰撞，不是“窄”
+
+      // 水平切线（前后差分），法向 = 切线 × z
+      const double t0 = std::max(0.0, tc - 0.5 * dt_samp);
+      const double t1 = std::min(dur, tc + 0.5 * dt_samp);
+      Eigen::Vector3d tangent = traj.evaluateDeBoorT(t1) - traj.evaluateDeBoorT(t0);
+      tangent(2) = 0.0;
+      if (tangent.norm() < 1e-3)
+        continue;
+      const Eigen::Vector3d n = tangent.normalized().cross(z).normalized();
+
+      double l = max_search, r = max_search;
+      bool l_hit = false, r_hit = false;
+      for (int k = 1; k <= n_step; ++k)
       {
-        const double dist = (cps_.points.col(i) - cps_.base_point[i][j]).dot(cps_.direction[i][j]);
-        if (dist < min_clearance)
+        const double d = k * step;
+        if (!l_hit && grid_map_->getInflateOccupancy(p + n * d) > 0)
         {
-          min_clearance = dist;
+          l = d;
+          l_hit = true;
         }
+        if (!r_hit && grid_map_->getInflateOccupancy(p - n * d) > 0)
+        {
+          r = d;
+          r_hit = true;
+        }
+        if (l_hit && r_hit)
+          break;
+      }
+
+      if (l < threshold && r < threshold && l + r < min_width)
+      {
+        min_width = l + r;
+        l_out = l;
+        r_out = r;
       }
     }
-    return min_clearance;
+
+    return min_width;
   }
 
   // 预计算"走廊余量"约束：对每个控制点沿 ±x/±y/±z 六向以半个格子的步长探测膨胀面，
