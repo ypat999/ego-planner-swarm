@@ -76,17 +76,21 @@
 > FSM 以 1 s 周期重规划、traj_server 独立 100 Hz 发布，几十至一百余毫秒的规划耗时可接受；
 > 实际值看日志 `total time:...,optimize:...,refine:...`。
 
-**3. B-spline 生成后按最小余量自动减速（`BsplineOptimizer::getMinClearance()`）**
+**3. B-spline 生成后按局部余量自动减速（`BsplineOptimizer::getClearanceAt()`）**
 
 - 实现：`reboundReplan` 在 STEP2（rebound 优化）之后、构造 `UniformBspline` 之前，
-  遍历 `cps_.base_point` / `cps_.direction` 求沿轨迹到膨胀障碍面的最小有符号距离。
-- 控制点是纯几何量，`ts`（结点间隔）决定时间尺度：**放大 `ts` 只降速、不改路径**。
-  余量从阈值线性降到 0 时，速度比例从 1.0 降到 `narrow_vel_ratio`。
-- 日志：`[narrow] min_clearance=... < ... , 减速到 ...% (ts=...)`。
+  沿**优化后的最终轨迹**按 0.05 s 采样，逐点搜索该采样点所在高度层的水平（XY）邻域，
+  取到膨胀障碍栅格的最小距离（不使用 `cps_.base_point`，因此不受种子路径与"控制点是否已碰撞"限制）。
+- **只统计水平方向**：地板/天花板与轨迹高度差恒定，若计入垂直方向，任何低空平飞都会被误判为窄
+  （实测 1.2 m 高度 + 0.4 m 膨胀 → 0.8 m，恒小于 1.0 m 阈值）；通过性主要由门窗水平净宽决定。
+- **只减速窄点附近**：速度比例为 `r = clamp(clearance/threshold, narrow_vel_ratio, 1)`，
+  窄口前后各扩 0.5 m、再平滑 0.25 m，然后按虚拟时间 `T = ∫dt/r` 等间隔重采样控制点。
+  窄处控制点变密（同路径走得更慢），宽处保持原密度（原速度与原时间分配不变）。
+- 日志：`[narrow] min_clearance=... < ..., 局部减速段 x/y m (最低 ...%, ts=...)`。
 
 | 参数（主仓 launch） | 当前值 | 说明 |
 |---|---|---|
-| `manager/narrow_clearance_threshold` | 1.0 | 自由余量阈值 (m)，低于此值开始减速 |
+| `manager/narrow_clearance_threshold` | 0.6 | 自由余量阈值 (m)，同时是检测半径；低于此值开始减速 |
 | `manager/narrow_vel_ratio` | 0.4 | 余量→0 时的速度比例（默认速度的 40%） |
 
 **4. 不使用「窗口中心航点」强制居中**

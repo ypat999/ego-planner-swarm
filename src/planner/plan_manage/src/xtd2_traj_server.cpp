@@ -344,9 +344,14 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
 
   // 计算目标偏航角
   double yaw_temp;
-  // 轨迹结束后使用目标偏航角
+  // 轨迹结束后使用目标偏航角（仅当确实已到达该目标点时）
   if (t_cur >= traj_duration_ && have_goal_) {
-    yaw_temp = target_yaw_;
+    // 新目标点下发后、新轨迹生成前，飞机可能仍停在上一个航点：
+    // 此时 target_yaw_/current_goal_pos_ 已切到新航点，若直接使用会让机头先转向新航点 yaw，
+    // 等新轨迹到达后又转回轨迹方向（表现为“转一下又回正”）。未到达新目标点前保持当前机头。
+    const double dist_to_goal = (Eigen::Vector2d(pos(0), pos(1))
+                               - Eigen::Vector2d(current_goal_pos_(0), current_goal_pos_(1))).norm();
+    yaw_temp = dist_to_goal < 2.0 ? target_yaw_ : last_yaw_;
   } else {
     // 轨迹执行中：接近目标时提前转向目标偏航角，否则跟随轨迹方向
     if (have_goal_) {

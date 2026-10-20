@@ -51,6 +51,10 @@ namespace ego_planner
     double getSwarmClearance(void) { return bspline_optimizer_->getSwarmClearance(); }
 
     bool checkCollision(int drone_id);
+
+    // 局部目标是否为最终目标：是则把输出 B 样条的末端精确对齐到该点
+    void setFinalTargetFlag(bool flag) { flag_final_target_ = flag; }
+
     
 
     PlanParameters pp_;
@@ -74,8 +78,10 @@ namespace ego_planner
     int continous_failures_count_{0};
 
     // 狭窄通道自动减速参数（见 initPlanModules 读取）
-    double narrow_clearance_threshold_{1.0};  // 自由余量阈值(米)：低于此值开始减速
+    double narrow_clearance_threshold_{0.6};  // 自由余量阈值(米)，同时是检测半径：低于此值开始减速
     double narrow_vel_ratio_{0.4};            // 余量→0 时的速度比例（0.4 = 降到默认速度的 40%）
+
+    bool flag_final_target_{false};           // 局部目标是否为最终目标（决定是否做末端精确对齐）
 
     void updateTrajInfo(const UniformBspline &position_traj, const rclcpp::Time time_now);
 

@@ -23,12 +23,17 @@ namespace ego_planner
     node->declare_parameter("manager/planning_horizon", 5.0);
     node->declare_parameter("manager/use_distinctive_trajs", false);
     node->declare_parameter("manager/drone_id", -1);
-    node->declare_parameter("manager/narrow_clearance_threshold", 1.0);
+    node->declare_parameter("manager/narrow_clearance_threshold", 0.6);
     node->declare_parameter("manager/narrow_vel_ratio", 0.4);
 
     node->get_parameter("manager/max_vel", pp_.max_vel_);
     node->get_parameter("manager/max_acc", pp_.max_acc_);
     node->get_parameter("manager/max_jerk", pp_.max_jerk_);
+    node->get_parameter("manager/feasibility_tolerance", pp_.feasibility_tolerance_);
+    node->get_parameter("manager/control_points_distance", pp_.ctrl_pt_dist);
+    node->get_parameter("manager/planning_horizon", pp_.planning_horizen_);
+    node->get_parameter("manager/use_distinctive_trajs", pp_.use_distinctive_trajs);
+    node->get_parameter("manager/drone_id", pp_.drone_id);
     // Validate critical physical limits to avoid invalid planning results
     if (pp_.max_vel_ <= 0.0)
     {
@@ -45,11 +50,6 @@ namespace ego_planner
       RCLCPP_WARN(node->get_logger(), "Invalid manager/control_points_distance (<=0): %f. Setting to default 0.5 m.", pp_.ctrl_pt_dist);
       pp_.ctrl_pt_dist = 0.5;
     }
-    node->get_parameter("manager/feasibility_tolerance", pp_.feasibility_tolerance_);
-    node->get_parameter("manager/control_points_distance", pp_.ctrl_pt_dist);
-    node->get_parameter("manager/planning_horizon", pp_.planning_horizen_);
-    node->get_parameter("manager/use_distinctive_trajs", pp_.use_distinctive_trajs);
-    node->get_parameter("manager/drone_id", pp_.drone_id);
     
     // 验证无人机ID
     if (pp_.drone_id < 0)
@@ -105,6 +105,7 @@ namespace ego_planner
     }
 
     bspline_optimizer_->setLocalTargetPt(local_target_pt);
+    bspline_optimizer_->setLocalTargetVel(local_target_vel);
 
     rclcpp::Time t_start = rclcpp::Clock().now();
     rclcpp::Duration t_init(0, 0), t_opt(0, 0), t_refine(0, 0);
@@ -284,6 +285,21 @@ namespace ego_planner
     // 将轨迹变为B样条轨迹
     Eigen::MatrixXd ctrl_pts, ctrl_pts_temp;
     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
+    if (getenv("EGO_DIAG"))
+    {
+      double L = 0, seg_max = 0, seg_min = 1e9;
+      for (size_t i = 1; i < point_set.size(); ++i)
+      {
+        double d = (point_set[i] - point_set[i - 1]).norm();
+        L += d;
+        seg_max = std::max(seg_max, d);
+        seg_min = std::min(seg_min, d);
+      }
+      RCLCPP_WARN(node_->get_logger(),
+                  "[diag-seed] polyInit=%d seed_pts=%zu d_to_goal=%.2fm ts=%.3f ctrl=%d seedLen=%.2fm seg[min/max]=%.3f/%.3f",
+                  (int)flag_polyInit, point_set.size(), (start_pt - local_target_pt).norm(), ts,
+                  (int)ctrl_pts.cols(), L, seg_min, seg_max);
+    }
 
     vector<std::pair<int, int>> segments;
     segments = bspline_optimizer_->initControlPoints(ctrl_pts, true);
@@ -354,25 +370,125 @@ namespace ego_planner
 
     t_start = rclcpp::Clock().now();
 
-    // ==== 狭窄通道自动减速：B-spline 几何已定，取沿轨迹最小自由余量，窄则拉长时间步长 ====
-    // 控制点是纯几何量，ts（结点间隔）决定时间尺度：增大 ts 不改路径、只放慢速度。
-    // 余量从阈值线性降到 0 时，速度比例从 1.0 降到 narrow_vel_ratio_。
-    double min_clearance = bspline_optimizer_->getMinClearance();
-    if (min_clearance < narrow_clearance_threshold_)
+#if 0 // 临时关闭窄路减速（排查复杂避障打结用）：恢复时删除本行与块尾的 #endif
+    // ==== 狭窄通道自动减速（局部）：只在实际余量不足的路段放慢，其余路段保持原速 ====
+    // B 样条几何已定，这里只改时间参数化：沿轨迹把现有速度乘以
+    // r(s) = clamp(clearance/threshold, narrow_vel_ratio, 1)，
+    // 再按虚拟时间 T = ∫dt/r(s) 等间隔重采样控制点。
+    // 窄处控制点变密（同路径走得更慢），宽处保持原密度（维持原速度和原时间分配），
+    // 因此起停段的加减速、目标点减速都不受影响。
     {
-      double scale = min_clearance / narrow_clearance_threshold_;              // [0, 1)
-      double v_ratio = std::max(narrow_vel_ratio_, std::min(1.0, scale));
-      ts /= v_ratio;                                                           // ts 变大 → 同路径走得更慢
-      RCLCPP_INFO(node_->get_logger(),
-                  "[narrow] min_clearance=%.2fm < %.2fm, 减速到 %.0f%% (ts=%.3fs)",
-                  min_clearance, narrow_clearance_threshold_, v_ratio * 100.0, ts);
+      const double th = narrow_clearance_threshold_;
+      const double dt_samp = 0.05;  // 沿轨迹采样时间步长
+      UniformBspline raw(ctrl_pts, 3, ts);
+      const double dur = raw.getTimeSum();
+
+      if (dur > 1e-3 && ts > 1e-3)
+      {
+        const int n = std::max(2, (int)std::ceil(dur / dt_samp) + 1);
+        std::vector<Eigen::Vector3d> pts(n);
+        std::vector<double> tsamp(n, 0.0), arc(n, 0.0), ratio(n, 1.0);
+
+        double min_c = th;
+        for (int i = 0; i < n; ++i)
+        {
+          tsamp[i] = std::min(dur, i * dt_samp);
+          pts[i] = raw.evaluateDeBoorT(tsamp[i]);
+          if (i > 0)
+            arc[i] = arc[i - 1] + (pts[i] - pts[i - 1]).norm();
+
+          const double c = bspline_optimizer_->getClearanceAt(pts[i], th);
+          // c == 0 表示该采样点本身就在膨胀区里：贴地起降（地面膨胀）或轨迹穿障。
+          // 这属于"不在可通行空间"，不是"通道窄"，不参与减速判定；
+          // 按点跳过而不是把整条轨迹判窄，避免贴地段把整条航线压到 40% 速度。
+          if (c <= 1e-3)
+            continue;
+          min_c = std::min(min_c, c);
+          ratio[i] = std::max(narrow_vel_ratio_, std::min(1.0, c / th));
+        }
+
+        if (min_c < th)
+        {
+          // 窄口前后各扩展 0.5m 进入减速区，再做 0.25m 滑动平均，避免速度阶跃
+          std::vector<double> r_min = ratio;
+          for (int i = 0; i < n; ++i)
+          {
+            for (int j = i; j >= 0 && arc[i] - arc[j] <= 0.5; --j)
+              r_min[i] = std::min(r_min[i], ratio[j]);
+            for (int j = i; j < n && arc[j] - arc[i] <= 0.5; ++j)
+              r_min[i] = std::min(r_min[i], ratio[j]);
+          }
+
+          std::vector<double> r_smooth(n, 1.0);
+          for (int i = 0; i < n; ++i)
+          {
+            double sum = 0.0;
+            int cnt = 0;
+            for (int j = i; j >= 0 && arc[i] - arc[j] <= 0.25; --j)
+            {
+              sum += r_min[j];
+              ++cnt;
+            }
+            for (int j = i + 1; j < n && arc[j] - arc[i] <= 0.25; ++j)
+            {
+              sum += r_min[j];
+              ++cnt;
+            }
+            r_smooth[i] = cnt > 0 ? sum / cnt : 1.0;
+          }
+
+          // 虚拟时间：宽处每步 dt，窄处拉伸为 dt/r
+          std::vector<double> tv(n, 0.0);
+          double slow_len = 0.0;
+          for (int i = 1; i < n; ++i)
+          {
+            tv[i] = tv[i - 1] + (tsamp[i] - tsamp[i - 1]) / std::max(0.05, r_smooth[i]);
+            if (r_smooth[i] < 0.999)
+              slow_len += arc[i] - arc[i - 1];
+          }
+
+          const double t_total = tv.back();
+          if (t_total > dur * 1.001)
+          {
+            const int K = std::max(6, (int)std::lround(t_total / ts));
+            const double dt_new = t_total / K;
+
+            std::vector<Eigen::Vector3d> point_set;
+            point_set.reserve(K + 1);
+            int idx = 0;
+            for (int k = 0; k <= K; ++k)
+            {
+              const double tk = std::min(t_total, k * dt_new);
+              while (idx < n - 2 && tv[idx + 1] < tk)
+                ++idx;
+              const double w = (tk - tv[idx]) / std::max(1e-6, tv[idx + 1] - tv[idx]);
+              point_set.push_back((1.0 - w) * pts[idx] + w * pts[idx + 1]);
+            }
+            point_set.back() = pts.back();  // 终点与原轨迹对齐
+
+            Eigen::MatrixXd ctrl_pts_new;
+            UniformBspline::parameterizeToBspline(dt_new, point_set, start_end_derivatives, ctrl_pts_new);
+            if (ctrl_pts_new.cols() >= 4)
+            {
+              ctrl_pts = ctrl_pts_new;
+              ts = dt_new;
+            }
+
+            RCLCPP_INFO(node_->get_logger(),
+                        "[narrow] min_clearance=%.2fm < %.2fm, 局部减速段 %.1f/%.1fm (最低 %.0f%%, ts=%.3fs)",
+                        min_c, th, slow_len, arc.back(), narrow_vel_ratio_ * 100.0, ts);
+          }
+        }
+      }
     }
+#endif
 
     UniformBspline pos = UniformBspline(ctrl_pts, 3, ts);
     pos.setPhysicalLimits(pp_.max_vel_, pp_.max_acc_, pp_.feasibility_tolerance_);
 
     /*** STEP 3: REFINE(RE-ALLOCATE TIME) IF NECESSARY ***/
     // Note: Only adjust time in single drone mode. But we still allow drone_0 to adjust its time profile.
+    double refine_ratio = 1.0;
     if (pp_.drone_id <= 0)
     {
 
@@ -380,6 +496,7 @@ namespace ego_planner
       bool flag_step_2_success = true;
       if (!pos.checkFeasibility(ratio, false))
       {
+        refine_ratio = ratio;
         cout << "Need to reallocate time." << endl;
 
         Eigen::MatrixXd optimal_control_points;
@@ -407,6 +524,46 @@ namespace ego_planner
 
     // t_refine = ros::Time::now() - t_start;
     t_refine = rclcpp::Clock().now() - t_start;
+
+    // 诊断：输出本条轨迹的时长/长度/平均与峰值速度，用于判断“整体偏慢”来自哪里
+    // （polyInit=0 表示走了旧轨迹采样种子；refine_ratio>1 表示 STEP3 被整体拉长时间）
+    if (getenv("EGO_DIAG"))
+    {
+      const double dur = pos.getTimeSum();
+      double len = 0.0, vmax = 0.0;
+      const int N = 40;
+      Eigen::Vector3d prev = pos.evaluateDeBoorT(0.0);
+      for (int i = 1; i <= N; ++i)
+      {
+        const Eigen::Vector3d p = pos.evaluateDeBoorT(dur * i / N);
+        len += (p - prev).norm();
+        vmax = std::max(vmax, (p - prev).norm() * N / std::max(1e-6, dur));
+        prev = p;
+      }
+      RCLCPP_INFO(node_->get_logger(),
+                  "[diag-speed] polyInit=%d ts=%.3f refine_ratio=%.2f ctrl=%d dur=%.2fs len=%.2fm vavg=%.2f vmax=%.2f d_target=%.2fm",
+                  (int)flag_polyInit, ts, refine_ratio, (int)pos.getControlPoint().cols(), dur, len,
+                  len / std::max(1e-3, dur), vmax, (start_pt - local_target_pt).norm());
+    }
+
+    // 末段末端对齐：B 样条是用采样点做加权最小二乘拟合出来的，末端并不精确等于局部目标
+    // （种子采样只取 t < time，且速度/加速度行权重远高于位置行）。局部目标只是 7.5m 视野外的
+    // 中间点时这点残差无害，但局部目标就是最终目标时，残差会让飞机停在目标点之前，
+    // 而 FSM 的到达判定只看时间、traj_server 的吸附又只有 0.5m。
+    // 这里把最后 3 个控制点整体平移 end_err：B 样条末端 = (Q_{n-3}+4Q_{n-2}+Q_{n-1})/6，
+    // 三点同平移即末端精确平移 end_err，且相邻差值不变（末端速度/加速度保持）。
+    if (flag_final_target_)
+    {
+      const double dur = pos.getTimeSum();
+      Eigen::Vector3d end_err = local_target_pt - pos.evaluateDeBoorT(dur);
+      Eigen::MatrixXd cps = pos.getControlPoint();
+      const double ts_now = dur / std::max(1, (int)cps.cols() - 3);
+      for (int i = cps.cols() - 3; i < cps.cols(); ++i)
+        cps.col(i) += end_err;
+      pos = UniformBspline(cps, 3, ts_now);
+      if (end_err.norm() > 0.05)
+        RCLCPP_INFO(node_->get_logger(), "[final] 末端对齐 %.2fm 到目标点", end_err.norm());
+    }
 
     // save planned results
     // 用规划开始时刻作为 start_time，让 traj_server 计算 t_cur 时自然包含优化延迟，
@@ -656,7 +813,21 @@ namespace ego_planner
     {
       point_set.push_back(bspline.evaluateDeBoorT(time));
     }
-    UniformBspline::parameterizeToBspline(dt, point_set, start_end_derivative, ctrl_pts);
+
+    // lengthenTime 只拉长节点、不改变几何：同一条曲线的速度变为 1/ratio、加速度变为 1/ratio^2。
+    // parameterizeToBspline 解的是最小二乘，速度行权重 ~1/(2dt)、加速度行权重 ~1/dt^2，
+    // 远大于位置行权重 1/6。若边界导数仍用缩放前的值，巨大的边界残差会被摊到整条控制点链上，
+    // 表现为空旷处出现与障碍无关、从起点开始逐渐衰减的周期性波纹。
+    vector<Eigen::Vector3d> deriv = start_end_derivative;
+    if (deriv.size() == 4 && std::abs(ratio - 1.0) > 1e-6)
+    {
+      const double r2 = ratio * ratio;
+      deriv[0] /= ratio;   // 起点速度
+      deriv[1] /= ratio;   // 终点速度
+      deriv[2] /= r2;      // 起点加速度
+      deriv[3] /= r2;      // 终点加速度
+    }
+    UniformBspline::parameterizeToBspline(dt, point_set, deriv, ctrl_pts);
   }
 
   double EGOPlannerManager::setMaxVel(double max_vel)

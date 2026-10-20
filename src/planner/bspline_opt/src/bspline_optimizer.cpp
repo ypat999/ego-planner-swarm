@@ -60,23 +60,42 @@ namespace ego_planner
 
   void BsplineOptimizer::setDroneId(const int drone_id) { drone_id_ = drone_id; }
 
-  // 返回当前优化后控制点沿轨迹到最近障碍（膨胀面）的最小自由余量（米）。
-  // base_point/direction 由 initControlPoints 与 check_collision_and_rebound 维护：
-  // dist = (points - base_point)·direction 即控制点到膨胀障碍面的有符号距离。
-  double BsplineOptimizer::getMinClearance()
+  // 返回给定点到最近膨胀障碍栅格的最小水平（XY）自由距离（米）。
+  // 只统计水平（XY）方向的余量：地板/天花板与轨迹始终保持固定高度差，
+  // 若计入垂直方向，任何低空平飞都会被判成"窄"（实测 1.2m 高度 + 0.4m 膨胀 → 0.8m，
+  // 恒小于 1.0m 阈值），而实际通过性主要由门窗的水平净宽决定。
+  //
+  // 搜索半径内没有任何膨胀栅格时返回 max_search_dist（视为足够宽裕）；
+  // 点本身已在膨胀区内时返回 0。
+  double BsplineOptimizer::getClearanceAt(const Eigen::Vector3d &p, const double max_search_dist)
   {
-    double min_clearance = 1e9;
-    for (int i = 0; i < cps_.size; ++i)
-    {
-      for (size_t j = 0; j < cps_.base_point[i].size(); ++j)
+    if (max_search_dist <= 0.0)
+      return 1e9;
+
+    if (grid_map_->getInflateOccupancy(p) > 0)
+      return 0.0;
+
+    const double res = grid_map_->getResolution();
+    const int n_side = std::max(1, (int)std::ceil(max_search_dist / res));
+
+    double min_clearance = max_search_dist;
+    Eigen::Vector3i id0;
+    grid_map_->posToIndex(p, id0);
+
+    for (int dx = -n_side; dx <= n_side; ++dx)
+      for (int dy = -n_side; dy <= n_side; ++dy)
       {
-        const double dist = (cps_.points.col(i) - cps_.base_point[i][j]).dot(cps_.direction[i][j]);
-        if (dist < min_clearance)
-        {
-          min_clearance = dist;
-        }
+        const double d2 = res * res * (dx * dx + dy * dy);
+        if (d2 >= min_clearance * min_clearance)
+          continue;
+
+        const Eigen::Vector3i id = id0 + Eigen::Vector3i(dx, dy, 0);
+        Eigen::Vector3d q;
+        grid_map_->indexToPos(id, q);
+        if (grid_map_->getInflateOccupancy(q) > 0)
+          min_clearance = std::sqrt(d2);
       }
-    }
+
     return min_clearance;
   }
 
@@ -1197,7 +1216,11 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     gradient.col(q.cols() - 2) += 2 * dq * (4 / 6.0);
     gradient.col(q.cols() - 1) += 2 * dq * (1 / 6.0);
 
-    // 末段多级速度约束：最后4段逐步减速，避免尾段冲刺
+    // 末段多级速度约束：最后4段逐步收敛到局部目标的期望速度，避免尾段冲刺。
+    // 目标速度必须是 local_target_vel_ 而不是 0：local_target_pt_ 通常只是 7.5m 视野外的
+    // 全局轨迹中间点，飞机在那里应该仍有速度。若强行压到 0，位置项要求
+    // (Q_{n-3}+4Q_{n-2}+Q_{n-1})/6 = target、速度项要求 Q_{n-1} ≈ Q_{n-3}，
+    // 联立会把尾部控制点压成"后-前-后"的折返，并随 1Hz 重规划被种子带进下一帧。
     const int n = q.cols();
     const double weights[] = {10.0, 5.0, 2.0, 0.5};
     for (int k = 0; k < 4 && n - 3 - k >= 0; k++)
@@ -1206,9 +1229,10 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
       int i3 = n - 3 - k;      // Q_{n-3}, Q_{n-4}, Q_{n-5}, Q_{n-6}
       double w = weights[k];
       Eigen::Vector3d vel = (q.col(i1) - q.col(i3)) / (2.0 * bspline_interval_);
-      cost += w * vel.squaredNorm();
-      gradient.col(i3) += 2.0 * w * vel * (-1.0 / (2.0 * bspline_interval_));
-      gradient.col(i1) += 2.0 * w * vel * ( 1.0 / (2.0 * bspline_interval_));
+      Eigen::Vector3d vel_err = vel - local_target_vel_;
+      cost += w * vel_err.squaredNorm();
+      gradient.col(i3) += 2.0 * w * vel_err * (-1.0 / (2.0 * bspline_interval_));
+      gradient.col(i1) += 2.0 * w * vel_err * ( 1.0 / (2.0 * bspline_interval_));
     }
   }
 
@@ -1934,7 +1958,10 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     // cout << "n=" << n << endl;
     // cout << "sizeof(x[0])=" << sizeof(x[0]) << endl;
 
-    memcpy(cps_.points.data() + 3 * order_, x, n * sizeof(x[0]));
+    // 偏移必须与 rebound_optimize 里的 start_id = order_ + 1 一致：
+    // 变量从 Q4 开始（Q0~Q3 固定），若这里仍按 3*order_ 写回，会把整条控制点链左移一位，
+    // 起点处 Q2->Q3 间距被拉成两倍、末端两个控制点重合，smoothness 反复修补即表现为起步拐角和扭曲。
+    memcpy(cps_.points.data() + 3 * (order_ + 1), x, n * sizeof(x[0]));
 
     /* ---------- evaluate cost and gradient ---------- */
     double f_smoothness, f_distance, f_feasibility /*, f_mov_objs*/, f_swarm, f_terminal, f_corridor;
@@ -1961,14 +1988,15 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
 
     Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal + corridor_weight_ * g_corridor;
     // Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_mov_objs;
-    memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
+    memcpy(grad, grad_3D.data() + 3 * (order_ + 1), n * sizeof(grad[0]));
   }
 
   // 计算优化后的损失
   void BsplineOptimizer::combineCostRefine(const double *x, double *grad, double &f_combine, const int n)
   {
 
-    memcpy(cps_.points.data() + 3 * order_, x, n * sizeof(x[0]));
+    // 与 refine_optimize 里的 start_id = order_ + 1 保持一致，否则控制点链整体左移一位。
+    memcpy(cps_.points.data() + 3 * (order_ + 1), x, n * sizeof(x[0]));
 
     /* ---------- evaluate cost and gradient ---------- */
     double f_smoothness, f_fitness, f_feasibility;
@@ -1988,7 +2016,7 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
     // printf("origin %f %f %f %f\n", f_smoothness, f_fitness, f_feasibility, f_combine);
 
     Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + lambda4_ * g_fitness + lambda3_ * g_feasibility;
-    memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
+    memcpy(grad, grad_3D.data() + 3 * (order_ + 1), n * sizeof(grad[0]));
   }
 
 } // namespace ego_planner

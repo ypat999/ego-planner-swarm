@@ -109,6 +109,10 @@ namespace ego_planner
     void setWaypoints(const vector<Eigen::Vector3d> &waypts,
                       const vector<int> &waypt_idx); // N-2 constraints at most
     void setLocalTargetPt(const Eigen::Vector3d local_target_pt) { local_target_pt_ = local_target_pt; };
+    // 末段速度约束的目标速度：等于局部目标的期望速度。
+    // 只有终点就是最终目标时它才是 0；否则（7.5m 视野外的中间点）应保持全局轨迹在该点的速度，
+    // 否则每次规划都会在视野边界人为制造一次“虚拟停车”，把尾部控制点压成折返（表现为打结）。
+    void setLocalTargetVel(const Eigen::Vector3d local_target_vel) { local_target_vel_ = local_target_vel; };
 
     // 运行期实时调速：同步更新优化器的速度/加速度限值
     // （优化器持有独立的 optimization/max_vel，若只改 pp_.max_vel_ 会出现
@@ -123,9 +127,10 @@ namespace ego_planner
 
     ControlPoints getControlPoints() { return cps_; };
 
-    // 返回当前优化后控制点沿轨迹到最近障碍（膨胀面）的最小自由余量（米）。
-    // 无 base_point（附近无障碍）时返回远大于阈值的大值，表示不触发减速。
-    double getMinClearance();
+    // 返回给定点到最近膨胀障碍栅格的最小水平（XY）自由距离（米）。
+    // 只统计水平方向：低空平飞时到地面的垂距恒小于阈值，计入会误判为窄通道。
+    // 搜索半径内没有膨胀栅格时返回 max_search_dist；点本身在膨胀区内返回 0。
+    double getClearanceAt(const Eigen::Vector3d &p, const double max_search_dist);
 
     AStar::Ptr a_star_;
     std::vector<Eigen::Vector3d> ref_pts_;
@@ -191,6 +196,7 @@ namespace ego_planner
     double min_cost_;               //
 
     Eigen::Vector3d local_target_pt_; 
+    Eigen::Vector3d local_target_vel_ = Eigen::Vector3d::Zero();
 
 #define INIT_min_ellip_dist_ 123456789.0123456789
     double min_ellip_dist_;

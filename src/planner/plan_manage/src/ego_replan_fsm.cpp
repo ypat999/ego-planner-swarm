@@ -1566,6 +1566,9 @@ namespace ego_planner
 
     getLocalTarget();
 
+    // 局部目标即最终目标时，要求规划器把轨迹末端精确对齐到该点（见 reboundReplan 末段对齐）
+    planner_manager_->setFinalTargetFlag((local_target_pt_ - end_pt_).norm() < 1e-3);
+
     bool plan_and_refine_success =
         planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
     have_new_target_ = false;
@@ -1707,6 +1710,20 @@ namespace ego_planner
 
     double t_step = planning_horizen_ / 20 / planner_manager_->pp_.max_vel_;
     double dist_min = 9999, dist_min_t = 0.0;
+
+    // 局部目标必须落在自由空间里。
+    // 全局轨迹是不考虑障碍的多项式（大遮挡时会直接穿墙），原来"取第一个距离
+    // >= planning_horizen_ 的点"会把局部目标选到墙体内部或墙后。此时
+    // check_collision_and_rebound 在碰撞段之后找不到任何自由控制点（out_id），
+    // 直接置 STOP_FOR_ERROR 并跳过本次规划，于是 1Hz 重规划连续失败，
+    // 3s 后触发急停。
+    // 改为继续沿全局轨迹往前找第一个"既超出视野、又不在膨胀区"的点，
+    // 让局部目标始终可达，视野内的绕行交给 check_collision_and_rebound 里的 A*。
+    Eigen::Vector3d free_pt = end_pt_;
+    double free_t = planner_manager_->global_data_.global_duration_;
+    double target_t = free_t;
+    bool found = false;
+
     for (t = planner_manager_->global_data_.last_progress_time_; t < planner_manager_->global_data_.global_duration_; t += t_step)
     {
       Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(t);
@@ -1735,17 +1752,40 @@ namespace ego_planner
         dist_min_t = t;
       }
 
-      if (dist >= planning_horizen_)
+      if (planner_manager_->grid_map_->getInflateOccupancy(pos_t) <= 0)
       {
-        local_target_pt_ = pos_t;
-        planner_manager_->global_data_.last_progress_time_ = dist_min_t;
-        break;
+        free_pt = pos_t;
+        free_t = t;
+
+        if (dist >= planning_horizen_)
+        {
+          local_target_pt_ = pos_t;
+          planner_manager_->global_data_.last_progress_time_ = dist_min_t;
+          target_t = t;
+          found = true;
+          break;
+        }
       }
     }
-    if (t > planner_manager_->global_data_.global_duration_) // Last global point
+    if (!found)
     {
-      local_target_pt_ = end_pt_;
-      planner_manager_->global_data_.last_progress_time_ = planner_manager_->global_data_.global_duration_;
+      if ((end_pt_ - start_pt_).norm() < planning_horizen_)
+      {
+        // 末段：剩余全局轨迹都在视野内，局部目标必须直接取最终目标。
+        // 否则 local_target_pt_ 与 end_pt_ 不一致，EXEC_TRAJ 里
+        // (local_target_pt_ - end_pt_).norm() < 1e-3 的到达分支永远不成立：
+        // 轨迹终点会停在目标点之前，且每秒都判定"还没到"而持续重规划。
+        local_target_pt_ = end_pt_;
+        planner_manager_->global_data_.last_progress_time_ = planner_manager_->global_data_.global_duration_;
+        target_t = planner_manager_->global_data_.global_duration_;
+      }
+      else
+      {
+        // 视野内全被障碍占据：先推进到最后一个自由点，保证本次局部问题可解
+        local_target_pt_ = free_pt;
+        planner_manager_->global_data_.last_progress_time_ = free_t;
+        target_t = free_t;
+      }
     }
 
     if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))
@@ -1754,7 +1794,7 @@ namespace ego_planner
     }
     else
     {
-      local_target_vel_ = planner_manager_->global_data_.getVelocity(t);
+      local_target_vel_ = planner_manager_->global_data_.getVelocity(target_t);
     }
   }
 
