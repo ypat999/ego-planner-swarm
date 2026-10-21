@@ -62,14 +62,14 @@ double time_forward_ = 0.5;
 
 // Safe zone descent configuration
 bool szd_enabled_ = false;
-double szd_speed_ = 0.5;          // 水平(xy)修正速度上限，仅作用于水平段
+double szd_speed_ = 1.0;          // 水平(xy)修正速度上限，仅作用于水平段
 double szd_descend_speed_ = 0.5;  // 垂直(z)下降速度上限，独立于水平速度调节
 Eigen::Vector3d szd_zone_size_ = Eigen::Vector3d(2.0, 2.0, 2.0);
 double szd_z_offset_ = -2.0;  // SZD目标z偏移，负值表示再下降(补偿定位误差)
 double szd_position_threshold_ = 0.05;
 // 前视时间(s)：闭环制导中设定点相对飞机实际位置的提前量 T，
 // 指令速度 = min(szd_speed_, 距离/T)，兼具"满速纠偏"与"到点自然减速"
-double szd_lookahead_time_ = 0.5;
+double szd_lookahead_time_ = 0.25;
 
 // Safe zone descent state
 bool szd_active_ = false;
@@ -558,9 +558,11 @@ void cmdCallback()
       {
         const Eigen::Vector2d dir2 = err_xy / d_xy;
         const double v_xy = min(szd_speed_, d_xy / szd_lookahead_time_);
-        const double lead = min(d_xy, szd_speed_ * szd_lookahead_time_);
-        pos_flu = Eigen::Vector3d(current_pos_(0) + dir2.x() * lead,
-                                  current_pos_(1) + dir2.y() * lead,
+        // 强力横向修正：位置设定点直接钉在降落点正上方，让位置环看到全部真实偏差。
+        // 旧实现 lead 被 szd_speed_*lookahead_time 截断（默认仅 0.25m），位置环恒只看到
+        // 0.25m 误差，修正力与真实偏差无关；靠近中点时速度前馈把飞机推过头再拉回，
+        // 形成来回震荡，始终进不了 5cm 的垂直段切换门限。
+        pos_flu = Eigen::Vector3d(szd_target_(0), szd_target_(1),
                                   szd_ref_pos_(2));  // 高度保持激活值
         vel = Eigen::Vector3d(dir2.x() * v_xy, dir2.y() * v_xy, 0.0);
       }
@@ -813,7 +815,7 @@ int main(int argc, char **argv)
   // Safe zone descent parameters
   node->declare_parameter("safe_zone_descent/enabled", false);
   node->get_parameter("safe_zone_descent/enabled", szd_enabled_);
-  node->declare_parameter("safe_zone_descent/speed", 0.5);
+  node->declare_parameter("safe_zone_descent/speed", 1.0);
   node->get_parameter("safe_zone_descent/speed", szd_speed_);
   node->declare_parameter("safe_zone_descent/descend_speed", 0.5);
   node->get_parameter("safe_zone_descent/descend_speed", szd_descend_speed_);
@@ -827,7 +829,7 @@ int main(int argc, char **argv)
   node->get_parameter("safe_zone_descent/zone_size_z", szd_zone_size_(2));
   node->declare_parameter("safe_zone_descent/position_threshold", 0.05);
   node->get_parameter("safe_zone_descent/position_threshold", szd_position_threshold_);
-  node->declare_parameter("safe_zone_descent/lookahead_time", 0.5);
+  node->declare_parameter("safe_zone_descent/lookahead_time", 0.25);
   node->get_parameter("safe_zone_descent/lookahead_time", szd_lookahead_time_);
   if (szd_lookahead_time_ < 0.1) szd_lookahead_time_ = 0.1;
 
