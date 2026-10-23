@@ -76,6 +76,10 @@ double szd_position_threshold_ = 0.05;
 double szd_lookahead_time_ = 0.1;
 // PX4 水平位置环增益名义值(MPC_XY_P≈0.95)，用于把速度上限换算成位置误差上限
 constexpr double SZD_PX4_XY_P_NOMINAL = 0.95;
+// SZD 启动后的目标点漂移余量(m)：出区判据 = 安全区半径 + 该余量。
+// 降落期间落地目标点被持续重发，且落地点基准匹配不断修正 map->odom，同一目标点在
+// world 下会漂移 0.2~0.7m，用该余量区分"定位抖动"与"任务真的改为飞往别处"。
+constexpr double SZD_EXIT_MARGIN = 1.0;
 
 // Safe zone descent state
 bool szd_active_ = false;
@@ -300,23 +304,38 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
   goal_near_origin_ = isTargetInSafeZone(new_goal_pos);
 
   // Safe zone descent check
-  if (szd_enabled_ && goal_near_origin_)
+  // 最后一个导航点(落地目标)会被持续重发，同时落地点基准匹配仍在修正 map->odom，
+  // 使同一个 map 目标点在 world 下漂移 0.2~0.7m，远超 ±0.5m 安全区判据与 1cm 去重阈值。
+  // 因此 SZD 一经启动就保持到降落结束：漂移抖动只更新水平落点，不重启相位也不中止。
+  if (szd_enabled_ && (szd_active_ || szd_phase_ == SZD_DONE))
   {
-    if (szd_active_ && szd_phase_ == SZD_VERTICAL)
+    if (!szd_active_)
     {
-      // 已进入垂直下降：降落期间 lidar_localization 的落地点基准匹配仍会持续修正
-      // map->odom，同一个 map 目标点变换到 world 后每帧都可能变化（本次实测跳变 0.46m，
-      // 远超下面的 1cm 去重阈值）。此时只跟着修正水平落点，保持垂直相位与当前下降进度，
-      // 不再回到水平段重新锁定当前高度——否则表现为被拉回 (0,0) 且始终不下降。
+      // 已降到目标，落地目标重发不再触发第二次下降
+      return;
+    }
+
+    const double exit_dist = szd_zone_size_(0) / 2.0 + SZD_EXIT_MARGIN;
+    if (std::hypot(new_goal_pos(0), new_goal_pos(1)) <= exit_dist)
+    {
+      // 只跟随水平落点，保持当前相位与下降进度，避免被拉回水平段重新锁定高度
       szd_target_(0) = new_goal_pos(0);
       szd_target_(1) = new_goal_pos(1);
       static rclcpp::Clock szd_retarget_clock(RCL_STEADY_TIME);
       RCLCPP_INFO_THROTTLE(rclcpp::get_logger("traj_server"), szd_retarget_clock, 2000,
-                           "Safe zone descent: vertical phase, landing target updated to (%.2f, %.2f), keep descending (z=%.2f)",
-                           szd_target_(0), szd_target_(1), current_pos_(2));
+                           "Safe zone descent: landing target drifted to (%.2f, %.2f), keep phase %d, descending (z=%.2f)",
+                           szd_target_(0), szd_target_(1), static_cast<int>(szd_phase_), current_pos_(2));
       return;
     }
 
+    RCLCPP_INFO(rclcpp::get_logger("traj_server"),
+                "Target (%.2f, %.2f, %.2f) is far outside safe zone (%.2fm), deactivating safe zone descent mode",
+                new_goal_pos(0), new_goal_pos(1), new_goal_pos(2), exit_dist);
+    szd_active_ = false;
+    szd_phase_ = SZD_NONE;
+  }
+  else if (szd_enabled_ && goal_near_origin_)
+  {
     szd_active_ = true;
     szd_phase_ = SZD_HORIZONTAL;
     // 降落点强制取 world 坐标系 (0,0)，z 沿用目标点高度+偏移，避免地图匹配偏差
