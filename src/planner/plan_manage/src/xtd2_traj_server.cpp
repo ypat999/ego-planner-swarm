@@ -302,6 +302,21 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
   // Safe zone descent check
   if (szd_enabled_ && goal_near_origin_)
   {
+    if (szd_active_ && szd_phase_ == SZD_VERTICAL)
+    {
+      // 已进入垂直下降：降落期间 lidar_localization 的落地点基准匹配仍会持续修正
+      // map->odom，同一个 map 目标点变换到 world 后每帧都可能变化（本次实测跳变 0.46m，
+      // 远超下面的 1cm 去重阈值）。此时只跟着修正水平落点，保持垂直相位与当前下降进度，
+      // 不再回到水平段重新锁定当前高度——否则表现为被拉回 (0,0) 且始终不下降。
+      szd_target_(0) = new_goal_pos(0);
+      szd_target_(1) = new_goal_pos(1);
+      static rclcpp::Clock szd_retarget_clock(RCL_STEADY_TIME);
+      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("traj_server"), szd_retarget_clock, 2000,
+                           "Safe zone descent: vertical phase, landing target updated to (%.2f, %.2f), keep descending (z=%.2f)",
+                           szd_target_(0), szd_target_(1), current_pos_(2));
+      return;
+    }
+
     szd_active_ = true;
     szd_phase_ = SZD_HORIZONTAL;
     // 降落点强制取 world 坐标系 (0,0)，z 沿用目标点高度+偏移，避免地图匹配偏差
