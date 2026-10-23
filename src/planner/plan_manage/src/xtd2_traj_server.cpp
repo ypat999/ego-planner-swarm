@@ -5,6 +5,7 @@
 #include "geometry_msgs/msg/pose.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "std_msgs/msg/empty.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Geometry>
 #include <tf2_ros/transform_listener.h>
@@ -14,6 +15,9 @@
 #include <limits.h>
 
 rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
+// SZD 慢速降落状态广播（20Hz）：comms 侧据此把 LAND 延后到 SZD 结束，
+// 避免 PX4 原生 LAND 抢走控制权、把 0.1m/s 的定点慢降变成 MPC_LAND_SPEED
+rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr szd_active_pub;
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub;
 rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub;
 rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr reset_traj_sub;
@@ -69,7 +73,9 @@ double szd_z_offset_ = -2.0;  // SZD目标z偏移，负值表示再下降(补偿
 double szd_position_threshold_ = 0.05;
 // 前视时间(s)：闭环制导中设定点相对飞机实际位置的提前量 T，
 // 指令速度 = min(szd_speed_, 距离/T)，兼具"满速纠偏"与"到点自然减速"
-double szd_lookahead_time_ = 0.25;
+double szd_lookahead_time_ = 0.1;
+// PX4 水平位置环增益名义值(MPC_XY_P≈0.95)，用于把速度上限换算成位置误差上限
+constexpr double SZD_PX4_XY_P_NOMINAL = 0.95;
 
 // Safe zone descent state
 bool szd_active_ = false;
@@ -464,6 +470,13 @@ void cmdCallback()
   rclcpp::Clock clock(RCL_ROS_TIME);
   rclcpp::Time time_now = clock.now();
 
+  // 广播 SZD 是否正在慢速降落（外部据此延后 LAND）
+  {
+    std_msgs::msg::Bool szd_state;
+    szd_state.data = szd_active_;
+    szd_active_pub->publish(szd_state);
+  }
+
   static int log_counter = 0;
   if (szd_active_ && log_counter % 20 == 0) // 每1秒输出一次（20*50ms=1s）
   {
@@ -512,10 +525,9 @@ void cmdCallback()
 
     if (szd_phase_ == SZD_HORIZONTAL)
     {
-      // 闭环前视制导：设定点相对"飞机实际位置"朝降落点(0,0)前伸 lead 距离。
-      // 漂移/偏移立即反映为指令误差 -> 以 szd_speed_ 上限满力修正；
-      // 接近目标时 lead 与 vel 按 距离/T 收缩 -> 自然减速，不会冲过头。
-      // （旧开环爬行：参考点自说自话按 dt 推进，不看飞机，漂了不修、到了刹不住）
+      // 闭环纯位置制导：位置设定点在"飞机实际位置"与降落点之间取 min(d_xy, lead_max)，
+      // 只发位置、不发速度前馈。漂移/偏移立即反映为位置误差 -> 位置环满力修正；
+      // 距离小于 lead_max 时设定点直接钉在降落点，误差随距离线性收敛 -> 自然减速。
       const Eigen::Vector2d err_xy(szd_target_(0) - current_pos_(0),
                                    szd_target_(1) - current_pos_(1));
       const double d_xy = err_xy.norm();
@@ -557,14 +569,23 @@ void cmdCallback()
       else
       {
         const Eigen::Vector2d dir2 = err_xy / d_xy;
-        const double v_xy = min(szd_speed_, d_xy / szd_lookahead_time_);
-        // 强力横向修正：位置设定点直接钉在降落点正上方，让位置环看到全部真实偏差。
-        // 旧实现 lead 被 szd_speed_*lookahead_time 截断（默认仅 0.25m），位置环恒只看到
-        // 0.25m 误差，修正力与真实偏差无关；靠近中点时速度前馈把飞机推过头再拉回，
-        // 形成来回震荡，始终进不了 5cm 的垂直段切换门限。
-        pos_flu = Eigen::Vector3d(szd_target_(0), szd_target_(1),
+        // 只下发位置、不下发速度：PX4 内部 vel_sp = vel_ff + MPC_XY_P*(pos_sp - pos)，
+        // 同时下发速度前馈会把位置环P项叠加到速度上（日志实测 1.0m/s 被放大到约 2.0m/s）；
+        // 且纯径向速度指令没有切向分量阻尼，过冲产生的切向速度无法衰减，
+        // 稳定成绕落点的圆周运动（离心极限环，半径 0.11~0.57m），永远进不了 5cm 门限。
+        // 改为只给位置后，PX4 位置环内部走"位置->速度->加速度"级联，自带速度阻尼。
+        //
+        // 减速曲线（线性律）：位置误差上限取两者较小值
+        //   d_xy    —— 设定点不会越过落点
+        //   lead_max = szd_speed_/MPC_XY_P —— 指令速度不超过 szd_speed_
+        // d_xy < lead_max 后设定点钉在落点上，位置误差随距离线性收敛，
+        // 对应 PX4 速度指令 v ≈ MPC_XY_P·d，越近越慢。
+        const double lead_max = szd_speed_ / SZD_PX4_XY_P_NOMINAL;
+        const double lead = std::min(d_xy, lead_max);
+        pos_flu = Eigen::Vector3d(current_pos_(0) + dir2.x() * lead,
+                                  current_pos_(1) + dir2.y() * lead,
                                   szd_ref_pos_(2));  // 高度保持激活值
-        vel = Eigen::Vector3d(dir2.x() * v_xy, dir2.y() * v_xy, 0.0);
+        vel.setZero();  // 不输出速度前馈，避免离心运动
       }
     }
     else if (szd_phase_ == SZD_VERTICAL)
@@ -891,6 +912,10 @@ int main(int argc, char **argv)
   pos_cmd_pub = node->create_publisher<quadrotor_msgs::msg::PositionCommand>(
       std::string("/xtdrone2") + ros_ns + "cmd_trajectory_flu",
       50);
+
+  szd_active_pub = node->create_publisher<std_msgs::msg::Bool>(
+      std::string("/xtdrone2") + ros_ns + "safe_zone_descent_active",
+      10);
 
   reset_traj_sub = node->create_subscription<std_msgs::msg::Empty>(
       std::string("/xtdrone2") + ros_ns + "reset_traj_time",
