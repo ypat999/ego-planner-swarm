@@ -117,6 +117,59 @@ double normalizeAngle(double angle)
   return angle;
 }
 
+// SZD 降落反馈改用激光约束的 map 系位姿（map->base_link TF）。
+// lidar_localization 维护 map->odom（10Hz），降落时切换为起飞点基准并静态锁定最低误差；
+// 用 map 系反馈可消除 Super-LIO 在 world 系累积的漂移。
+bool getMapFramePosition(Eigen::Vector3d &pos_map)
+{
+  if (!tf_buffer_)
+  {
+    return false;
+  }
+  try
+  {
+    geometry_msgs::msg::TransformStamped t = tf_buffer_->lookupTransform(
+        "map", "base_link", tf2::TimePointZero);
+    pos_map = Eigen::Vector3d(
+        t.transform.translation.x,
+        t.transform.translation.y,
+        t.transform.translation.z);
+    return true;
+  }
+  catch (const tf2::TransformException &)
+  {
+    return false;
+  }
+}
+
+// map -> world 变换（odom 与 world 为恒等静态 TF，即 map->odom 的逆）。
+// SZD 在 map 系计算设定点，输出前再变换回 world 系（comms 仍按 world 做 FLU->NED）。
+bool transformMapToWorld(const Eigen::Vector3d &p_map, Eigen::Vector3d &p_world)
+{
+  if (!tf_buffer_)
+  {
+    return false;
+  }
+  try
+  {
+    geometry_msgs::msg::TransformStamped t = tf_buffer_->lookupTransform(
+        "world", "map", tf2::TimePointZero);
+    geometry_msgs::msg::PointStamped p_in;
+    p_in.header.frame_id = "map";
+    p_in.point.x = p_map(0);
+    p_in.point.y = p_map(1);
+    p_in.point.z = p_map(2);
+    geometry_msgs::msg::PointStamped p_out;
+    tf2::doTransform(p_in, p_out, t);
+    p_world = Eigen::Vector3d(p_out.point.x, p_out.point.y, p_out.point.z);
+    return true;
+  }
+  catch (const tf2::TransformException &)
+  {
+    return false;
+  }
+}
+
 void resetTrajCallback(const std_msgs::msg::Empty::ConstSharedPtr msg)
 {
   (void)msg;
@@ -280,6 +333,27 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
 
   Eigen::Vector3d new_goal_pos(transformed_msg.pose.position.x, transformed_msg.pose.position.y, transformed_msg.pose.position.z);
 
+  // SZD 使用 map 系目标点（发布的目标点本来就是 map 系），避免 world 系漂移污染落点。
+  Eigen::Vector3d new_goal_pos_map(
+      msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+  if (msg->header.frame_id != "map")
+  {
+    try
+    {
+      geometry_msgs::msg::TransformStamped t_map = tf_buffer_->lookupTransform(
+          "map", msg->header.frame_id, msg->header.stamp,
+          rclcpp::Duration::from_seconds(1.0));
+      geometry_msgs::msg::PoseStamped map_goal_msg;
+      tf2::doTransform(*msg, map_goal_msg, t_map);
+      new_goal_pos_map = Eigen::Vector3d(
+          map_goal_msg.pose.position.x, map_goal_msg.pose.position.y, map_goal_msg.pose.position.z);
+    }
+    catch (const tf2::TransformException &)
+    {
+      new_goal_pos_map = new_goal_pos;  // 失败退回 world 近似
+    }
+  }
+
   // 检查新目标点是否与当前目标点相同
   if (has_valid_goal_)
   {
@@ -304,9 +378,8 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
   goal_near_origin_ = isTargetInSafeZone(new_goal_pos);
 
   // Safe zone descent check
-  // 最后一个导航点(落地目标)会被持续重发，同时落地点基准匹配仍在修正 map->odom，
-  // 使同一个 map 目标点在 world 下漂移 0.2~0.7m，远超 ±0.5m 安全区判据与 1cm 去重阈值。
-  // 因此 SZD 一经启动就保持到降落结束：漂移抖动只更新水平落点，不重启相位也不中止。
+  // 最后一个导航点(落地目标)会被持续重发；SZD 落点在 map 系固定为 (0,0)，
+  // 不跟随 world 系漂移，因此 SZD 一经启动就保持到降落结束，不重启相位也不中止。
   if (szd_enabled_ && (szd_active_ || szd_phase_ == SZD_DONE))
   {
     if (!szd_active_)
@@ -316,36 +389,38 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
     }
 
     const double exit_dist = szd_zone_size_(0) / 2.0 + SZD_EXIT_MARGIN;
-    if (std::hypot(new_goal_pos(0), new_goal_pos(1)) <= exit_dist)
+    if (std::hypot(new_goal_pos_map(0), new_goal_pos_map(1)) <= exit_dist)
     {
-      // 只跟随水平落点，保持当前相位与下降进度，避免被拉回水平段重新锁定高度
-      szd_target_(0) = new_goal_pos(0);
-      szd_target_(1) = new_goal_pos(1);
+      // 落点保持 map 系目标（发布的目标点本来就是 map 系），不跟随 world 系漂移。
+      // 这里仅保留出区判据，避免任务真的改飞到远处时 SZD 仍占着控制权。
+      szd_target_(0) = new_goal_pos_map(0);
+      szd_target_(1) = new_goal_pos_map(1);
       static rclcpp::Clock szd_retarget_clock(RCL_STEADY_TIME);
       RCLCPP_INFO_THROTTLE(rclcpp::get_logger("traj_server"), szd_retarget_clock, 2000,
-                           "Safe zone descent: landing target drifted to (%.2f, %.2f), keep phase %d, descending (z=%.2f)",
+                           "Safe zone descent: landing target in map frame (%.2f, %.2f), keep phase %d, descending (z=%.2f)",
                            szd_target_(0), szd_target_(1), static_cast<int>(szd_phase_), current_pos_(2));
       return;
     }
 
     RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                 "Target (%.2f, %.2f, %.2f) is far outside safe zone (%.2fm), deactivating safe zone descent mode",
-                new_goal_pos(0), new_goal_pos(1), new_goal_pos(2), exit_dist);
+                new_goal_pos_map(0), new_goal_pos_map(1), new_goal_pos_map(2), exit_dist);
     szd_active_ = false;
     szd_phase_ = SZD_NONE;
   }
-  else if (szd_enabled_ && goal_near_origin_)
+  else if (szd_enabled_ && isTargetInSafeZone(new_goal_pos_map))
   {
     szd_active_ = true;
     szd_phase_ = SZD_HORIZONTAL;
-    // 降落点强制取 world 坐标系 (0,0)，z 沿用目标点高度+偏移，避免地图匹配偏差
+    // 降落点强制取 map 坐标系 (0,0)（起飞点基准），z 用 z_offset；
+    // 用 map 系消除 Super-LIO 在 world 系累积的漂移，经 map->odom 变换回 world 后即为实际起飞点。
     szd_target_ = Eigen::Vector3d(0.0, 0.0, szd_z_offset_);
     szd_ref_pos_initialized_ = false;
     szd_cmd_count_ = 0;  // 重置命令计数器
     receive_traj_ = false;
     RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                 "Target (%.2f, %.2f, %.2f) is in safe zone, activating safe zone descent mode (speed=%.2f), "
-                "landing point forced to world origin: (%.2f, %.2f, %.2f)",
+                "landing point forced to map origin: (%.2f, %.2f, %.2f)",
                 new_goal_pos(0), new_goal_pos(1), new_goal_pos(2), szd_speed_,
                 szd_target_(0), szd_target_(1), szd_target_(2));
     RCLCPP_INFO(rclcpp::get_logger("traj_server"),
@@ -527,24 +602,33 @@ void cmdCallback()
   log_counter++;
 
   // 降落阶段 map->odom 由 lidar_localization 的原点基准匹配维护，
-  // traj_server 只负责把降落点锚定到 world (0,0)
+  // SZD 在 map 系（起飞点基准）计算设定点，输出前经 map->odom 变换回 world 系。
 
   if (szd_active_ && have_odom_)
   {
+    // 反馈用激光约束的 map 系位姿（map->base_link TF），消除 Super-LIO world 系累积漂移。
+    Eigen::Vector3d szd_pos_map = Eigen::Vector3d::Zero();
+    if (!getMapFramePosition(szd_pos_map))
+    {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "SZD: map->base_link TF unavailable, fallback to world odom");
+      szd_pos_map = current_pos_;
+    }
+
     double dt = 0.05;
 
     if (!szd_ref_pos_initialized_)
     {
-      szd_ref_pos_ = current_pos_;
+      szd_ref_pos_ = szd_pos_map;
       szd_ref_pos_initialized_ = true;
       
-      // 使用更可靠的方法提取yaw（从旋转矩阵）
+      // 使用更可靠的方法提取yaw（从旋转矩阵，world 系）
       Eigen::Matrix3d rot = current_orientation_.toRotationMatrix();
       szd_current_yaw_ = atan2(rot(1, 0), rot(0, 0));
       
       RCLCPP_INFO(rclcpp::get_logger("traj_server"),
-                  "Safe zone descent: starting from (%.2f, %.2f, %.2f) to (%.2f, %.2f, %.2f)",
-                  current_pos_(0), current_pos_(1), current_pos_(2),
+                  "Safe zone descent: starting from map (%.2f, %.2f, %.2f) to map (%.2f, %.2f, %.2f)",
+                  szd_pos_map(0), szd_pos_map(1), szd_pos_map(2),
                   szd_target_(0), szd_target_(1), szd_target_(2));
       RCLCPP_INFO(rclcpp::get_logger("traj_server"),
                   "Safe zone descent: initial yaw %.2f rad (%.2f deg), target yaw %.2f rad (%.2f deg), yaw_diff %.2f rad",
@@ -553,7 +637,7 @@ void cmdCallback()
                   normalizeAngle(target_yaw_ - szd_current_yaw_));
     }
 
-    Eigen::Vector3d pos_flu(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero());
+    Eigen::Vector3d pos_map(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero());
     double yaw = last_yaw_;
     double yaw_dot = 0.0;
 
@@ -562,8 +646,8 @@ void cmdCallback()
       // 闭环纯位置制导：位置设定点在"飞机实际位置"与降落点之间取 min(d_xy, lead_max)，
       // 只发位置、不发速度前馈。漂移/偏移立即反映为位置误差 -> 位置环满力修正；
       // 距离小于 lead_max 时设定点直接钉在降落点，误差随距离线性收敛 -> 自然减速。
-      const Eigen::Vector2d err_xy(szd_target_(0) - current_pos_(0),
-                                   szd_target_(1) - current_pos_(1));
+      const Eigen::Vector2d err_xy(szd_target_(0) - szd_pos_map(0),
+                                   szd_target_(1) - szd_pos_map(1));
       const double d_xy = err_xy.norm();
 
       double yaw_diff = target_yaw_ - szd_current_yaw_;
@@ -596,8 +680,8 @@ void cmdCallback()
       {
         szd_phase_ = SZD_VERTICAL;
         RCLCPP_INFO(rclcpp::get_logger("traj_server"),
-                    "Safe zone descent: horizontal phase complete, aircraft at (%.2f, %.2f) within %.2fm of (%.2f, %.2f), starting vertical descent to z=%.2f",
-                    current_pos_(0), current_pos_(1), szd_position_threshold_,
+                    "Safe zone descent: horizontal phase complete, aircraft at map (%.2f, %.2f) within %.2fm of (%.2f, %.2f), starting vertical descent to z=%.2f",
+                    szd_pos_map(0), szd_pos_map(1), szd_position_threshold_,
                     szd_target_(0), szd_target_(1), szd_target_(2));
       }
       else
@@ -616,8 +700,8 @@ void cmdCallback()
         // 对应 PX4 速度指令 v ≈ MPC_XY_P·d，越近越慢。
         const double lead_max = szd_speed_ / SZD_PX4_XY_P_NOMINAL;
         const double lead = std::min(d_xy, lead_max);
-        pos_flu = Eigen::Vector3d(current_pos_(0) + dir2.x() * lead,
-                                  current_pos_(1) + dir2.y() * lead,
+        pos_map = Eigen::Vector3d(szd_pos_map(0) + dir2.x() * lead,
+                                  szd_pos_map(1) + dir2.y() * lead,
                                   szd_ref_pos_(2));  // 高度保持激活值
         vel.setZero();  // 不输出速度前馈，避免离心运动
       }
@@ -627,19 +711,19 @@ void cmdCallback()
       yaw = target_yaw_;
       yaw_dot = 0.0;
 
-      const double dz = szd_target_(2) - current_pos_(2);
-      const double d_xy = std::hypot(szd_target_(0) - current_pos_(0),
-                                     szd_target_(1) - current_pos_(1));
+      const double dz = szd_target_(2) - szd_pos_map(2);
+      const double d_xy = std::hypot(szd_target_(0) - szd_pos_map(0),
+                                     szd_target_(1) - szd_pos_map(1));
 
       if (fabs(dz) < szd_position_threshold_ && d_xy < szd_position_threshold_)
       {
         szd_ref_pos_ = szd_target_;
         szd_phase_ = SZD_DONE;
         szd_active_ = false;
-        pos_flu = szd_target_;
+        pos_map = szd_target_;
         vel.setZero();
         RCLCPP_INFO(rclcpp::get_logger("traj_server"),
-                    "Safe zone descent: vertical descent complete, reached target (%.2f, %.2f, %.2f)",
+                    "Safe zone descent: vertical descent complete, reached map target (%.2f, %.2f, %.2f)",
                     szd_target_(0), szd_target_(1), szd_target_(2));
       }
       else
@@ -650,18 +734,26 @@ void cmdCallback()
           min(szd_descend_speed_, fabs(dz) / szd_lookahead_time_), dz);
         const double lead_z = std::copysign(
           min(fabs(dz), szd_descend_speed_ * szd_lookahead_time_), dz);
-        pos_flu = Eigen::Vector3d(szd_target_(0), szd_target_(1),
-                                  current_pos_(2) + lead_z);
+        pos_map = Eigen::Vector3d(szd_target_(0), szd_target_(1),
+                                  szd_pos_map(2) + lead_z);
         vel = Eigen::Vector3d(0.0, 0.0, v_z);
       }
     }
     else
     {
-      pos_flu = szd_target_;
+      pos_map = szd_target_;
       vel.setZero();
       acc.setZero();
       yaw = target_yaw_;
       yaw_dot = 0.0;
+    }
+
+    // map -> world 变换后输出（comms 仍按 world 系做 FLU->NED）。
+    Eigen::Vector3d pos_world = pos_map;
+    if (!transformMapToWorld(pos_map, pos_world))
+    {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "SZD: world->map TF unavailable, publishing map-frame as world approximation");
     }
 
     pos_cmd.header.stamp = time_now;
@@ -669,9 +761,9 @@ void cmdCallback()
     pos_cmd.trajectory_flag = quadrotor_msgs::msg::PositionCommand::TRAJECTORY_STATUS_READY;
     pos_cmd.trajectory_id = traj_id_;
 
-    pos_cmd.position.x = pos_flu(0);
-    pos_cmd.position.y = pos_flu(1);
-    pos_cmd.position.z = pos_flu(2);
+    pos_cmd.position.x = pos_world(0);
+    pos_cmd.position.y = pos_world(1);
+    pos_cmd.position.z = pos_world(2);
 
     pos_cmd.velocity.x = vel(0);
     pos_cmd.velocity.y = vel(1);
@@ -690,9 +782,9 @@ void cmdCallback()
     if (szd_cmd_count_ < 10)
     {
       RCLCPP_DEBUG(rclcpp::get_logger("traj_server"),
-                  "SZD cmd #%d: phase=%d, pos=(%.2f, %.2f, %.2f), yaw=%.2f rad (%.2f deg), yaw_dot=%.2f rad/s",
+                  "SZD cmd #%d: phase=%d, pos_world=(%.2f, %.2f, %.2f), yaw=%.2f rad (%.2f deg), yaw_dot=%.2f rad/s",
                   szd_cmd_count_, szd_phase_,
-                  pos_flu(0), pos_flu(1), pos_flu(2),
+                  pos_world(0), pos_world(1), pos_world(2),
                   yaw, yaw * 180.0 / M_PI, yaw_dot);
       szd_cmd_count_++;
     }
