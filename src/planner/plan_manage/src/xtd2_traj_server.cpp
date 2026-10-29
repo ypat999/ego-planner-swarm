@@ -34,6 +34,8 @@ bool goal_near_origin_ = false;
 
 // Current drone position and orientation
 Eigen::Vector3d current_pos_ = Eigen::Vector3d::Zero();
+// 实测水平速度(world 系)：由 odom 的机体系 twist 旋到 world，供 SZD 切向阻尼使用。
+Eigen::Vector3d current_vel_ = Eigen::Vector3d::Zero();
 Eigen::Quaterniond current_orientation_ = Eigen::Quaterniond::Identity();
 bool have_odom_ = false;
 
@@ -74,8 +76,15 @@ double szd_position_threshold_ = 0.05;
 // 前视时间(s)：闭环制导中设定点相对飞机实际位置的提前量 T，
 // 指令速度 = min(szd_speed_, 距离/T)，兼具"满速纠偏"与"到点自然减速"
 double szd_lookahead_time_ = 0.1;
-// PX4 水平位置环增益名义值(MPC_XY_P≈0.95)，用于把速度上限换算成位置误差上限
-constexpr double SZD_PX4_XY_P_NOMINAL = 0.95;
+// PX4 水平位置环增益(MPC_XY_P)，用于把"期望速度上限"换算成"位置前视上限"。
+// 必须与飞控实际参数一致：PX4 内部 vel_sp = MPC_XY_P*(pos_sp - pos) + vel_ff，
+// 所以 lead_max = szd_speed_/MPC_XY_P 对应"指令速度达到 szd_speed_"的前视量。
+// 早期这里硬编码 0.95，实机 MPC_XY_P=1.35 时速度被悄悄放大 1.42 倍。
+double szd_px4_xy_p_ = 1.35;
+// 水平段切向阻尼增益：vel_ff += -k * v_tangential。
+// 目的：径向纠偏指令不含切向分量，过冲产生的切向速度只能靠 PX4 自身阻尼衰减，
+// 而实测该环近乎无阻尼，会稳定成绕落点的圆周极限环。k 越大切向衰减越快。
+double szd_damping_gain_ = 0.0;
 // SZD 启动后的目标点漂移余量(m)：出区判据 = 安全区半径 + 该余量。
 // 降落期间落地目标点被持续重发，且落地点基准匹配不断修正 map->odom，同一目标点在
 // world 下会漂移 0.2~0.7m，用该余量区分"定位抖动"与"任务真的改为飞往别处"。
@@ -162,6 +171,29 @@ bool transformMapToWorld(const Eigen::Vector3d &p_map, Eigen::Vector3d &p_world)
     geometry_msgs::msg::PointStamped p_out;
     tf2::doTransform(p_in, p_out, t);
     p_world = Eigen::Vector3d(p_out.point.x, p_out.point.y, p_out.point.z);
+    return true;
+  }
+  catch (const tf2::TransformException &)
+  {
+    return false;
+  }
+}
+
+// 取 map -> world 的旋转换算（只取旋转部分），用于把 map 系方向转到 world 系。
+// 平移部分由 transformMapToWorld 处理；这里只服务于 SZD 切向阻尼的方向对齐。
+bool getWorldFromMapRotation(Eigen::Matrix3d &R_world_from_map)
+{
+  if (!tf_buffer_)
+  {
+    return false;
+  }
+  try
+  {
+    geometry_msgs::msg::TransformStamped t = tf_buffer_->lookupTransform(
+        "world", "map", tf2::TimePointZero);
+    R_world_from_map = Eigen::Quaterniond(
+        t.transform.rotation.w, t.transform.rotation.x,
+        t.transform.rotation.y, t.transform.rotation.z).toRotationMatrix();
     return true;
   }
   catch (const tf2::TransformException &)
@@ -267,7 +299,12 @@ void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
     msg->pose.pose.orientation.y,
     msg->pose.pose.orientation.z
   );
-  
+
+  // REP 103：twist 在 child_frame(base_link 机体系 FLU)下，旋到 world 系再保存
+  current_vel_ = current_orientation_ * Eigen::Vector3d(msg->twist.twist.linear.x,
+                                                        msg->twist.twist.linear.y,
+                                                        msg->twist.twist.linear.z);
+
   have_odom_ = true;
 }
 
@@ -687,23 +724,36 @@ void cmdCallback()
       else
       {
         const Eigen::Vector2d dir2 = err_xy / d_xy;
-        // 只下发位置、不下发速度：PX4 内部 vel_sp = vel_ff + MPC_XY_P*(pos_sp - pos)，
-        // 同时下发速度前馈会把位置环P项叠加到速度上（日志实测 1.0m/s 被放大到约 2.0m/s）；
-        // 且纯径向速度指令没有切向分量阻尼，过冲产生的切向速度无法衰减，
-        // 稳定成绕落点的圆周运动（离心极限环，半径 0.11~0.57m），永远进不了 5cm 门限。
-        // 改为只给位置后，PX4 位置环内部走"位置->速度->加速度"级联，自带速度阻尼。
-        //
-        // 减速曲线（线性律）：位置误差上限取两者较小值
-        //   d_xy    —— 设定点不会越过落点
-        //   lead_max = szd_speed_/MPC_XY_P —— 指令速度不超过 szd_speed_
-        // d_xy < lead_max 后设定点钉在落点上，位置误差随距离线性收敛，
-        // 对应 PX4 速度指令 v ≈ MPC_XY_P·d，越近越慢。
-        const double lead_max = szd_speed_ / SZD_PX4_XY_P_NOMINAL;
-        const double lead = std::min(d_xy, lead_max);
+        // 饱和曲线（tanh）：位置前视量 lead = lead_max·tanh(d/lead_max)
+        //   d << lead_max：lead ≈ d        —— 近场保留 PX4 位置环比例刚度，与纯位置保持一致
+        //   d >> lead_max：lead → lead_max —— 远场指令速度平滑饱和到 szd_speed_
+        // 旧实现是 min(d, lead_max)：远场从 d=lead_max 起就是"恒速硬饱和"，
+        // 带着满速一路冲到落点附近才减速，过冲后没有切向阻尼 -> 绕落点转圈。
+        // speed 从 1.0 降到 0.2 时 lead_max 从 1.05m 掉到 0.21m，恰好砸进 SZD
+        // 0.05~0.25m 的工作区间，于是表现为"近处不转圈、远处转圈"。
+        const double lead_max = szd_speed_ / szd_px4_xy_p_;
+        const double lead = lead_max * std::tanh(d_xy / lead_max);
         pos_map = Eigen::Vector3d(szd_pos_map(0) + dir2.x() * lead,
                                   szd_pos_map(1) + dir2.y() * lead,
                                   szd_ref_pos_(2));  // 高度保持激活值
-        vel.setZero();  // 不输出速度前馈，避免离心运动
+
+        // 切向阻尼：径向制导指令不含切向分量，过冲产生的切向速度只能靠飞控自身阻尼衰减，
+        // 而实测该环近乎无阻尼（相位裕度约 7°），会稳定成绕落点的圆周极限环。
+        // 这里通过速度前馈补一个显式衰减项 vel_ff = -k·v_tangential。
+        vel.setZero();
+        if (szd_damping_gain_ > 0.0)
+        {
+          // 误差方向在 map 系、实测速度在 world 系，取 map->world 的旋转把方向转过去后
+          // 再做切向分解（两者只差一个缓变的定位修正，但不要假设为单位阵）。
+          Eigen::Matrix3d R_world_from_map = Eigen::Matrix3d::Identity();
+          getWorldFromMapRotation(R_world_from_map);
+          const Eigen::Vector2d dir_w =
+            (R_world_from_map * Eigen::Vector3d(dir2.x(), dir2.y(), 0.0)).head<2>();
+          const Eigen::Vector2d v_xy(current_vel_(0), current_vel_(1));
+          const Eigen::Vector2d v_tan = v_xy - dir_w * v_xy.dot(dir_w);
+          vel = Eigen::Vector3d(-szd_damping_gain_ * v_tan.x(),
+                                -szd_damping_gain_ * v_tan.y(), 0.0);
+        }
       }
     }
     else if (szd_phase_ == SZD_VERTICAL)
@@ -982,6 +1032,10 @@ int main(int argc, char **argv)
 
   node->declare_parameter("safe_zone_descent/z_offset", 0.0);
   node->get_parameter("safe_zone_descent/z_offset", szd_z_offset_);
+  node->declare_parameter("safe_zone_descent/px4_xy_p", 1.35);
+  node->get_parameter("safe_zone_descent/px4_xy_p", szd_px4_xy_p_);
+  node->declare_parameter("safe_zone_descent/damping_gain", 0.0);
+  node->get_parameter("safe_zone_descent/damping_gain", szd_damping_gain_);
   // 参数运行时修改回调
   auto param_handle = node->add_on_set_parameters_callback(
     [](const std::vector<rclcpp::Parameter> & params) {
@@ -1002,6 +1056,8 @@ int main(int argc, char **argv)
           if (szd_lookahead_time_ < 0.1) szd_lookahead_time_ = 0.1;
         }
         else if (name == "safe_zone_descent/z_offset") szd_z_offset_ = p.as_double();
+        else if (name == "safe_zone_descent/px4_xy_p") szd_px4_xy_p_ = p.as_double();
+        else if (name == "safe_zone_descent/damping_gain") szd_damping_gain_ = p.as_double();
       }
       rcl_interfaces::msg::SetParametersResult result;
       result.successful = true;
