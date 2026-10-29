@@ -610,7 +610,7 @@ void cmdCallback()
     Eigen::Vector3d szd_pos_map = Eigen::Vector3d::Zero();
     if (!getMapFramePosition(szd_pos_map))
     {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      RCLCPP_WARN_THROTTLE(rclcpp::get_logger("traj_server"), clock, 2000,
                            "SZD: map->base_link TF unavailable, fallback to world odom");
       szd_pos_map = current_pos_;
     }
@@ -752,7 +752,7 @@ void cmdCallback()
     Eigen::Vector3d pos_world = pos_map;
     if (!transformMapToWorld(pos_map, pos_world))
     {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      RCLCPP_WARN_THROTTLE(rclcpp::get_logger("traj_server"), clock, 2000,
                            "SZD: world->map TF unavailable, publishing map-frame as world approximation");
     }
 
@@ -940,7 +940,7 @@ int main(int argc, char **argv)
   {
     default_namespace = "/";
     default_use_sim_time = false;
-    odom_world_topic = "lio/robo/odom";
+    odom_world_topic = "lio/odom";
     grid_map_cloud_topic = "lio/cloud_world";
     grid_map_pose_topic = "mid360/pose";
     RCLCPP_INFO(node->get_logger(), "Running on %s, using real robot topics", hostname_str.c_str());
