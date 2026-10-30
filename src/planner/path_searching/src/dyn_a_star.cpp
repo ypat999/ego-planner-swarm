@@ -1,4 +1,6 @@
 #include "path_searching/dyn_a_star.h"
+#include <algorithm>
+#include <cmath>
 
 using namespace std;
 using namespace Eigen;
@@ -143,6 +145,21 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
     GridNodePtr startPtr = GridNodeMap_[start_idx(0)][start_idx(1)][start_idx(2)];
     GridNodePtr endPtr = GridNodeMap_[end_idx(0)][end_idx(1)][end_idx(2)];
 
+    // 搜索走廊：以“起点→终点”连线为轴，把扩张限制在锥形走廊内。
+    // 目的：窗关闭等“必须拐大弯才能通过”的场景直接搜不到解（快速失败并悬停），
+    // 而不是沿着墙面/建筑外轮廓绕行，进而飞入雷达盲区。
+    Eigen::Vector3d corridor_start = Index2Coord(start_idx);
+    Eigen::Vector3d corridor_dir = Index2Coord(end_idx) - corridor_start;
+    const double corridor_len = corridor_dir.norm();
+    const bool use_corridor = (max_lateral_dev_ > 0.0 || max_search_angle_deg_ > 0.0) && corridor_len > 1e-3;
+    if (use_corridor)
+        corridor_dir /= corridor_len;
+    const double corridor_tan = max_search_angle_deg_ > 0.0
+                                    ? std::tan(max_search_angle_deg_ * M_PI / 180.0)
+                                    : 1e9;
+    // 锥顶附近给固定余量，避免起点旁的有效邻域被过窄的锥角误剪
+    constexpr double CORRIDOR_START_ALLOWANCE = 0.5;
+
     std::priority_queue<GridNodePtr, std::vector<GridNodePtr>, NodeComparator> empty;
     openSet_.swap(empty);
 
@@ -211,9 +228,25 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
 
                     neighborPtr->rounds = rounds_;
 
-                    if (checkOccupancy(Index2Coord(neighborPtr->index)))
+                    Eigen::Vector3d neighbor_pos = Index2Coord(neighborPtr->index);
+
+                    if (checkOccupancy(neighbor_pos))
                     {
                         continue;
+                    }
+
+                    if (use_corridor)
+                    {
+                        Eigen::Vector3d delta = neighbor_pos - corridor_start;
+                        double along = delta.dot(corridor_dir);
+                        if (along < 0.0)
+                            continue; // 不允许往起点的反方向绕行
+                        double lateral = (delta - along * corridor_dir).norm();
+                        double lateral_limit = corridor_tan * along + CORRIDOR_START_ALLOWANCE;
+                        if (max_lateral_dev_ > 0.0)
+                            lateral_limit = std::min(lateral_limit, max_lateral_dev_);
+                        if (lateral > lateral_limit)
+                            continue; // 超出锥形走廊，剪枝
                     }
 
                     double static_cost = sqrt(dx * dx + dy * dy + dz * dz);
@@ -244,6 +277,14 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
     }
 
     rclcpp::Time time_2 = rclcpp::Clock().now();
+
+    if (use_corridor && shouldLogNow("AstarSearch"))
+    {
+        RCLCPP_WARN(rclcpp::get_logger("AstarSearch"),
+                    "A* search found no path within the corridor limit (max_lateral=%.2fm, max_angle=%.0fdeg). "
+                    "A large detour is required (e.g. window closed), skip searching around.",
+                    max_lateral_dev_, max_search_angle_deg_);
+    }
 
     if ((time_2 - time_1).seconds() > 0.1)
         RCLCPP_WARN(rclcpp::get_logger("AstarSearch"), 

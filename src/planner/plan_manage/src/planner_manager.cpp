@@ -25,6 +25,10 @@ namespace ego_planner
     node->declare_parameter("manager/drone_id", -1);
     node->declare_parameter("manager/narrow_clearance_threshold", 1.0);
     node->declare_parameter("manager/narrow_vel_ratio", 0.4);
+    // A* 搜索走廊约束：限制碰撞片段 A* 相对“起点→终点”连线的横向偏移，
+    // 窗关闭等必须拐大弯的场景直接搜不到解，避免绕建筑/贴雷达盲区绕行
+    node->declare_parameter("manager/astar_max_lateral_dev", 2.0);
+    node->declare_parameter("manager/astar_max_search_angle_deg", 60.0);
 
     node->get_parameter("manager/max_vel", pp_.max_vel_);
     node->get_parameter("manager/max_acc", pp_.max_acc_);
@@ -81,6 +85,14 @@ namespace ego_planner
     bspline_optimizer_->setEnvironment(grid_map_, obj_predictor_);
     bspline_optimizer_->a_star_.reset(new AStar);
     bspline_optimizer_->a_star_->initGridMap(grid_map_, Eigen::Vector3i(100, 100, 100));
+
+    // A* 搜索走廊约束（<=0 表示关闭对应维度）
+    double astar_max_lateral_dev = 2.0, astar_max_search_angle_deg = 60.0;
+    node->get_parameter("manager/astar_max_lateral_dev", astar_max_lateral_dev);
+    node->get_parameter("manager/astar_max_search_angle_deg", astar_max_search_angle_deg);
+    bspline_optimizer_->a_star_->setSearchLimits(astar_max_lateral_dev, astar_max_search_angle_deg);
+    RCLCPP_INFO(node->get_logger(), "A* 搜索走廊约束: 横向半宽上限=%.2fm, 锥半角=%.1f° (<=0 关闭)",
+                astar_max_lateral_dev, astar_max_search_angle_deg);
 
     // 狭窄通道自动减速参数
     node->get_parameter("manager/narrow_clearance_threshold", narrow_clearance_threshold_);

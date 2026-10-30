@@ -62,6 +62,13 @@ private:
 
 	std::vector<GridNodePtr> retrievePath(GridNodePtr current);
 
+	// 搜索走廊约束（相对“起点→终点”连线）：
+	// max_lateral_dev_: 走廊横向半宽上限(米)，<=0 关闭；
+	// max_search_angle_deg_: 走廊半角(度)，<=0 关闭。
+	// 两者都不生效时退化为原始全向搜索。
+	double max_lateral_dev_{0.0};
+	double max_search_angle_deg_{0.0};
+
 	double step_size_, inv_step_size_;
 	Eigen::Vector3d center_;
 	Eigen::Vector3i CENTER_IDX_, POOL_SIZE_;
@@ -107,6 +114,13 @@ public:
 	~AStar();
 
 	void initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size);
+
+	// 设定搜索走廊约束；任一参数 <=0 表示该维度不限制
+	void setSearchLimits(const double max_lateral_dev, const double max_search_angle_deg)
+	{
+		max_lateral_dev_ = max_lateral_dev;
+		max_search_angle_deg_ = max_search_angle_deg;
+	}
 
 	bool AstarSearch(const double step_size, Eigen::Vector3d start_pt, Eigen::Vector3d end_pt);
 
