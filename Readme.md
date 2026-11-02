@@ -1,6 +1,6 @@
-# EGO-Planner-Swarm (XTDrone2版本)
+# EGO-Planner-Swarm (RKDrone版本)
 
-这是EGO-Planner-Swarm的增强版本，支持ROS2、TF2坐标转换和改进的点云处理，专为XTDrone2框架优化。
+这是EGO-Planner-Swarm的增强版本，支持ROS2、TF2坐标转换和改进的点云处理，专为RKDrone框架优化。
 
 ## 主要特性
 - **ROS2支持**: 完整迁移到ROS2，性能优化
@@ -138,16 +138,16 @@ try {
 1. **ROS2完整迁移**: 从ROS1迁移到ROS2，支持最新的ROS生态系统
 2. **TF2集成**: 添加了完整的TF2坐标系转换支持
 3. **错误处理增强**: 改进了点云处理和数据转换的鲁棒性
-4. **XTDrone2集成**: 专门为XTDrone2框架优化
+4. **RKDrone集成**: 专门为RKDrone框架优化
 
 ## 6. 许可证
 本项目遵循原始项目的许可证条款。详情请参考LICENSE文件。
 
 ---
 
-# EGO-Planner-Swarm (XTDrone2 Version)
+# EGO-Planner-Swarm (RKDrone Version)
 
-This is an enhanced version of EGO-Planner-Swarm with ROS2 support, TF2 coordinate transformations, and improved point cloud processing for XTDrone2 framework.
+This is an enhanced version of EGO-Planner-Swarm with ROS2 support, TF2 coordinate transformations, and improved point cloud processing for RKDrone framework.
 
 ## Key Features
 - **ROS2 Support**: Full migration to ROS2 with improved performance
@@ -272,7 +272,7 @@ This project is based on [ZJU-FAST-Lab/ego-planner-swarm](https://github.com/ZJU
 1. **Complete ROS2 Migration**: Migrated from ROS1 to ROS2, supporting the latest ROS ecosystem
 2. **TF2 Integration**: Added complete TF2 coordinate transformation support
 3. **Enhanced Error Handling**: Improved robustness in point cloud processing and data conversion
-4. **XTDrone2 Integration**: Specifically optimized for XTDrone2 framework
+4. **RKDrone Integration**: Specifically optimized for RKDrone framework
 
 ## 6. License
 This project follows the license terms of the original project. Please refer to the LICENSE file for details.

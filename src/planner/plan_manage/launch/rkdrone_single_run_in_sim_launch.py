@@ -55,7 +55,7 @@ def generate_launch_description():
     world_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([
-                FindPackageShare("xtd2_launch"),
+                FindPackageShare("rkdrone_launch"),
                 "launch",
                 "gz_launch.py"
             ])
@@ -81,9 +81,9 @@ def generate_launch_description():
     spawn = IncludeLaunchDescription(
             PythonLaunchDescriptionSource([
                 PathJoinSubstitution([
-                    FindPackageShare('xtd2_launch'),
+                    FindPackageShare('rkdrone_launch'),
                     'launch',
-                    'xtd2_vehicle_spawn_launch.py'
+                    'rkdrone_vehicle_spawn_launch.py'
                 ])
             ]),
             launch_arguments={
@@ -97,7 +97,7 @@ def generate_launch_description():
     # Include advanced parameters
     advanced_param_include = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
-            get_package_share_directory('ego_planner'), 'launch', 'xtd2_advanced_param_launch.py')),
+            get_package_share_directory('ego_planner'), 'launch', 'rkdrone_advanced_param_launch.py')),
         launch_arguments={
                 'xtd_ns': LaunchConfiguration('namespace'),
 
@@ -127,11 +127,11 @@ def generate_launch_description():
     # Trajectory server node
     traj_server_node = Node(
         package='ego_planner',
-        executable='xtd2_traj_server',
+        executable='rkdrone_traj_server',
         name=['drone_', drone_id, '_traj_server'],
         output='screen',
         remappings=[
-            ('/xtdrone2/planning/cmd_pose_local_ned', ['/xtdrone2/', LaunchConfiguration('namespace'), '/planning/cmd_pose_local_ned']),
+            ('/rkdrone/planning/cmd_pose_local_ned', ['/rkdrone/', LaunchConfiguration('namespace'), '/planning/cmd_pose_local_ned']),
             ('planning/bspline', ['drone_', drone_id, '_planning/bspline'])
         ],
         parameters=[

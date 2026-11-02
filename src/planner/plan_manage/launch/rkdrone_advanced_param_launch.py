@@ -51,7 +51,7 @@ def generate_launch_description():
     drone_id = LaunchConfiguration('drone_id', default=0)
 
     # DeclareLaunchArguments
-    xtd_ns_arg = DeclareLaunchArgument('xtd_ns', default_value=xtd_ns, description='XTDrone2 namespace')
+    xtd_ns_arg = DeclareLaunchArgument('xtd_ns', default_value=xtd_ns, description='RKDrone namespace')
 
     map_size_x_arg = DeclareLaunchArgument('map_size_x_', default_value=map_size_x, description='Map size along X')
     map_size_y_arg = DeclareLaunchArgument('map_size_y_', default_value=map_size_y, description='Map size along Y')

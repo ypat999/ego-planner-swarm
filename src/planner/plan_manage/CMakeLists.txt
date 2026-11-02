@@ -82,9 +82,9 @@ ament_target_dependencies(traj_server
                           traj_utils
                           cv_bridge pcl_conversions)
 
-add_executable(xtd2_traj_server src/xtd2_traj_server.cpp)
+add_executable(rkdrone_traj_server src/rkdrone_traj_server.cpp)
 
-ament_target_dependencies(xtd2_traj_server 
+ament_target_dependencies(rkdrone_traj_server 
                           rclcpp 
                           visualization_msgs geometry_msgs 
                           quadrotor_msgs plan_env 
@@ -95,7 +95,7 @@ ament_target_dependencies(xtd2_traj_server
 
 # Install targets
 install(
-  TARGETS ego_planner_node traj_server xtd2_traj_server
+  TARGETS ego_planner_node traj_server rkdrone_traj_server
   DESTINATION lib/${PROJECT_NAME}
 )
 

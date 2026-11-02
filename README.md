@@ -1,14 +1,14 @@
-# ego-planner-swarm (XTDrone2 fork)
+# ego-planner-swarm (RKDrone fork)
 
-上游 ego-planner-swarm 的 XTDrone2 定制副本，由主仓库
+上游 ego-planner-swarm 的 RKDrone 定制副本，由主仓库
 `XTDrone2_ego_planner`（分支 `dev/ego-planner-swarm`）以 gitlink 钉定。
 上游原版参考：https://github.com/Zhefan-Xu/ego-planner-swarm
 
-## XTDrone2 本地改动
+## RKDrone 本地改动
 
-### xtd2_traj_server：SZD 安全区精准降落（近期重点）
+### rkdrone_traj_server：SZD 安全区精准降落（近期重点）
 
-文件：`src/planner/plan_manage/src/xtd2_traj_server.cpp`
+文件：`src/planner/plan_manage/src/rkdrone_traj_server.cpp`
 
 - **降落点锚定 world 原点**：SZD 激活时降落 xy 强制为 `(0, 0)`（起飞点），
   z = 目标z + `z_offset`（默认 -2.0，补偿定位/起落架高度），不受返航目标点坐标
@@ -19,8 +19,8 @@
   - 垂直段：xy 钉死原点（边降边拉回），z 独立限速前视下降；
   - 相位切换与到位判定均使用飞机真实距离。
 - **速度参数拆分**：`speed` 仅管水平 xy；`descend_speed` 独立控制 z 下降速度。
-- 全部参数可在 `XTDrone2_ego_planner/xtd2_launch/launch/ego_planner_launch.py`
-  配置并支持运行时 `ros2 param set /xtd2_traj_server ...` 热调。
+- 全部参数可在 `XTDrone2_ego_planner/rkdrone_launch/launch/ego_planner_launch.py`
+  配置并支持运行时 `ros2 param set /rkdrone_traj_server ...` 热调。
 
 | 参数（namespace `safe_zone_descent/`） | 默认 | 说明 |
 |---|---|---|
