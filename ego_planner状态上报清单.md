@@ -3,7 +3,7 @@
 > 版本：v1.1（2026-10-14）  
 > v1.1 变更：**撤销 `/mission_status` 新话题**——心跳与 FSM 状态一律走既有的 `/mission_event`（`event:"HEARTBEAT"`），planner 侧对外仍只占这一个话题。  
 > 取证范围：`xtd2_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/**` + `uav_service/src/task_dispatcher/**`  
-> 协议口径：对齐仓库根 `系统失效降级方案设计.md` §14「任务面接口契约」——**String+JSON，不新增自定义 msg、不新增话题、不新增事件名**（新事件一律复用 §14 已列出的 `GOAL_UNREACHABLE / GOAL_REJECTED / SAFETY_HOLD / ARRIVED / NOT_READY / RETURN_*`）。  
+> 协议口径：对齐主仓 `docs/系统失效降级方案设计.md` §14「任务面接口契约」——**String+JSON，不新增自定义 msg、不新增话题、不新增事件名**（新事件一律复用 §14 已列出的 `GOAL_UNREACHABLE / GOAL_REJECTED / SAFETY_HOLD / ARRIVED / NOT_READY / RETURN_*`）。  
 > 用途：本文是 planner 侧「已上报 / 应上报」的唯一对账清单，供后续 ego 与编排侧同步时逐项勾选。
 
 ---
