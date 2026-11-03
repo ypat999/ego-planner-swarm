@@ -2,7 +2,7 @@
 
 > 版本：v1.1（2026-10-14）  
 > v1.1 变更：**撤销 `/mission_status` 新话题**——心跳与 FSM 状态一律走既有的 `/mission_event`（`event:"HEARTBEAT"`），planner 侧对外仍只占这一个话题。  
-> 取证范围：`rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/**` + `rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/**`  
+> 取证范围：`rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/**` + `uav_service/src/task_dispatcher/**`  
 > 协议口径：对齐主仓 `docs/系统失效降级方案设计.md` §14「任务面接口契约」——**String+JSON，不新增自定义 msg、不新增话题、不新增事件名**（新事件一律复用 §14 已列出的 `GOAL_UNREACHABLE / GOAL_REJECTED / SAFETY_HOLD / ARRIVED / NOT_READY / RETURN_*`）。  
 > 用途：本文是 planner 侧「已上报 / 应上报」的唯一对账清单，供后续 ego 与编排侧同步时逐项勾选。
 
@@ -24,7 +24,7 @@ task_dispatcher ───┼──▶ /mission_event (String+JSON，唯一状态
 | 事实 | 证据 | 对上报的影响 |
 |---|---|---|
 | planner 报错的**唯一归属节点**是 `ego_planner_node`（FSM），不是 traj_server | [ego_planner_node.cpp#L12-L18](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_planner_node.cpp#L12-L18) | 所有 `source=planner` 的消息都从该节点发 |
-| `/mission_event` 已是**多源共用**话题：planner、perform_action、cruise 三处都在发 | [ego_replan_fsm.cpp#L128](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L128)、[perform_action_manager.py#L51](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/perform_action_manager.py#L51)、[cruise_uav_task_manager.py#L140](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L140) | 合流心跳**必须带 `source`** 且消费方先按 source 过滤，否则判活会失真（见 §7 坑 8） |
+| `/mission_event` 已是**多源共用**话题：planner、perform_action、cruise 三处都在发 | [ego_replan_fsm.cpp#L128](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L128)、[perform_action_manager.py#L51](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/perform_action_manager.py#L51)、[cruise_uav_task_manager.py#L140](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L140) | 合流心跳**必须带 `source`** 且消费方先按 source 过滤，否则判活会失真（见 §7 坑 8） |
 | 目标点实际订阅 `/move_base_simple/goal`，`/goal_pose_3d` 直订已注释 | [rkdrone_traj_server.cpp#L867-L871](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/rkdrone_traj_server.cpp#L867-L871)；[ego_replan_fsm.cpp#L141-L147](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L141-L147) | 同函数 [L894](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/rkdrone_traj_server.cpp#L894) 日志仍写 `/goal_pose_3d`，排查时勿被误导 |
 | goal 上游有 comms 闸门，未就绪时**静默丢弃** | [multirotor_communication.py#L277-L279](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_communication/rkdrone_communication/multirotor_communication.py#L277-L279) | 「planner 没反应」有两种成因：goal 没到 / planner 收到但失败。**只有心跳里的 `state` 能把两者区分开** |
 | 回调频率：FSM 主循环 100Hz，碰撞检测 20Hz | [ego_replan_fsm.cpp#L72-L76](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L72-L76) | 任何新增上报**必须边沿去重**，否则 100 条/秒刷屏 |
@@ -51,7 +51,7 @@ task_dispatcher ───┼──▶ /mission_event (String+JSON，唯一状态
 
 `odom_world`（里程计）、`/move_base_simple/goal`（目标点）、`/traj_start_trigger`（预设航线触发）、`/stop_planning`（编排侧收回控制权）、`grid_map/{cloud,odom,pose,depth}`、`/vins_estimator/extrinsic`、`planning/broadcast_bspline_to_planner`。
 
-> **注意**：`/stop_planning` 是**单向无回执**的。编排侧 [`_publish_stop_planning`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L506-L512) 发完即假定生效，planner 侧 [L931-L944](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L931-L944) 只打 WARN。→ 由 §4.2 心跳帧里的 `state:"WAIT_TARGET"` 充当隐式回执（G13）。
+> **注意**：`/stop_planning` 是**单向无回执**的。编排侧 [`_publish_stop_planning`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L506-L512) 发完即假定生效，planner 侧 [L931-L944](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L931-L944) 只打 WARN。→ 由 §4.2 心跳帧里的 `state:"WAIT_TARGET"` 充当隐式回执（G13）。
 
 ### 2.3 `/mission_event` 现有命中点（planner 侧全量，仅 2 处）
 
@@ -62,7 +62,7 @@ task_dispatcher ───┼──▶ /mission_event (String+JSON，唯一状态
 
 底层封装 `publishMissionEvent()`：[L1043-L1071](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L1043-L1071)（自动补 `event/source/ts`，`json_fields` 为手工拼的键值串，**无状态快照字段**）。
 
-编排侧消费：[`_mission_event_callback`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L172-L190) 只认 `event==GOAL_UNREACHABLE && source==planner && reason==OBSTACLE`，3s 窗去重后累加 `same_point_retry` → 进 [跳点/返航/迫降状态机](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L204-L261)。
+编排侧消费：[`_mission_event_callback`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L172-L190) 只认 `event==GOAL_UNREACHABLE && source==planner && reason==OBSTACLE`，3s 窗去重后累加 `same_point_retry` → 进 [跳点/返航/迫降状态机](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L204-L261)。
 
 **结论：planner 对外只有一种声音——「目标点在障碍里」，而且不带任何状态快照。** 其余所有失败（无路、机体越界、感知丢失、规划不收敛、目标被拒、FSM 现在处于哪个状态）全部只落 `RCLCPP_*` 日志，编排侧只能靠 5s 停滞 watchdog + 盯位置反推。
 
@@ -92,7 +92,7 @@ task_dispatcher ───┼──▶ /mission_event (String+JSON，唯一状态
 | G9 | 全局轨迹（前端）生成失败 / duration 非法 | [L437-L440](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L437-L440)、[L398-L407](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L398-L407) | ERROR 日志 | `GOAL_UNREACHABLE{reason:GLOBAL_TRJ_FAIL}` | 与 G1 区分：前端就连不上，重试无意义 |
 | G10 | 「目标点在障碍里」被 planner 静默放弃（与已有事件同语义却不上报的两处） | [L1275-L1282](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L1275-L1282)（`planFromGlobalTraj` 放弃）、[L1244-L1252](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L1244-L1252)（急停恢复时发现目标仍在障碍 → 回 `WAIT_TARGET`） | **同一条判据，只有另外两处会发事件**，这两处不发 → 编排侧漏计数，飞机原地悬停到电量耗尽 | 补齐 `GOAL_UNREACHABLE{reason:OBSTACLE}` | 这是当前**最容易造成静默失声**的一处 |
 | G11 | **FSM 状态机全序**（`INIT/WAIT_TARGET/GEN_NEW_TRAJ/REPLAN_TRAJ/EXEC_TRAJ/EMERGENCY_STOP/SEQUENTIAL_START`） | [L1037](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L1037)、[L1080](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L1080) 只 `cout` | 外部只能「盯位置猜状态」 | `HEARTBEAT.state`（§4.2），状态跃迁时**立即多发一帧** | 你要的「把 fsm_wait 之类传出来」即此项；也是 §14 H8「comms 死=失声」的正解 |
-| G12 | 到达确认（轨迹执行完毕） | [L1202-L1217](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L1202-L1217) | 无 | `ARRIVED{detail:"target=...,dist=..."} `；心跳常驻 `dist_goal` | 编排侧现在是纯距离判到达（[perform_action_manager.py#L316](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/perform_action_manager.py#L316)），可换成事件/心跳驱动（§14 P-D） |
+| G12 | 到达确认（轨迹执行完毕） | [L1202-L1217](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L1202-L1217) | 无 | `ARRIVED{detail:"target=...,dist=..."} `；心跳常驻 `dist_goal` | 编排侧现在是纯距离判到达（[perform_action_manager.py#L316](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/perform_action_manager.py#L316)），可换成事件/心跳驱动（§14 P-D） |
 | G13 | `/stop_planning` 已生效 | [L931-L944](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L931-L944) | 无回执 | 收到 `/stop_planning` 后立即发一帧 `HEARTBEAT{state:"WAIT_TARGET"}`（不新增事件名） | 「降落/返航前必须先把控制权交回飞控」的闭环确认 |
 | G14 | SZD 安全区降落已接管 | [rkdrone_traj_server.cpp#L284-L291](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/rkdrone_traj_server.cpp#L284-L291) | 无 | 心跳 `szd:true`（traj_server 直接在同一话题发 `HEARTBEAT{source:"traj_server"}`，或由 planner 合并） | 编排侧 `_wait_landed` 现在只看 arming 状态，分不清「在降落」还是「在悬停」 |
 | G15 | 多机邻居异常（轨迹时间差 >0.25s、traj 数量/阶数不匹配） | [L857-L863](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L857-L863)、[L954-L968](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/motion_planning/ego-planner-swarm/src/planner/plan_manage/src/ego_replan_fsm.cpp#L954-L968) | ERROR 日志 | P2：`SAFETY_HOLD{reason:NEIGH_STALE, detail:"drone_id=N"}` | 单机编队不用 |
@@ -172,7 +172,7 @@ task_dispatcher ───┼──▶ /mission_event (String+JSON，唯一状态
 
 ### 4.4 为什么合流到一条话题是安全的（三条依据）
 
-1. 消费成本为零：[`_mission_event_callback`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L172-L190) 首行就 `json.loads` + `event != ... → return`，1Hz 心跳只是多走两次字符串比较。
+1. 消费成本为零：[`_mission_event_callback`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L172-L190) 首行就 `json.loads` + `event != ... → return`，1Hz 心跳只是多走两次字符串比较。
 2. late-join 由 `active[]` 兜住，不需要给话题加 `transient_local`，也不需要新建 latched 服务。
 3. 带宽可忽略：单帧 ~250B × 1Hz × 3 个发布源，比现有 100Hz 的 `planning/data_display` 小三个数量级。
 
@@ -197,13 +197,13 @@ task_dispatcher ───┼──▶ /mission_event (String+JSON，唯一状态
 
 ### 5.2 编排侧（包：`task_dispatcher`）
 
-- [ ] [`_mission_event_callback`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L172-L190) **入口先分流**：`event=='HEARTBEAT'` → 只更新 `last_planner_hb_ts`/`planner_state` 后立即 return；`event=='GOAL_REJECTED'` → 走 §6 立即失败分支；其余按 reason 白名单进 §6 矩阵。
+- [ ] [`_mission_event_callback`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L172-L190) **入口先分流**：`event=='HEARTBEAT'` → 只更新 `last_planner_hb_ts`/`planner_state` 后立即 return；`event=='GOAL_REJECTED'` → 走 §6 立即失败分支；其余按 reason 白名单进 §6 矩阵。
 - [ ] 去重窗从单个 `last_obstacle_ts` 改成 `dict[(source,event,reason)] → ts`。
 - [ ] 新增 `SAFETY_HOLD` 分支：不进「同点重试」计数，直接 `RETURN_INIT`（`trigger` 用 reason）；`vel<0.1` 久持 → `EMERGENCY_LAND`。
 - [ ] 新增 `GOAL_REJECTED` 分支：**立即失败该航点且不重试**，`taskProgress=3` + 原因为参数/坐标错误（区别于环境不可达，避免无谓的 3 次重试拖住航线）。
-- [ ] 判活：`source=='planner'` 心跳断流 >3s → `PLANNER_SILENT`；在 [`perform_action_walk_to_pos_3d` 的内层循环](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/perform_action_manager.py#L306-L355) 加两条早退：① `PLANNER_SILENT`；② 收到针对当前目标（用 `goal` 坐标匹配）的 planner 硬错误 → 立即返回 `GOAL_UNREACHABLE:` 前缀，**不再等满 5s 停滞窗口**。
-- [ ] 心跳快照的存放位置建议放 [`ros2_topic_subscriber.py`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/ros2_topic_subscriber.py)（已是集中的话题读取入口，perform_action 与 cruise 共用），**不要再为该话题建第三个订阅者**；cruise 现有的那一个订阅把快照转存进去即可。
-- [ ] 自环防护（合流后风险变大）：cruise 自己既 publish 又 subscribe `/mission_event`（[L139-L145](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L139-L145)）。若编排侧也补 1Hz `HEARTBEAT{source:"executor"}`，**判活必须锁死 `source=='planner'`**，否则自己的心跳会把 planner 失联永远掩盖掉。
+- [ ] 判活：`source=='planner'` 心跳断流 >3s → `PLANNER_SILENT`；在 [`perform_action_walk_to_pos_3d` 的内层循环](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/perform_action_manager.py#L306-L355) 加两条早退：① `PLANNER_SILENT`；② 收到针对当前目标（用 `goal` 坐标匹配）的 planner 硬错误 → 立即返回 `GOAL_UNREACHABLE:` 前缀，**不再等满 5s 停滞窗口**。
+- [ ] 心跳快照的存放位置建议放 [`ros2_topic_subscriber.py`](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/ros2_topic_subscriber.py)（已是集中的话题读取入口，perform_action 与 cruise 共用），**不要再为该话题建第三个订阅者**；cruise 现有的那一个订阅把快照转存进去即可。
+- [ ] 自环防护（合流后风险变大）：cruise 自己既 publish 又 subscribe `/mission_event`（[L139-L145](file:///home/ywj/git/xtd2_ws/XTDrone2_ego_planner/uav_service/src/task_dispatcher/task_dispatcher/cruise_uav_task_manager.py#L139-L145)）。若编排侧也补 1Hz `HEARTBEAT{source:"executor"}`，**判活必须锁死 `source=='planner'`**，否则自己的心跳会把 planner 失联永远掩盖掉。
 
 ---
 
@@ -248,7 +248,7 @@ ros2 topic hz /mission_event            # 基线≈1Hz（仅 planner 心跳）�
 #   `ros2 topic echo` 没有 --filter，按源粗筛用 grep：
 ros2 topic echo /mission_event | grep --line-buffered '"source":"planner"'
 
-# 2) 故障注入（离线仿真，链路见 rkdrone_third_party_pkgs/uav_service/src/task_dispatcher/launch/offline_route_sim.launch.py）
+# 2) 故障注入（离线仿真，链路见 uav_service/src/task_dispatcher/launch/offline_route_sim.launch.py）
 #    a. 目标点打进墙里 → 期望 GOAL_UNREACHABLE/OBSTACLE 1 条 + 后续心跳 active:["OBSTACLE"]
 ros2 topic pub --once /move_base_simple/goal geometry_msgs/msg/PoseStamped \
   "{header: {stamp: now, frame_id: world}, pose: {position: {x: 3.0, y: 2.0, z: 1.0}, orientation: {w: 1.0}}}"
