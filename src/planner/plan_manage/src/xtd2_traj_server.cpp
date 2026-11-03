@@ -1092,15 +1092,15 @@ int main(int argc, char **argv)
       goalCallback);
 
   pos_cmd_pub = node->create_publisher<quadrotor_msgs::msg::PositionCommand>(
-      std::string("/rkdrone") + ros_ns + "cmd_trajectory_flu",
+      std::string("/xtdrone2") + ros_ns + "cmd_trajectory_flu",
       50);
 
   szd_active_pub = node->create_publisher<std_msgs::msg::Bool>(
-      std::string("/rkdrone") + ros_ns + "safe_zone_descent_active",
+      std::string("/xtdrone2") + ros_ns + "safe_zone_descent_active",
       10);
 
   reset_traj_sub = node->create_subscription<std_msgs::msg::Empty>(
-      std::string("/rkdrone") + ros_ns + "reset_traj_time",
+      std::string("/xtdrone2") + ros_ns + "reset_traj_time",
       10,
       resetTrajCallback);
 
@@ -1114,7 +1114,7 @@ int main(int argc, char **argv)
       cmdCallback);
 
   RCLCPP_INFO(node->get_logger(), "Trajectory server started - outputting position, velocity, acceleration");
-  RCLCPP_INFO(node->get_logger(), "Publishing trajectory to: /rkdrone%s cmd_trajectory_flu", ros_ns.c_str());
+  RCLCPP_INFO(node->get_logger(), "Publishing trajectory to: /xtdrone2%s cmd_trajectory_flu", ros_ns.c_str());
   RCLCPP_INFO(node->get_logger(), "Subscribed to odometry: %s", odom_world_topic.c_str());
   RCLCPP_INFO(node->get_logger(), "Subscribed to goal pose: /goal_pose_3d");
   RCLCPP_INFO(node->get_logger(), "Subscribed to grid map cloud: %s", grid_map_cloud_topic.c_str());
