@@ -1141,7 +1141,11 @@ namespace ego_planner
       s += "}";
       msg.data = s;
       mission_event_pub_->publish(msg);
-      RCLCPP_INFO(node_->get_logger(), "[mission_event] %s", msg.data.c_str());
+      // 1Hz 心跳不刷 INFO，否则日志被淹没
+      if (event == "HEARTBEAT")
+        RCLCPP_DEBUG(node_->get_logger(), "[mission_event] %s", msg.data.c_str());
+      else
+        RCLCPP_INFO(node_->get_logger(), "[mission_event] %s", msg.data.c_str());
     }
     catch (const std::exception &e)
     {
@@ -1461,6 +1465,14 @@ namespace ego_planner
 
   void EGOReplanFSM::checkCollisionCallback()
   {
+    // 失效降级互通：在既有 50ms 安全节拍上 20 分频发 1Hz HEARTBEAT（不新增 timer）。
+    // safety 侧 2.5s 收不到即判 PLANNER_ALIVE=0 → HOVER（§16.3-C / P5）。
+    if (++hb_tick_ >= 20)
+    {
+      hb_tick_ = 0;
+      publishMissionEvent("HEARTBEAT",
+                          "\"goal_seq\":\"NA\",\"flight_epoch\":\"NA\"");
+    }
 
     LocalTrajData *info = &planner_manager_->local_data_;
     auto map = planner_manager_->grid_map_;

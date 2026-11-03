@@ -73,6 +73,8 @@ namespace ego_planner
     bool goal_switch_in_progress_; // 标记目标点切换是否正在进行
     FSM_EXEC_STATE exec_state_;
     int continously_called_times_{0};
+    // safety 心跳分频计数：safety_timer_(50ms) 上每 20 拍发一次 1Hz HEARTBEAT
+    int hb_tick_{0};
     // 本轮连续规划失败的墙上时钟起点（逃逸时间帽用：单次状态调用可能烧多次 A* 超时，
     // 仅按次数判定会让尾窗拖到 5~6s，加 3s 时间帽封顶）
     std::chrono::steady_clock::time_point fail_streak_start_{};
