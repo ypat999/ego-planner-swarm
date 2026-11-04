@@ -38,6 +38,10 @@ Eigen::Vector3d current_pos_ = Eigen::Vector3d::Zero();
 Eigen::Vector3d current_vel_ = Eigen::Vector3d::Zero();
 Eigen::Quaterniond current_orientation_ = Eigen::Quaterniond::Identity();
 bool have_odom_ = false;
+// odom 时标（单调时钟秒）与新鲜度门限：odom 停更 → setpoint 冻结 + 限频告警
+// （失效降级方案 §8-C1 增强；看门狗统一由 safety/comms 监视，traj_server 只自保护）。
+double odom_last_stamp_ = -1.0;
+double odom_stale_max_ = 0.5;
 
 // Target yaw from goal pose orientation
 double target_yaw_ = 0.0;
@@ -61,6 +65,15 @@ vector<UniformBspline> traj_;
 double traj_duration_;
 rclcpp::Time start_time_;
 int traj_id_;
+
+// ---- 轨迹流门控（失效降级方案 §9.3 修订/D-11，防长距爆冲）----
+// 正常播放时 t_cur 为墙钟虚拟时间；一旦飞机实际位置与轨迹设定点偏差超限，
+// 冻结 t_cur 不再推进，等飞机跟上轨迹再继续——避免调度/网络/重规划延迟
+// 造成设定点远远跑在飞机前面，触发位置环满量程追赶（爆冲）。
+double vtime_ = -1.0;          // 虚拟轨迹时间（>=0 有效）
+double vtime_last_wall_ = -1.0; // 上一次参与门控的墙钟（单调）
+double traj_lag_max_ = 1.5;    // 允许的最大滞后(m)，超则冻结
+double vtime_dt_clamp_ = 0.1;  // 单拍墙钟增量上限(s)，发布循环卡死后不一次性跳时间
 
 // yaw control
 double last_yaw_, last_yaw_dot_;
@@ -209,6 +222,8 @@ void resetTrajCallback(const std_msgs::msg::Empty::ConstSharedPtr msg)
   {
     rclcpp::Clock clock(RCL_ROS_TIME);
     start_time_ = clock.now();
+    vtime_ = 0.0;              // 虚拟时间同步复位
+    vtime_last_wall_ = -1.0;   // 下一拍重新建立墙钟基准
     RCLCPP_INFO(rclcpp::get_logger("traj_server"), "Trajectory start time reset to now");
   }
 }
@@ -260,6 +275,10 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstSharedPtr msg)
 
   start_time_ = msg->start_time;
   traj_id_ = msg->traj_id;
+  // 新轨迹到达：虚拟时间按其自身起点与当前墙钟的差重同步（规划发起时刻可能
+  // 早于本节点收到时刻）。此后由 cmdCallback 门控推进，不再裸跟墙钟（D-11）。
+  vtime_ = (rclcpp::Clock(RCL_ROS_TIME).now() - start_time_).seconds();
+  vtime_last_wall_ = -1.0;
 
   traj_.clear();
   traj_.push_back(pos_traj);
@@ -306,6 +325,7 @@ void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
                                                         msg->twist.twist.linear.z);
 
   have_odom_ = true;
+  odom_last_stamp_ = rclcpp::Clock(RCL_ROS_TIME).now().seconds();
 }
 
 void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
@@ -879,13 +899,65 @@ void cmdCallback()
   }
 
   time_now = clock.now();
-  double t_cur = (time_now - start_time_).seconds();
+
+  // ---- 轨迹流门控（D-11：odom 与 setpoint 同拍监看，滞后超限冻结 t_cur）----
+  // 时间域与墙钟一致；单拍增量先钳到 vtime_dt_clamp_，发布循环被卡死时
+  // 不会一次性跳时间；随后与 odom 偏差比较，超限则冻结，等飞机跟上再继续。
+  double t_cur;
+  const double wall = time_now.seconds();
+  if (vtime_last_wall_ < 0.0)
+    vtime_last_wall_ = wall;
+  double dv = wall - vtime_last_wall_;
+  vtime_last_wall_ = wall;
+  if (dv < 0.0) dv = 0.0;      // 时钟回跳：不后退也不前进
+  if (dv > vtime_dt_clamp_)
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("traj_server"), clock, 2000,
+        "setpoint loop stalled %.3fs (clamp to %.3fs)", dv, vtime_dt_clamp_);
+  dv = min(dv, vtime_dt_clamp_);
+
+  bool traj_frozen = false;
+  if (vtime_ < 0.0)
+    vtime_ = dv;
+  else
+    vtime_ += dv;
+  if (have_odom_ && !traj_.empty() && vtime_ >= 0.0 && vtime_ < traj_duration_)
+  {
+    const double lag = (traj_[0].evaluateDeBoorT(vtime_) - current_pos_).norm();
+    if (lag > traj_lag_max_)
+    {
+      vtime_ -= dv;  // 冻结：撤销本拍推进，等飞机跟上
+      traj_frozen = true;
+      RCLCPP_WARN_THROTTLE(rclcpp::get_logger("traj_server"), clock, 2000,
+          "traj lag %.2fm > %.2fm, hold t_cur=%.2f until aircraft catches up",
+          lag, traj_lag_max_, vtime_);
+    }
+  }
+  (void)traj_frozen;
+  t_cur = vtime_;
+
+  // odom 新鲜度：停更超阈 → 位置反馈失效，冻结轨迹输出、发当前位置悬停并告警
+  // （POSITION_LOST 的降级决策统一由 safety 仲裁，本节点只自保护，D-12）
+  if (have_odom_)
+  {
+    const double odom_age = wall - odom_last_stamp_;
+    if (odom_age > odom_stale_max_)
+    {
+      RCLCPP_WARN_THROTTLE(rclcpp::get_logger("traj_server"), clock, 2000,
+          "odom stale %.2fs (>%s s), freeze trajectory output, hold position",
+          odom_age, std::to_string(odom_stale_max_).c_str());
+      receive_traj_ = false;
+      vtime_ = -1.0;
+      vtime_last_wall_ = -1.0;
+    }
+  }
 
   static double last_t_cur = 0.0;
   if (t_cur < 0.0 && receive_traj_)
   {
     RCLCPP_WARN(rclcpp::get_logger("traj_server"), "Time jump detected (t_cur=%.3f -> last_t_cur=%.3f), adjusting start_time_ to continue trajectory", t_cur, last_t_cur);
     start_time_ = time_now - rclcpp::Duration::from_seconds(last_t_cur);
+    vtime_ = last_t_cur;
+    vtime_last_wall_ = wall;
     t_cur = last_t_cur;
   }
   
@@ -1004,6 +1076,14 @@ int main(int argc, char **argv)
   //Get time_forward parameter
   node->declare_parameter("traj_server/time_forward", 0.5);
   node->get_parameter("traj_server/time_forward", time_forward_);
+
+  // ---- 轨迹流门控参数（D-11 防长距爆冲 + odom 新鲜度自保护）----
+  node->declare_parameter("traj_server/lag_max", 1.5);
+  node->get_parameter("traj_server/lag_max", traj_lag_max_);
+  node->declare_parameter("traj_server/dt_clamp", 0.1);
+  node->get_parameter("traj_server/dt_clamp", vtime_dt_clamp_);
+  node->declare_parameter("traj_server/odom_stale_max", 0.5);
+  node->get_parameter("traj_server/odom_stale_max", odom_stale_max_);
   
   // Get target frame parameter
   node->declare_parameter("traj_server/frame_id", "world");
