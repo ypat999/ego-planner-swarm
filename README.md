@@ -94,6 +94,38 @@
 定位存在偏差，书面航点无法保证落在真实窗心；居中完全依赖走廊余量代价 + 碰撞代价
 （必须经避障通过），航点只负责给出穿窗方向。
 
+### plan_env：横纵向独立膨胀、天花板膨胀带、大地图寻址
+
+机体在规划链路里是**质点**——A*（`checkOccupancy`）、FSM 验收（`checkTrajectoryFeasibility`）、
+优化器碰撞代价都只查 `occupancy_buffer_inflate_`，全部安全余量只能由膨胀提供。本轮改动：
+
+- **新增 `grid_map/obstacles_inflation_z`（默认 0.2）**：`cloudCallback` 里 z 向原本硬编码
+  `inf_step_z = 1`，既不跟随 `obstacles_inflation`、又随 `resolution` 变动（安全性绑在性能参数上）。
+  现在横纵向各自量化：横向对应桨叶扫掠半径，纵向对应机体半高，互不牵连。
+- **虚拟天花板按 `inf_step_z` 向下铺禁飞带**（原来只铺 1 格），并对 `ceil_id` 做了体素索引钳位
+  ——`virtual_ceil_height` 落在地图外时，`toAddress` 不会越出缓冲区而是串到相邻列的低 z 行，
+  凭空造出大片假障碍。
+- **量化的下限保护**：`inf_step`/`inf_step_z` 取 `max(0, ceil(...))`。`obstacles_inflation` 的
+  declare 默认值是 −1.0，负数会让整个膨胀圈静默失效；`inf_step_z` 若为 0 会让天花板整层消失。
+- **启动自检日志**（配置值 ≠ 生效值，避免"配了却没生效"的反复排查）：
+
+  ```text
+  膨胀量化: 横向0.25m->2格(0.25m/侧), 纵向0.20m->2格(0.25m/侧), res=0.125m, 体素3200 x 3200 x 160
+  ```
+
+- **`toAddress` / `buffer_size` 全链 `size_t` 化**：res 0.1 @400×400×20 的体素数 3.2e9 超过
+  `INT_MAX`，int 相乘溢出成负数 → `std::length_error` → 节点 abort。边界判断同步由
+  `idx < 0 || idx >= num0*num1*num2` 改为 `idx >= occupancy_buffer_inflate_.size()`。
+- 点云模式（`enable_depth_raycast: false`）下不再分配 `occupancy_buffer_` 等五块随全图尺寸
+  增长的大缓冲，只留 inflate 一张 `char` 表。
+
+> 膨胀的量化公式、不同 `resolution` 下开口能剩几格、以及 0.8 m 窗的选型判据，
+> 统一记在主仓 `README.md` 的「障碍膨胀与体素量化」一节。
+>
+> 死代码说明：`clearAndInflateLocalMap()` + `inflatePoint()` 仍是各向同性立方且未接入
+> 任何调用者；活跃路径只有 `cloudCallback`。深度射线路径 `setOccupied()` 写单格、不膨胀
+> （`enable_depth_raycast: false` 时不执行）。
+
 ### 其他既有本地改动
 
 - `planning/avoid.h`：Fast-DDS XML 静态加载路径按主机名自适应；
@@ -101,4 +133,7 @@
 
 ## 部署提醒
 
-launch 配置属主仓库；本仓库改动需在上机环境 `colcon build --packages-select bspline_opt ego_planner` 后生效。
+launch 配置属主仓库；本仓库改动需在上机环境
+`colcon build --packages-select plan_env path_searching bspline_opt ego_planner` 后生效。
+`plan_env` 的头文件（如 `MapParams` 成员）参与下游编译，只编 `ego_planner` 会用到旧的
+`plan_env` 产物，出现"改了没生效"或直接 ABI 不匹配。

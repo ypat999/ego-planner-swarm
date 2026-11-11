@@ -33,6 +33,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/clear_range_y", -1.0);
   node_->declare_parameter("grid_map/clear_range_z", -1.0);
   node_->declare_parameter("grid_map/obstacles_inflation", -1.0);
+  node_->declare_parameter("grid_map/obstacles_inflation_z", 0.2);
   node_->declare_parameter("grid_map/fx", -1.0);
   node_->declare_parameter("grid_map/fy", -1.0);
   node_->declare_parameter("grid_map/cx", -1.0);
@@ -96,6 +97,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
               mp_.local_update_range_(0), mp_.local_update_range_(1), mp_.local_update_range_(2),
               mp_.clear_range_(0), mp_.clear_range_(1), mp_.clear_range_(2));
   node_->get_parameter("grid_map/obstacles_inflation", mp_.obstacles_inflation_);
+  node_->get_parameter("grid_map/obstacles_inflation_z", mp_.obstacles_inflation_z_);
   node_->get_parameter("grid_map/fx", mp_.fx_);
   node_->get_parameter("grid_map/fy", mp_.fy_);
   node_->get_parameter("grid_map/cx", mp_.cx_);
@@ -156,12 +158,23 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   for (int i = 0; i < 3; ++i)
     mp_.map_voxel_num_(i) = ceil(mp_.map_size_(i) / mp_.resolution_);
 
+  // 膨胀按整格量化，配置值与真实生效值常不一致，启动时打印避免“配了却没生效”的反复排查
+  int inf_step_log = max(0, (int)ceil(mp_.obstacles_inflation_ / mp_.resolution_));
+  int inf_step_z_log = max(0, (int)ceil(mp_.obstacles_inflation_z_ / mp_.resolution_));
+  RCLCPP_INFO(node_->get_logger(),
+              "膨胀量化: 横向%.2fm->%d格(%.2fm/侧), 纵向%.2fm->%d格(%.2fm/侧), res=%.3fm, 体素%d x %d x %d",
+              mp_.obstacles_inflation_, inf_step_log, inf_step_log * mp_.resolution_,
+              mp_.obstacles_inflation_z_, inf_step_z_log, inf_step_z_log * mp_.resolution_,
+              mp_.resolution_, mp_.map_voxel_num_(0), mp_.map_voxel_num_(1), mp_.map_voxel_num_(2));
+
   mp_.map_min_boundary_ = mp_.map_origin_;
   mp_.map_max_boundary_ = mp_.map_origin_ + mp_.map_size_;
 
   // initialize data buffers
 
-  int buffer_size = mp_.map_voxel_num_(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2);
+  // 必须用 size_t：400m×400m×20m @0.1m 的体素数约 3.2e9，int 相乘会溢出成负数
+  size_t buffer_size = (size_t)mp_.map_voxel_num_(0) * (size_t)mp_.map_voxel_num_(1) *
+                       (size_t)mp_.map_voxel_num_(2);
 
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
 
@@ -331,7 +344,7 @@ void GridMap::clearOriginSafeZone()
     for (int y = min_id(1); y <= max_id(1); ++y)
       for (int z = min_id(2); z <= max_id(2); ++z)
       {
-        int idx = toAddress(x, y, z);
+        size_t idx = toAddress(x, y, z);
         if (md_.occupancy_buffer_inflate_[idx] != 0 ||
             (mp_.enable_depth_raycast_ && md_.occupancy_buffer_[idx] > mp_.clamp_min_log_))
         {
@@ -718,13 +731,13 @@ void GridMap::clearAndInflateLocalMap()
 
       for (int z = min_cut_m(2); z < min_cut(2); ++z)
       {
-        int idx = toAddress(x, y, z);
+        size_t idx = toAddress(x, y, z);
         md_.occupancy_buffer_[idx] = mp_.clamp_min_log_ - mp_.unknown_flag_;
       }
 
       for (int z = max_cut(2) + 1; z <= max_cut_m(2); ++z)
       {
-        int idx = toAddress(x, y, z);
+        size_t idx = toAddress(x, y, z);
         md_.occupancy_buffer_[idx] = mp_.clamp_min_log_ - mp_.unknown_flag_;
       }
     }
@@ -735,13 +748,13 @@ void GridMap::clearAndInflateLocalMap()
 
       for (int y = min_cut_m(1); y < min_cut(1); ++y)
       {
-        int idx = toAddress(x, y, z);
+        size_t idx = toAddress(x, y, z);
         md_.occupancy_buffer_[idx] = mp_.clamp_min_log_ - mp_.unknown_flag_;
       }
 
       for (int y = max_cut(1) + 1; y <= max_cut_m(1); ++y)
       {
-        int idx = toAddress(x, y, z);
+        size_t idx = toAddress(x, y, z);
         md_.occupancy_buffer_[idx] = mp_.clamp_min_log_ - mp_.unknown_flag_;
       }
     }
@@ -752,13 +765,13 @@ void GridMap::clearAndInflateLocalMap()
 
       for (int x = min_cut_m(0); x < min_cut(0); ++x)
       {
-        int idx = toAddress(x, y, z);
+        size_t idx = toAddress(x, y, z);
         md_.occupancy_buffer_[idx] = mp_.clamp_min_log_ - mp_.unknown_flag_;
       }
 
       for (int x = max_cut(0) + 1; x <= max_cut_m(0); ++x)
       {
-        int idx = toAddress(x, y, z);
+        size_t idx = toAddress(x, y, z);
         md_.occupancy_buffer_[idx] = mp_.clamp_min_log_ - mp_.unknown_flag_;
       }
     }
@@ -792,9 +805,8 @@ void GridMap::clearAndInflateLocalMap()
           for (int k = 0; k < (int)inf_pts.size(); ++k)
           {
             inf_pt = inf_pts[k];
-            int idx_inf = toAddress(inf_pt);
-            if (idx_inf < 0 ||
-                idx_inf >= mp_.map_voxel_num_(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2))
+            size_t idx_inf = toAddress(inf_pt);
+            if (idx_inf >= md_.occupancy_buffer_inflate_.size())
             {
               continue;
             }
@@ -1119,8 +1131,10 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   pcl::PointXYZ pt;
   Eigen::Vector3d p3d, p3d_inf;
 
-  int inf_step = ceil(mp_.obstacles_inflation_ / mp_.resolution_);
-  int inf_step_z = 1;
+  // 横向/纵向各自量化到整格：横向对应桨叶扫掠半径，纵向对应机体半高，两者互不牵连。
+  // 下限取 0（inflation 配成 0 表示只占自身体素），避免负数 step 让膨胀圈整个静默失效
+  int inf_step = max(0, (int)ceil(mp_.obstacles_inflation_ / mp_.resolution_));
+  int inf_step_z = max(0, (int)ceil(mp_.obstacles_inflation_z_ / mp_.resolution_));
 
   double max_x, max_y, max_z, min_x, min_y, min_z;
 
@@ -1170,7 +1184,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
             if (!isInMap(inf_pt))
               continue;
 
-            int idx_inf = toAddress(inf_pt);
+            size_t idx_inf = toAddress(inf_pt);
 
             md_.occupancy_buffer_inflate_[idx_inf] = 1;
           }
@@ -1195,14 +1209,18 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   boundIndex(md_.local_bound_max_);
 
   // add virtual ceiling to limit flight height
-  // 添加虚拟天花板控制飞行高度
+  // 添加虚拟天花板控制飞行高度：向下铺 inf_step_z 格的禁飞带（厚度 >= obstacles_inflation_z），
+  // 原来只铺 1 格，等于机体上半高没算进天花板余量
   if (mp_.virtual_ceil_height_ > -0.5) {
-    int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
+    int ceil_id = min(mp_.map_voxel_num_(2) - 1,
+                      (int)floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1);
+    int ceil_bottom_id = max(0, ceil_id - max(1, inf_step_z) + 1);
     // RCLCPP_INFO(node_->get_logger(), "添加虚拟天花板: 高度=%.2f, 栅格ID=%d", mp_.virtual_ceil_height_, ceil_id);
     for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y) {
-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
-      }
+      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+        for (int z = ceil_bottom_id; z <= ceil_id; ++z) {
+          md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
+        }
   }
   clearOriginSafeZone();
   is_map_updating_ = false;

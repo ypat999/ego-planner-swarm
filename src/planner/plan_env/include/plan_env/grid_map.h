@@ -64,6 +64,9 @@ struct MappingParameters
   Eigen::Vector3d clear_range_;
   double resolution_, resolution_inv_;
   double obstacles_inflation_;
+  /* z 方向独立膨胀半径（对应机体半高）；横向用 obstacles_inflation_（对应桨叶半径）。
+     两者都会按 ceil(inflation / resolution) 量化到整格，所以不要指望配出的值精确相等 */
+  double obstacles_inflation_z_;
   string frame_id_;
   int pose_type_;
 
@@ -182,8 +185,10 @@ public:
 
   inline void posToIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &id);
   inline void indexToPos(const Eigen::Vector3i &id, Eigen::Vector3d &pos);
-  inline int toAddress(const Eigen::Vector3i &id);
-  inline int toAddress(int &x, int &y, int &z);
+  // 返回 size_t：地图体素数可能超过 INT_MAX（如 400m×400m×20m @0.1m ≈ 3.2e9），
+  // 用 int 计算地址会溢出成负数，导致 vector 长度非法直接 abort
+  inline size_t toAddress(const Eigen::Vector3i &id);
+  inline size_t toAddress(int &x, int &y, int &z);
   inline bool isInMap(const Eigen::Vector3d &pos);
   inline bool isInMap(const Eigen::Vector3i &idx);
 
@@ -287,14 +292,16 @@ private:
 /* ============================== definition of inline function
  * ============================== */
 
-inline int GridMap::toAddress(const Eigen::Vector3i &id)
+inline size_t GridMap::toAddress(const Eigen::Vector3i &id)
 {
-  return id(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + id(1) * mp_.map_voxel_num_(2) + id(2);
+  return (size_t)id(0) * (size_t)mp_.map_voxel_num_(1) * (size_t)mp_.map_voxel_num_(2) +
+         (size_t)id(1) * (size_t)mp_.map_voxel_num_(2) + (size_t)id(2);
 }
 
-inline int GridMap::toAddress(int &x, int &y, int &z)
+inline size_t GridMap::toAddress(int &x, int &y, int &z)
 {
-  return x * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + y * mp_.map_voxel_num_(2) + z;
+  return (size_t)x * (size_t)mp_.map_voxel_num_(1) * (size_t)mp_.map_voxel_num_(2) +
+         (size_t)y * (size_t)mp_.map_voxel_num_(2) + (size_t)z;
 }
 
 inline void GridMap::boundIndex(Eigen::Vector3i &id)
@@ -324,7 +331,7 @@ inline bool GridMap::isKnownFree(const Eigen::Vector3i &id)
 {
   Eigen::Vector3i id1 = id;
   boundIndex(id1);
-  int adr = toAddress(id1);
+  size_t adr = toAddress(id1);
 
   // return md_.occupancy_buffer_[adr] >= mp_.clamp_min_log_ &&
   //     md_.occupancy_buffer_[adr] < mp_.min_occupancy_log_;
@@ -335,7 +342,7 @@ inline bool GridMap::isKnownOccupied(const Eigen::Vector3i &id)
 {
   Eigen::Vector3i id1 = id;
   boundIndex(id1);
-  int adr = toAddress(id1);
+  size_t adr = toAddress(id1);
 
   return md_.occupancy_buffer_inflate_[adr] == 1;
 }
@@ -348,8 +355,7 @@ inline void GridMap::setOccupied(Eigen::Vector3d pos)
   Eigen::Vector3i id;
   posToIndex(pos, id);
 
-  md_.occupancy_buffer_inflate_[id(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) +
-                                id(1) * mp_.map_voxel_num_(2) + id(2)] = 1;
+  md_.occupancy_buffer_inflate_[toAddress(id)] = 1;
 }
 
 inline void GridMap::setOccupancy(Eigen::Vector3d pos, double occ)
