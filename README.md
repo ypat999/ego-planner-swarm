@@ -102,15 +102,18 @@
 - **新增 `grid_map/obstacles_inflation_z`（默认 0.2）**：`cloudCallback` 里 z 向原本硬编码
   `inf_step_z = 1`，既不跟随 `obstacles_inflation`、又随 `resolution` 变动（安全性绑在性能参数上）。
   现在横纵向各自量化：横向对应桨叶扫掠半径，纵向对应机体半高，互不牵连。
-- **虚拟天花板按 `inf_step_z` 向下铺禁飞带**（原来只铺 1 格），并对 `ceil_id` 做了体素索引钳位
-  ——`virtual_ceil_height` 落在地图外时，`toAddress` 不会越出缓冲区而是串到相邻列的低 z 行，
-  凭空造出大片假障碍。
+- **虚拟天花板禁飞带厚度改为 `max(1, inf_step_z)` 格**（原硬编码 1 格，`obstacles_inflation_z`
+  调大时天花板不跟着留余量），并对 `ceil_id` 做了体素索引钳位——`virtual_ceil_height` 落在地图外时，
+  `toAddress` 不会越出缓冲区而是串到相邻列的低 z 行，凭空造出大片假障碍。
 - **量化的下限保护**：`inf_step`/`inf_step_z` 取 `max(0, ceil(...))`。`obstacles_inflation` 的
   declare 默认值是 −1.0，负数会让整个膨胀圈静默失效；`inf_step_z` 若为 0 会让天花板整层消失。
 - **启动自检日志**（配置值 ≠ 生效值，避免"配了却没生效"的反复排查）：
 
   ```text
+  # inflate_z=0.2（declare 默认，@res 0.125 跳档到 2 格）
   膨胀量化: 横向0.25m->2格(0.25m/侧), 纵向0.20m->2格(0.25m/侧), res=0.125m, 体素3200 x 3200 x 160
+  # inflate_z=0.125（主仓 launch 现配，整除，纵向省 1 格）
+  膨胀量化: 横向0.25m->2格(0.25m/侧), 纵向0.125m->1格(0.125m/侧), res=0.125m, 体素3200 x 3200 x 160
   ```
 
 - **`toAddress` / `buffer_size` 全链 `size_t` 化**：res 0.1 @400×400×20 的体素数 3.2e9 超过
