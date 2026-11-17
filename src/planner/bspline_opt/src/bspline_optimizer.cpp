@@ -3,6 +3,36 @@
 #include <chrono>
 // using namespace std;
 
+namespace
+{
+  // 限频日志：同一调用点最多每 interval_sec 秒输出一条，下次输出时附带期间被压掉的条数。
+  struct ThrottledLog
+  {
+    std::chrono::steady_clock::time_point last{};
+    int suppressed = 0;
+
+    bool allow(double interval_sec, int &suppressed_out)
+    {
+      const auto now = std::chrono::steady_clock::now();
+      if (last.time_since_epoch().count() != 0 &&
+          std::chrono::duration<double>(now - last).count() < interval_sec)
+      {
+        ++suppressed;
+        return false;
+      }
+      suppressed_out = suppressed;
+      suppressed = 0;
+      last = now;
+      return true;
+    }
+  };
+
+  inline std::string suppressed_suffix(int n)
+  {
+    return n > 0 ? (" (期间抑制 " + std::to_string(n) + " 条)") : std::string();
+  }
+}
+
 namespace ego_planner
 {
 
@@ -1805,7 +1835,12 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
           initControlPoints(cps_.points, false);
           new_lambda2_ *= 2; // 提高规避权重
 
-          printf("\033[32miter(+1)=%d,time(ms)=%5.3f, swarm too close, keep optimizing\n\033[0m", iter_num_, time_ms);
+          static ThrottledLog swarm_throttle;
+          int swarm_suppressed = 0;
+          if (swarm_throttle.allow(2.0, swarm_suppressed))
+          {
+            printf("\033[32miter(+1)=%d,time(ms)=%5.3f, swarm too close, keep optimizing%s\n\033[0m", iter_num_, time_ms, suppressed_suffix(swarm_suppressed).c_str());
+          }
 
           continue;
         }
@@ -1892,7 +1927,12 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
         // 如果没有检测到碰撞视为优化成功
         if (!flag_occ)
         {
-          printf("\033[32miter(+1)=%d,time(ms)=%5.3f,total_t(ms)=%5.3f,cost=%5.3f\n\033[0m", iter_num_, time_ms, total_time_ms, final_cost);
+          static ThrottledLog iter_ok_throttle;
+          int iter_ok_suppressed = 0;
+          if (iter_ok_throttle.allow(2.0, iter_ok_suppressed))
+          {
+            printf("\033[32miter(+1)=%d,time(ms)=%5.3f,total_t(ms)=%5.3f,cost=%5.3f%s\n\033[0m", iter_num_, time_ms, total_time_ms, final_cost, suppressed_suffix(iter_ok_suppressed).c_str());
+          }
           success = true;
         }
         // 如果有碰撞则重新初始化
@@ -1902,7 +1942,12 @@ const int ego_planner::BsplineOptimizer::MAX_LOGS_PER_INTERVAL = 5;
           initControlPoints(cps_.points, false);
           new_lambda2_ *= 2;
 
-          printf("\033[32miter(+1)=%d,time(ms)=%5.3f, collided, keep optimizing\n\033[0m", iter_num_, time_ms);
+          static ThrottledLog iter_collide_throttle;
+          int iter_collide_suppressed = 0;
+          if (iter_collide_throttle.allow(2.0, iter_collide_suppressed))
+          {
+            printf("\033[32miter(+1)=%d,time(ms)=%5.3f, collided, keep optimizing%s\n\033[0m", iter_num_, time_ms, suppressed_suffix(iter_collide_suppressed).c_str());
+          }
         }
       }
       // 如果优化被强制取消

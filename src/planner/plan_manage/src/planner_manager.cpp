@@ -3,7 +3,38 @@
 #include <thread>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 #include "visualization_msgs/msg/marker.hpp" // zx-todo
+
+namespace
+{
+  // 限频日志：同一调用点最多每 interval_sec 秒输出一条，下次输出时附带期间被压掉的条数。
+  struct ThrottledLog
+  {
+    std::chrono::steady_clock::time_point last{};
+    int suppressed = 0;
+
+    bool allow(double interval_sec, int &suppressed_out)
+    {
+      const auto now = std::chrono::steady_clock::now();
+      if (last.time_since_epoch().count() != 0 &&
+          std::chrono::duration<double>(now - last).count() < interval_sec)
+      {
+        ++suppressed;
+        return false;
+      }
+      suppressed_out = suppressed;
+      suppressed = 0;
+      last = now;
+      return true;
+    }
+  };
+
+  inline std::string suppressed_suffix(int n)
+  {
+    return n > 0 ? (" (期间抑制 " + std::to_string(n) + " 条)") : std::string();
+  }
+}
 
 namespace ego_planner
 {
@@ -315,8 +346,14 @@ namespace ego_planner
     {
       // cout << "enter" << endl;
       std::vector<ControlPoints> trajs = bspline_optimizer_->distinctiveTrajs(segments);
-      cout << "\033[1;33m"
-           << "multi-trajs=" << trajs.size() << "\033[1;0m" << endl;
+      static ThrottledLog multi_traj_throttle;
+      int multi_traj_suppressed = 0;
+      if (multi_traj_throttle.allow(5.0, multi_traj_suppressed))
+      {
+        cout << "\033[1;33m"
+             << "multi-trajs=" << trajs.size() << suppressed_suffix(multi_traj_suppressed)
+             << "\033[1;0m" << endl;
+      }
 
       double final_cost, min_cost = 999999.0;
       for (int i = trajs.size() - 1; i >= 0; i--)
@@ -324,7 +361,12 @@ namespace ego_planner
         if (bspline_optimizer_->BsplineOptimizeTrajRebound(ctrl_pts_temp, final_cost, trajs[i], ts))
         {
 
-          cout << "traj " << trajs.size() - i << " success." << endl;
+          static ThrottledLog traj_ok_throttle;
+          int traj_ok_suppressed = 0;
+          if (traj_ok_throttle.allow(5.0, traj_ok_suppressed))
+          {
+            cout << "traj " << trajs.size() - i << " success." << suppressed_suffix(traj_ok_suppressed) << endl;
+          }
 
           flag_step_1_success = true;
           if (final_cost < min_cost)
@@ -343,7 +385,12 @@ namespace ego_planner
         }
         else
         {
-          cout << "traj " << trajs.size() - i << " failed." << endl;
+          static ThrottledLog traj_fail_throttle;
+          int traj_fail_suppressed = 0;
+          if (traj_fail_throttle.allow(5.0, traj_fail_suppressed))
+          {
+            cout << "traj " << trajs.size() - i << " failed." << suppressed_suffix(traj_fail_suppressed) << endl;
+          }
         }
       }
 
@@ -383,10 +430,16 @@ namespace ego_planner
       double v_ratio = std::max(narrow_vel_ratio_,
                                 std::min(1.0, narrow_width / (2.0 * narrow_clearance_threshold_)));
       ts /= v_ratio;                                                           // ts 变大 → 同路径走得更慢
-      RCLCPP_INFO(node_->get_logger(),
-                  "[narrow] %s最窄 width=%.2fm < %.2fm (左右 %.2f/%.2f, 上下 %.2f/%.2f), 减速到 %.0f%% (ts=%.3fs)",
-                  narrow_vertical ? "上下" : "左右", narrow_width, 2.0 * narrow_clearance_threshold_,
-                  l_clearance, r_clearance, u_clearance, d_clearance, v_ratio * 100.0, ts);
+      static ThrottledLog narrow_throttle;
+      int narrow_suppressed = 0;
+      if (narrow_throttle.allow(2.0, narrow_suppressed))
+      {
+        RCLCPP_INFO(node_->get_logger(),
+                    "[narrow] %s最窄 width=%.2fm < %.2fm (左右 %.2f/%.2f, 上下 %.2f/%.2f), 减速到 %.0f%% (ts=%.3fs)%s",
+                    narrow_vertical ? "上下" : "左右", narrow_width, 2.0 * narrow_clearance_threshold_,
+                    l_clearance, r_clearance, u_clearance, d_clearance, v_ratio * 100.0, ts,
+                    suppressed_suffix(narrow_suppressed).c_str());
+      }
     }
 
     UniformBspline pos = UniformBspline(ctrl_pts, 3, ts);
@@ -401,7 +454,12 @@ namespace ego_planner
       bool flag_step_2_success = true;
       if (!pos.checkFeasibility(ratio, false))
       {
-        cout << "Need to reallocate time." << endl;
+        static ThrottledLog reallocate_throttle;
+        int reallocate_suppressed = 0;
+        if (reallocate_throttle.allow(5.0, reallocate_suppressed))
+        {
+          cout << "Need to reallocate time." << suppressed_suffix(reallocate_suppressed) << endl;
+        }
 
         Eigen::MatrixXd optimal_control_points;
         flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);
@@ -442,7 +500,12 @@ namespace ego_planner
     count_success++;
 
     // cout << "total time:\033[42m" << (t_init + t_opt + t_refine).toSec() << "\033[0m,optimize:" << (t_init + t_opt).toSec() << ",refine:" << t_refine.toSec() << ",avg_time=" << sum_time / count_success << endl;
-    cout << "total time:\033[42m" << (t_init + t_opt + t_refine).seconds() << "\033[0m,optimize:" << (t_init + t_opt).seconds() << ",refine:" << t_refine.seconds() << ",avg_time=" << sum_time / count_success << endl;
+    static ThrottledLog total_time_throttle;
+    int total_time_suppressed = 0;
+    if (total_time_throttle.allow(5.0, total_time_suppressed))
+    {
+      cout << "total time:\033[42m" << (t_init + t_opt + t_refine).seconds() << "\033[0m,optimize:" << (t_init + t_opt).seconds() << ",refine:" << t_refine.seconds() << ",avg_time=" << sum_time / count_success << suppressed_suffix(total_time_suppressed) << endl;
+    }
 
     // success. YoY
     continous_failures_count_ = 0;

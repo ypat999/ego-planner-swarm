@@ -4,6 +4,38 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <sstream>
 #include <cmath>
+#include <chrono>
+
+namespace
+{
+  // 限频日志：同一调用点最多每 interval_sec 秒输出一条，下次输出时附带期间被压掉的条数。
+  // 故障期间的高频日志（odom 抖动、急停判定等）据此既能降行数，又不丢频次量级。
+  struct ThrottledLog
+  {
+    std::chrono::steady_clock::time_point last{};
+    int suppressed = 0;
+
+    bool allow(double interval_sec, int &suppressed_out)
+    {
+      const auto now = std::chrono::steady_clock::now();
+      if (last.time_since_epoch().count() != 0 &&
+          std::chrono::duration<double>(now - last).count() < interval_sec)
+      {
+        ++suppressed;
+        return false;
+      }
+      suppressed_out = suppressed;
+      suppressed = 0;
+      last = now;
+      return true;
+    }
+  };
+
+  inline std::string suppressed_suffix(int n)
+  {
+    return n > 0 ? (" (期间抑制 " + std::to_string(n) + " 条)") : std::string();
+  }
+}
 
 namespace ego_planner
 {
@@ -649,14 +681,24 @@ namespace ego_planner
                       position_diff, time_since_last_plan);
           return;
         }
-        RCLCPP_INFO(node_->get_logger(), "完全相同点(差异 %.4f m)，距上次规划已超 %.2f 秒，跳过急停重规划",
-                    position_diff, time_since_last_plan);
+        static ThrottledLog same_goal_throttle;
+        int same_goal_suppressed = 0;
+        if (same_goal_throttle.allow(2.0, same_goal_suppressed))
+        {
+          RCLCPP_INFO(node_->get_logger(), "完全相同点(差异 %.4f m)，距上次规划已超 %.2f 秒，跳过急停重规划%s",
+                      position_diff, time_since_last_plan, suppressed_suffix(same_goal_suppressed).c_str());
+        }
         is_same_goal = true;
       }
       else if (position_diff < same_goal_skip_threshold_) // 1m 内：不同但相近的点
       {
-        RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点差异 %.4f m < %.2f m，跳过急停直接重规划",
-                    position_diff, same_goal_skip_threshold_);
+        static ThrottledLog near_goal_throttle;
+        int near_goal_suppressed = 0;
+        if (near_goal_throttle.allow(2.0, near_goal_suppressed))
+        {
+          RCLCPP_INFO(node_->get_logger(), "新目标点与当前目标点差异 %.4f m < %.2f m，跳过急停直接重规划%s",
+                      position_diff, same_goal_skip_threshold_, suppressed_suffix(near_goal_suppressed).c_str());
+        }
         is_same_goal = true;
       }
       // 差异 ≥ 1m：检查是否为同方向延伸（新旧目标相对无人机方向一致）
@@ -669,9 +711,14 @@ namespace ego_planner
           double dot = dir_to_new.normalized().dot(dir_to_old.normalized());
           if (dot > 0.5) // 同方向（约60°以内）
           {
-            RCLCPP_INFO(node_->get_logger(),
-                "新目标与当前目标同方向(dot=%.2f)，差异%.2fm，跳过急停直接重规划",
-                dot, position_diff);
+            static ThrottledLog same_dir_throttle;
+            int same_dir_suppressed = 0;
+            if (same_dir_throttle.allow(2.0, same_dir_suppressed))
+            {
+              RCLCPP_INFO(node_->get_logger(),
+                  "新目标与当前目标同方向(dot=%.2f)，差异%.2fm，跳过急停直接重规划%s",
+                  dot, position_diff, suppressed_suffix(same_dir_suppressed).c_str());
+            }
             is_same_goal = true;
           }
         }
@@ -837,12 +884,18 @@ namespace ego_planner
     
     if (!data_valid)
     {
-      std::string error_summary = "odom数据无效: ";
-      for (const auto& err : error_messages)
+      static ThrottledLog throttle;
+      int suppressed = 0;
+      if (throttle.allow(1.0, suppressed))
       {
-        error_summary += err + "; ";
+        std::string error_summary = "odom数据无效: ";
+        for (const auto& err : error_messages)
+        {
+          error_summary += err + "; ";
+        }
+        RCLCPP_ERROR(node_->get_logger(), "%s%s", error_summary.c_str(),
+                     suppressed_suffix(suppressed).c_str());
       }
-      RCLCPP_ERROR(node_->get_logger(), "%s", error_summary.c_str());
       return;
     }
 
@@ -1116,6 +1169,8 @@ namespace ego_planner
     static string state_str[8] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP", "SEQUENTIAL_START"};
     int pre_s = int(exec_state_);
     exec_state_ = new_state;
+    if (pre_s != int(new_state))
+      printFSMExecState();  // 状态切换立即打印一条，便于回溯时序
     // cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
   }
 
@@ -1161,8 +1216,23 @@ namespace ego_planner
   void EGOReplanFSM::printFSMExecState()
   {
     static string state_str[8] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP", "SEQUENTIAL_START"};
+    static ThrottledLog throttle;
+    static int last_state = -1;
 
-    cout << "[FSM]: state: " + state_str[int(exec_state_)] << endl;
+    // 状态切换时立即打印，状态不变时按 5s 心跳打印，避免 1Hz 刷屏
+    int suppressed = 0;
+    const int cur_state = int(exec_state_);
+    if (cur_state != last_state)
+    {
+      last_state = cur_state;
+      throttle.last = std::chrono::steady_clock::now();
+      throttle.suppressed = 0;
+    }
+    else if (!throttle.allow(5.0, suppressed))
+      return;
+
+    cout << "[FSM]: state: " + state_str[cur_state]
+         << suppressed_suffix(suppressed) << endl;
   }
 
   void EGOReplanFSM::execFSMCallback()
@@ -1557,13 +1627,25 @@ namespace ego_planner
         {
           if (t - t_cur < emergency_time_) // 0.8s of emergency time
           {
-            RCLCPP_WARN(node_->get_logger(), "Suddenly discovered obstacles. emergency stop! time=%f", t - t_cur);
+            static ThrottledLog throttle;
+            int suppressed = 0;
+            if (throttle.allow(1.0, suppressed))
+            {
+              RCLCPP_WARN(node_->get_logger(), "Suddenly discovered obstacles. emergency stop! time=%f%s",
+                          t - t_cur, suppressed_suffix(suppressed).c_str());
+            }
 
             changeFSMExecState(EMERGENCY_STOP, "SAFETY");
           }
           else
           {
-            RCLCPP_WARN(node_->get_logger(), "current traj in collision, replan.");
+            static ThrottledLog throttle;
+            int suppressed = 0;
+            if (throttle.allow(1.0, suppressed))
+            {
+              RCLCPP_WARN(node_->get_logger(), "current traj in collision, replan.%s",
+                          suppressed_suffix(suppressed).c_str());
+            }
             changeFSMExecState(REPLAN_TRAJ, "SAFETY");
           }
           return;

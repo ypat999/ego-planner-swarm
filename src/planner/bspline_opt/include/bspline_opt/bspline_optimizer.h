@@ -216,21 +216,20 @@ namespace ego_planner
     {
       auto now = std::chrono::steady_clock::now();
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time_).count();
-      
-      // 检查时间间隔
-      if (elapsed < LOG_INTERVAL_SECONDS * 1000)
+
+      // 每进入一个新的时间窗就重置计数，否则累计到 MAX_LOGS_PER_INTERVAL 后会永久静音
+      if (elapsed >= (long)(LOG_INTERVAL_SECONDS * 1000))
       {
-        return false;
+        last_log_time_ = now;
+        log_count_ = 0;
       }
-      
-      // 检查计数限制
+
+      // 同一窗口内限制输出条数
       if (log_count_ >= MAX_LOGS_PER_INTERVAL)
       {
         return false;
       }
-      
-      // 允许输出日志，更新时间戳和计数器
-      last_log_time_ = now;
+
       log_count_++;
       return true;
     }
