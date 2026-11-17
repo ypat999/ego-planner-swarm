@@ -3,6 +3,7 @@
 
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
+#include <cmath>
 #include <cv_bridge/cv_bridge.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>
@@ -195,6 +196,16 @@ public:
     INVALID_IDX = -10000
   };
 
+  // 占据缓冲三态编码（cloud 模式 fine/coarse 共用）：
+  // 0=自由，1=仅膨胀（膨胀盒内、非命中格），2=原始命中（同时也属于膨胀体）。
+  // 脱困窗口内只把 2 当作障碍，窗口外仍把 >=1 当作障碍。
+  enum OccupancyState
+  {
+    OCC_FREE = 0,
+    OCC_INFLATE = 1,
+    OCC_RAW = 2
+  };
+
   // occupancy map management
   void resetBuffer();
   void resetBuffer(Eigen::Vector3d min, Eigen::Vector3d max);
@@ -213,7 +224,19 @@ public:
   inline void setOccupied(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3i id);
+  // 会受脱困窗口影响：窗口内按原始命中格判定，窗口外按膨胀层判定
   inline int getInflateOccupancy(Eigen::Vector3d pos);
+  // 始终按膨胀层判定（用于判断机体是否真的还在膨胀区里）
+  inline int getInflateOccupancyNoEscape(Eigen::Vector3d pos);
+  // 只认原始命中格（缓冲值 == OCC_RAW）；depth 模式没有原始层，退回膨胀层
+  inline int getRawOccupancy(Eigen::Vector3d pos);
+
+  /* 脱困窗口：以 center 为心、half_size 为半边的立方体内临时只认原始障碍，
+     为规划器留出空间；窗口外一切照旧。开关由 FSM 控制。 */
+  void beginEscapeWindow(const Eigen::Vector3d &center, double half_size);
+  void endEscapeWindow();
+  inline bool escapeWindowActive() const { return escape_active_; }
+  inline bool inEscapeWindow(const Eigen::Vector3d &pos) const;
 
   inline void boundIndex(Eigen::Vector3i &id);
   inline bool isUnknown(const Eigen::Vector3i &id);
@@ -269,8 +292,8 @@ private:
   void rebuildCoarseDirty();
   void markInflatedPointFine(const Eigen::Vector3d &p3d);
   void markInflatedPointCoarse(const Eigen::Vector3d &p3d);
-  inline void setCoarseCell(const Eigen::Vector3i &c);
-  inline void markCoarseFromFineG(const Eigen::Vector3i &g);
+  inline void setCoarseCell(const Eigen::Vector3i &c, char val = OCC_INFLATE);
+  inline void markCoarseFromFineG(const Eigen::Vector3i &g, char val = OCC_INFLATE);
   inline void upsampleCoarseToFinePlane(int axis, int slot, const Eigen::Vector3i &g_front);
   inline void posToFineIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &g);
   inline void posToCoarseIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &c);
@@ -321,6 +344,11 @@ private:
   default_random_engine eng_;
 
   bool is_map_updating_;
+
+  /* 脱困窗口：window 内忽略膨胀层（只认原始命中格），由 EGOReplanFSM 开关 */
+  bool escape_active_{false};
+  Eigen::Vector3d escape_center_{Eigen::Vector3d::Zero()};
+  double escape_half_{0.5};
 };
 
 /* ============================== definition of inline function
@@ -425,25 +453,69 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
   if (!isInMap(pos))
     return -1;
 
+  // 脱困窗口内只认原始命中格：临时关掉膨胀，给规划器留出空间
+  if (escape_active_ && inEscapeWindow(pos))
+    return getRawOccupancy(pos);
+
+  return getInflateOccupancyNoEscape(pos);
+}
+
+inline int GridMap::getInflateOccupancyNoEscape(Eigen::Vector3d pos)
+{
+  if (!isInMap(pos))
+    return -1;
+
   if (!mp_.enable_depth_raycast_)
   {
     // cloud 模式：精细窗口优先，否则粗糙全局层
     Eigen::Vector3i g;
     posToFineIndex(pos, g);
     if (isFineActive(g))
-      return int(md_.occupancy_buffer_fine_[toFineAddress(g)]);
+      return md_.occupancy_buffer_fine_[toFineAddress(g)] > OCC_FREE ? 1 : 0;
 
     Eigen::Vector3i c;
     posToCoarseIndex(pos, c);
     boundCoarseIndex(c);
-    return int(md_.occupancy_buffer_coarse_[toCoarseAddress(c)]);
+    return md_.occupancy_buffer_coarse_[toCoarseAddress(c)] > OCC_FREE ? 1 : 0;
   }
 
   // depth 模式：单层全局栅格
   Eigen::Vector3i id;
   posToIndex(pos, id);
 
-  return int(md_.occupancy_buffer_inflate_[toAddress(id)]);
+  return md_.occupancy_buffer_inflate_[toAddress(id)] > OCC_FREE ? 1 : 0;
+}
+
+inline int GridMap::getRawOccupancy(Eigen::Vector3d pos)
+{
+  if (!isInMap(pos))
+    return -1;
+
+  if (!mp_.enable_depth_raycast_)
+  {
+    Eigen::Vector3i g;
+    posToFineIndex(pos, g);
+    if (isFineActive(g))
+      return md_.occupancy_buffer_fine_[toFineAddress(g)] == OCC_RAW ? 1 : 0;
+
+    Eigen::Vector3i c;
+    posToCoarseIndex(pos, c);
+    boundCoarseIndex(c);
+    return md_.occupancy_buffer_coarse_[toCoarseAddress(c)] == OCC_RAW ? 1 : 0;
+  }
+
+  // depth 模式没有原始层，退回膨胀层，避免脱困窗口放行未知障碍
+  Eigen::Vector3i id;
+  posToIndex(pos, id);
+  return md_.occupancy_buffer_inflate_[toAddress(id)] > OCC_FREE ? 1 : 0;
+}
+
+inline bool GridMap::inEscapeWindow(const Eigen::Vector3d &pos) const
+{
+  return escape_active_ &&
+         std::fabs(pos(0) - escape_center_(0)) <= escape_half_ &&
+         std::fabs(pos(1) - escape_center_(1)) <= escape_half_ &&
+         std::fabs(pos(2) - escape_center_(2)) <= escape_half_;
 }
 
 inline int GridMap::getOccupancy(Eigen::Vector3i id)
@@ -569,17 +641,17 @@ inline void GridMap::boundCoarseIndex(Eigen::Vector3i &c)
   c(2) = max(min(c(2), md_.coarse_voxel_num_(2) - 1), 0);
 }
 
-// coarse 格置占据；0->1 时记录可视化脏点（有上限，超限后靠全量重建兜底）
-inline void GridMap::setCoarseCell(const Eigen::Vector3i &c)
+// coarse 格置占据；只升级不降级（原始标记 OCC_RAW 不能被膨胀格覆盖），升级时记录可视化脏点
+inline void GridMap::setCoarseCell(const Eigen::Vector3i &c, char val)
 {
   if (c(0) < 0 || c(1) < 0 || c(2) < 0 ||
       c(0) >= md_.coarse_voxel_num_(0) || c(1) >= md_.coarse_voxel_num_(1) ||
       c(2) >= md_.coarse_voxel_num_(2))
     return;
   size_t addr = toCoarseAddress(c);
-  if (md_.occupancy_buffer_coarse_[addr] != 0)
+  if (md_.occupancy_buffer_coarse_[addr] >= val)
     return;
-  md_.occupancy_buffer_coarse_[addr] = 1;
+  md_.occupancy_buffer_coarse_[addr] = val;
   if (md_.coarse_dirty_pts_.size() < 2000000)
   {
     Eigen::Vector3d pos = mp_.map_origin_ +
@@ -588,13 +660,13 @@ inline void GridMap::setCoarseCell(const Eigen::Vector3i &c)
   }
 }
 
-// fine 全局索引 -> coarse 占据（用于 fine 滚出窗口时的写穿）
-inline void GridMap::markCoarseFromFineG(const Eigen::Vector3i &g)
+// fine 全局索引 -> coarse 占据（用于 fine 滚出窗口时的写穿），val 沿用 fine 的三态值
+inline void GridMap::markCoarseFromFineG(const Eigen::Vector3i &g, char val)
 {
   Eigen::Vector3i c;
   for (int i = 0; i < 3; ++i)
     c(i) = (int)floor((double)g(i) / mp_.coarse_ratio_);
-  setCoarseCell(c);
+  setCoarseCell(c, val);
 }
 
 // fine 窗口滚入新区域时，用 coarse 记忆播种该平面：coarse 占据处 fine 也必须占据，

@@ -57,6 +57,9 @@ namespace ego_planner
     node_->declare_parameter("fsm/planning_horizon", -1.0);
     node_->declare_parameter("fsm/planning_horizen_time", -1.0);
     node_->declare_parameter("fsm/emergency_time", 1.0);
+    node_->declare_parameter("fsm/escape_window_size", 1.0);
+    node_->declare_parameter("fsm/escape_window_timeout", 3.0);
+    node_->declare_parameter("fsm/escape_max_rounds", 3);
     node_->declare_parameter("fsm/same_goal_skip_threshold", 1.0);
     node_->declare_parameter("fsm/same_point_replan_time_threshold", 10.0);
     node_->declare_parameter("fsm/realworld_experiment", false);
@@ -69,6 +72,12 @@ namespace ego_planner
     node_->get_parameter("fsm/planning_horizon", planning_horizen_);
     node_->get_parameter("fsm/planning_horizen_time", planning_horizen_time_);
     node_->get_parameter("fsm/emergency_time", emergency_time_);
+    node_->get_parameter("fsm/escape_window_size", escape_window_size_);
+    node_->get_parameter("fsm/escape_window_timeout", escape_window_timeout_);
+    node_->get_parameter("fsm/escape_max_rounds", escape_max_rounds_);
+    RCLCPP_INFO(node_->get_logger(),
+                "脱困窗口: 边长 %.2f m, 单轮 %.1f s, 最多 %d 轮",
+                escape_window_size_, escape_window_timeout_, escape_max_rounds_);
     node_->get_parameter("fsm/same_goal_skip_threshold", same_goal_skip_threshold_);
     node_->get_parameter("fsm/same_point_replan_time_threshold", same_point_replan_time_threshold_);
     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
@@ -485,6 +494,10 @@ namespace ego_planner
       // bspline 成功生成后才标记目标点，避免规划失败时误判重复
       current_transformed_goal_ = next_wp;
       has_valid_goal_ = true;
+
+      // 新目标 = 新一轮脱困尝试：重置轮次，允许重新开窗
+      escape_round_ = 0;
+      escape_blocked_ = false;
 
       /*** FSM状态转换 ***/
       if (exec_state_ == WAIT_TARGET)
@@ -1169,6 +1182,9 @@ namespace ego_planner
     static string state_str[8] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP", "SEQUENTIAL_START"};
     int pre_s = int(exec_state_);
     exec_state_ = new_state;
+    // 回到 WAIT_TARGET 表示本轮任务已结束：必须关掉脱困窗口，避免窗口残留在旧位置
+    if (new_state == WAIT_TARGET)
+      resetEscapeWindow();
     if (pre_s != int(new_state))
       printFSMExecState();  // 状态切换立即打印一条，便于回溯时序
     // cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
@@ -1550,6 +1566,9 @@ namespace ego_planner
     if (exec_state_ == WAIT_TARGET || info->start_time_.seconds() < 1e-5)
       return;
 
+    // 脱困窗口维护：陷在膨胀区并且已经卡住时，临时在 1m 立方内关掉膨胀
+    updateEscapeWindow();
+
     /* ---------- check lost of depth ---------- */
     if (map->getOdomDepthTimeout())
     {
@@ -1653,6 +1672,75 @@ namespace ego_planner
         break;
       }
     }
+  }
+
+  void EGOReplanFSM::updateEscapeWindow()
+  {
+    auto map = planner_manager_->grid_map_;
+    const bool in_inflate = map->getInflateOccupancyNoEscape(odom_pos_) > 0;
+
+    // 卡住：已急停，或处在规划态且已经失败过（continously_called_times_ >= 2 即至少失败一次）
+    const bool stuck =
+        (exec_state_ == EMERGENCY_STOP) ||
+        ((exec_state_ == GEN_NEW_TRAJ || exec_state_ == REPLAN_TRAJ) &&
+         continously_called_times_ >= 2);
+
+    if (map->escapeWindowActive())
+    {
+      const bool out_of_window = !map->inEscapeWindow(odom_pos_);
+      const double elapsed = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - escape_open_time_)
+                                 .count();
+      if (!out_of_window && elapsed < escape_window_timeout_)
+        return; // 本轮窗口仍在生效
+
+      // 本轮结束：走出窗口（成功挪动）或超时
+      map->endEscapeWindow();
+
+      if (!in_inflate)
+      {
+        // 已经脱离膨胀区，恢复正常判定并清空轮次
+        escape_round_ = 0;
+        escape_blocked_ = false;
+        return;
+      }
+      if (escape_round_ >= escape_max_rounds_)
+      {
+        RCLCPP_WARN(node_->get_logger(),
+                    "脱困失败：连续 %d 轮仍在膨胀区内，不再关闭膨胀，交由规划失败降级链处理",
+                    escape_round_);
+        escape_blocked_ = true;
+        return;
+      }
+      if (!stuck)
+        return; // 还在飞，等下次卡住再开窗
+
+      // 又困住了：走下一个脱困流程，窗口跟随机体新位置
+      ++escape_round_;
+      map->beginEscapeWindow(odom_pos_, 0.5 * escape_window_size_);
+      escape_open_time_ = std::chrono::steady_clock::now();
+      return;
+    }
+
+    if (!in_inflate)
+    {
+      escape_round_ = 0;
+      escape_blocked_ = false;
+      return;
+    }
+    if (!stuck || escape_blocked_)
+      return;
+
+    if (escape_round_ == 0)
+      escape_round_ = 1;
+    map->beginEscapeWindow(odom_pos_, 0.5 * escape_window_size_);
+    escape_open_time_ = std::chrono::steady_clock::now();
+  }
+
+  void EGOReplanFSM::resetEscapeWindow()
+  {
+    planner_manager_->grid_map_->endEscapeWindow();
+    escape_round_ = 0;
   }
 
   bool EGOReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)

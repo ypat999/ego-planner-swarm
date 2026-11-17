@@ -3,6 +3,7 @@
 
 #include <Eigen/Eigen>
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include "nav_msgs/msg/path.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -93,6 +94,17 @@ namespace ego_planner
 
     bool flag_escape_emergency_;
     bool last_goal_obstacle_pub_ = false; // /mission_event 去重：目标进膨胀区只发一次
+
+    /* 脱困窗口：机体陷在膨胀区时，以触发位置为心、固定边长立方体内临时只认原始障碍，
+       给规划器留出空间；超时换下一轮，连续多轮仍出不来则不再开窗，交给原有降级链。 */
+    double escape_window_size_{1.0};     // 立方体边长（m）
+    double escape_window_timeout_{3.0};  // 单轮窗口持续时间（s）
+    int escape_max_rounds_{3};           // 最多连续脱困轮数
+    int escape_round_{0};                // 已完成的轮数
+    bool escape_blocked_{false};         // 本轮任务内脱困失败，不再开窗
+    std::chrono::steady_clock::time_point escape_open_time_{};
+    void updateEscapeWindow();
+    void resetEscapeWindow();
 
     /* ROS utils */
     rclcpp::Node::SharedPtr node_;

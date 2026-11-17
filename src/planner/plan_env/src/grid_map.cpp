@@ -1086,8 +1086,9 @@ void GridMap::resetFineWindow(const Eigen::Vector3d &camera_pos)
       for (int z0 = 0; z0 < md_.fine_n_(2); ++z0)
       {
         g(2) = md_.fine_min_gidx_(2) + z0;
-        if (md_.occupancy_buffer_fine_[toFineAddress(g)])
-          markCoarseFromFineG(g);
+        char v = md_.occupancy_buffer_fine_[toFineAddress(g)];
+        if (v)
+          markCoarseFromFineG(g, v);
       }
     }
   }
@@ -1157,8 +1158,9 @@ void GridMap::rollFineAxis(int axis, int delta)
         g(axis) = g_discard;
         g(a1) += v1;
         g(a2) += v2;
-        if (md_.occupancy_buffer_fine_[toFineAddress(g)])
-          markCoarseFromFineG(g);
+        char v = md_.occupancy_buffer_fine_[toFineAddress(g)];
+        if (v)
+          markCoarseFromFineG(g, v);
       }
 
     md_.fine_min_gidx_(axis) += dir_pos ? 1 : -1;
@@ -1180,10 +1182,25 @@ void GridMap::markInflatedPointFine(const Eigen::Vector3d &p3d)
       {
         Eigen::Vector3i g(g0(0) + dx, g0(1) + dy, g0(2) + dz);
         if (isFineActive(g))
-          md_.occupancy_buffer_fine_[toFineAddress(g)] = 1;
+        {
+          // 只升级不降级：膨胀格不能覆盖已经标记的原始命中格
+          char &cell = md_.occupancy_buffer_fine_[toFineAddress(g)];
+          if (cell == OCC_FREE)
+            cell = OCC_INFLATE;
+        }
         else
-          markCoarseFromFineG(g);  // 越过窗口裕量的罕见情况兜底写 coarse，绝不让障碍丢失
+          markCoarseFromFineG(g, OCC_INFLATE);  // 越过窗口裕量的罕见情况兜底写 coarse，绝不让障碍丢失
       }
+
+  // 命中点本身记为原始障碍：脱困窗口内只把这一类当障碍
+  if (isFineActive(g0))
+  {
+    char &cell = md_.occupancy_buffer_fine_[toFineAddress(g0)];
+    if (cell < OCC_RAW)
+      cell = OCC_RAW;
+  }
+  else
+    markCoarseFromFineG(g0, OCC_RAW);
 }
 
 void GridMap::markInflatedPointCoarse(const Eigen::Vector3d &p3d)
@@ -1192,7 +1209,25 @@ void GridMap::markInflatedPointCoarse(const Eigen::Vector3d &p3d)
     return;
   Eigen::Vector3i c;
   posToCoarseIndex(p3d, c);
-  setCoarseCell(c);  // 体素内有点云即占据，coarse 层不膨胀
+  setCoarseCell(c, OCC_RAW);  // 体素内有点云即占据，coarse 层不膨胀
+}
+
+void GridMap::beginEscapeWindow(const Eigen::Vector3d &center, double half_size)
+{
+  escape_active_ = true;
+  escape_center_ = center;
+  escape_half_ = half_size > 0.0 ? half_size : 0.0;
+  RCLCPP_WARN(node_->get_logger(),
+              "[grid_map] 脱困窗口开启: center=(%.2f, %.2f, %.2f), 边长 %.2f m（窗口内忽略膨胀层）",
+              center(0), center(1), center(2), 2.0 * escape_half_);
+}
+
+void GridMap::endEscapeWindow()
+{
+  if (!escape_active_)
+    return;
+  escape_active_ = false;
+  RCLCPP_INFO(node_->get_logger(), "[grid_map] 脱困窗口关闭，恢复膨胀层判定");
 }
 
 void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img)
@@ -1512,7 +1547,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
       for (int x = x0; x <= x1; ++x)
         for (int y = y0; y <= y1; ++y)
           for (int z = ceil_bottom_id; z <= ceil_id; ++z)
-            md_.occupancy_buffer_fine_[toFineAddress(Eigen::Vector3i(x, y, z))] = 1;
+            md_.occupancy_buffer_fine_[toFineAddress(Eigen::Vector3i(x, y, z))] = OCC_RAW;
 
       // coarse：只铺本帧包围盒覆盖的粗格一层（远场无规划，兜底查询够用）
       int cr = mp_.coarse_ratio_;
@@ -1524,7 +1559,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
           {
             Eigen::Vector3i c(cx, cy, cceil);
             boundCoarseIndex(c);
-            setCoarseCell(c);
+            setCoarseCell(c, OCC_RAW);
           }
     }
     else
