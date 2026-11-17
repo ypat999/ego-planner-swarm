@@ -63,6 +63,10 @@ struct MappingParameters
   /* 点云模式：加(mark)复用 local_update_range_，减(clear)用小范围以兼顾近端动态 */
   Eigen::Vector3d clear_range_;
   double resolution_, resolution_inv_;
+  /* 多层级（cloud 模式）：resolution_ 即精细层分辨率；coarse 层为整数倍更粗分辨率 */
+  double fine_resolution_, fine_resolution_inv_;
+  double coarse_resolution_, coarse_resolution_inv_;
+  int coarse_ratio_;
   double obstacles_inflation_;
   /* z 方向独立膨胀半径（对应机体半高）；横向用 obstacles_inflation_（对应桨叶半径）。
      两者都会按 ceil(inflation / resolution) 量化到整格，所以不要指望配出的值精确相等 */
@@ -105,6 +109,9 @@ struct MappingParameters
   /* depth raycast buffers (disable in cloud mode to save memory) */
   bool enable_depth_raycast_;
 
+  /* cloud 模式多层级地图：fine 环形滚动窗口(local_update_range 内高分辨率) + coarse 全局记忆层 */
+  bool multilevel_;
+
   /* origin safe zone for landing */
   bool origin_safe_zone_enabled_;
   Eigen::Vector3d origin_safe_zone_size_;
@@ -118,6 +125,16 @@ struct MappingData
 
   std::vector<double> occupancy_buffer_;
   std::vector<char> occupancy_buffer_inflate_;
+
+  // 多层级（cloud 模式）：粗糙全局层 + 精细环形窗口层
+  std::vector<char> occupancy_buffer_coarse_;
+  Eigen::Vector3i coarse_voxel_num_;
+  std::vector<char> occupancy_buffer_fine_;
+  Eigen::Vector3i fine_n_;         // 精细环形缓冲每轴体素数
+  Eigen::Vector3i fine_min_gidx_;  // 精细窗口最小角（全局精细索引）
+  int fine_inf_step_, fine_inf_step_z_;
+  bool fine_window_init_;
+  std::vector<Eigen::Vector3d> coarse_dirty_pts_;  // coarse 0->1 增量记录（仅可视化用）
 
   // camera position and pose data
 
@@ -244,6 +261,23 @@ private:
   void projectDepthImage();
   void raycastProcess();
   void clearAndInflateLocalMap();
+
+  // 多层级（cloud 模式）
+  void rollFineToCamera(const Eigen::Vector3d &camera_pos);
+  void rollFineAxis(int axis, int delta);
+  void resetFineWindow(const Eigen::Vector3d &camera_pos);
+  void rebuildCoarseDirty();
+  void markInflatedPointFine(const Eigen::Vector3d &p3d);
+  void markInflatedPointCoarse(const Eigen::Vector3d &p3d);
+  inline void setCoarseCell(const Eigen::Vector3i &c);
+  inline void markCoarseFromFineG(const Eigen::Vector3i &g);
+  inline void upsampleCoarseToFinePlane(int axis, int slot, const Eigen::Vector3i &g_front);
+  inline void posToFineIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &g);
+  inline void posToCoarseIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &c);
+  inline bool isFineActive(const Eigen::Vector3i &g);
+  inline size_t toFineAddress(const Eigen::Vector3i &g);
+  inline size_t toCoarseAddress(const Eigen::Vector3i &c);
+  inline void boundCoarseIndex(Eigen::Vector3i &c);
 
   inline void inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts);
   int setCacheOccupancy(Eigen::Vector3d pos, int occ);
@@ -391,6 +425,21 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
   if (!isInMap(pos))
     return -1;
 
+  if (!mp_.enable_depth_raycast_)
+  {
+    // cloud 模式：精细窗口优先，否则粗糙全局层
+    Eigen::Vector3i g;
+    posToFineIndex(pos, g);
+    if (isFineActive(g))
+      return int(md_.occupancy_buffer_fine_[toFineAddress(g)]);
+
+    Eigen::Vector3i c;
+    posToCoarseIndex(pos, c);
+    boundCoarseIndex(c);
+    return int(md_.occupancy_buffer_coarse_[toCoarseAddress(c)]);
+  }
+
+  // depth 模式：单层全局栅格
   Eigen::Vector3i id;
   posToIndex(pos, id);
 
@@ -476,6 +525,104 @@ inline void GridMap::inflatePoint(const Eigen::Vector3i &pt, int step, vector<Ei
       {
         pts[num++] = Eigen::Vector3i(pt(0) + x, pt(1) + y, pt(2) + z);
       }
+}
+
+inline void GridMap::posToFineIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &g)
+{
+  for (int i = 0; i < 3; ++i)
+    g(i) = (int)floor((pos(i) - mp_.map_origin_(i)) * mp_.fine_resolution_inv_);
+}
+
+inline void GridMap::posToCoarseIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &c)
+{
+  for (int i = 0; i < 3; ++i)
+    c(i) = (int)floor((pos(i) - mp_.map_origin_(i)) * mp_.coarse_resolution_inv_);
+}
+
+inline bool GridMap::isFineActive(const Eigen::Vector3i &g)
+{
+  return g(0) >= md_.fine_min_gidx_(0) && g(0) < md_.fine_min_gidx_(0) + md_.fine_n_(0) &&
+         g(1) >= md_.fine_min_gidx_(1) && g(1) < md_.fine_min_gidx_(1) + md_.fine_n_(1) &&
+         g(2) >= md_.fine_min_gidx_(2) && g(2) < md_.fine_min_gidx_(2) + md_.fine_n_(2);
+}
+
+inline size_t GridMap::toFineAddress(const Eigen::Vector3i &g)
+{
+  // 绝对取模环形寻址：slot = g mod n，窗口 min 平移时无需搬迁数据。
+  // int 转 size_t 后取模对负数同样得到正确的环绕槽位
+  size_t s0 = (size_t)g(0) % (size_t)md_.fine_n_(0);
+  size_t s1 = (size_t)g(1) % (size_t)md_.fine_n_(1);
+  size_t s2 = (size_t)g(2) % (size_t)md_.fine_n_(2);
+  return (s0 * (size_t)md_.fine_n_(1) + s1) * (size_t)md_.fine_n_(2) + s2;
+}
+
+inline size_t GridMap::toCoarseAddress(const Eigen::Vector3i &c)
+{
+  return ((size_t)c(0) * (size_t)md_.coarse_voxel_num_(1) + (size_t)c(1)) * (size_t)md_.coarse_voxel_num_(2) +
+         (size_t)c(2);
+}
+
+inline void GridMap::boundCoarseIndex(Eigen::Vector3i &c)
+{
+  c(0) = max(min(c(0), md_.coarse_voxel_num_(0) - 1), 0);
+  c(1) = max(min(c(1), md_.coarse_voxel_num_(1) - 1), 0);
+  c(2) = max(min(c(2), md_.coarse_voxel_num_(2) - 1), 0);
+}
+
+// coarse 格置占据；0->1 时记录可视化脏点（有上限，超限后靠全量重建兜底）
+inline void GridMap::setCoarseCell(const Eigen::Vector3i &c)
+{
+  if (c(0) < 0 || c(1) < 0 || c(2) < 0 ||
+      c(0) >= md_.coarse_voxel_num_(0) || c(1) >= md_.coarse_voxel_num_(1) ||
+      c(2) >= md_.coarse_voxel_num_(2))
+    return;
+  size_t addr = toCoarseAddress(c);
+  if (md_.occupancy_buffer_coarse_[addr] != 0)
+    return;
+  md_.occupancy_buffer_coarse_[addr] = 1;
+  if (md_.coarse_dirty_pts_.size() < 2000000)
+  {
+    Eigen::Vector3d pos = mp_.map_origin_ +
+                          (c.cast<double>() + Eigen::Vector3d(0.5, 0.5, 0.5)) * mp_.coarse_resolution_;
+    md_.coarse_dirty_pts_.push_back(pos);
+  }
+}
+
+// fine 全局索引 -> coarse 占据（用于 fine 滚出窗口时的写穿）
+inline void GridMap::markCoarseFromFineG(const Eigen::Vector3i &g)
+{
+  Eigen::Vector3i c;
+  for (int i = 0; i < 3; ++i)
+    c(i) = (int)floor((double)g(i) / mp_.coarse_ratio_);
+  setCoarseCell(c);
+}
+
+// fine 窗口滚入新区域时，用 coarse 记忆播种该平面：coarse 占据处 fine 也必须占据，
+// 否则查询走 fine 分支会把 coarse 里的旧障碍当作自由空间（安全性回归）
+inline void GridMap::upsampleCoarseToFinePlane(int axis, int slot, const Eigen::Vector3i &g_front)
+{
+  int a1 = (axis + 1) % 3, a2 = (axis + 2) % 3;
+  for (int v1 = 0; v1 < md_.fine_n_(a1); ++v1)
+    for (int v2 = 0; v2 < md_.fine_n_(a2); ++v2)
+    {
+      Eigen::Vector3i g = g_front;
+      g(a1) += v1;
+      g(a2) += v2;
+      Eigen::Vector3i c;
+      for (int i = 0; i < 3; ++i)
+        c(i) = (int)floor((double)g(i) / mp_.coarse_ratio_);
+      char val = 0;
+      if (c(0) >= 0 && c(1) >= 0 && c(2) >= 0 &&
+          c(0) < md_.coarse_voxel_num_(0) && c(1) < md_.coarse_voxel_num_(1) &&
+          c(2) < md_.coarse_voxel_num_(2))
+        val = md_.occupancy_buffer_coarse_[toCoarseAddress(c)];
+
+      Eigen::Vector3i s;
+      s(axis) = slot;
+      s(a1) = (size_t)g(a1) % (size_t)md_.fine_n_(a1);
+      s(a2) = (size_t)g(a2) % (size_t)md_.fine_n_(a2);
+      md_.occupancy_buffer_fine_[(s(0) * (size_t)md_.fine_n_(1) + s(1)) * (size_t)md_.fine_n_(2) + s(2)] = val;
+    }
 }
 
 inline double GridMap::getResolution() { return mp_.resolution_; }

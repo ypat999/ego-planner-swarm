@@ -133,6 +133,34 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/origin_safe_zone_size_y", mp_.origin_safe_zone_size_(1));
   node_->get_parameter("grid_map/origin_safe_zone_size_z", mp_.origin_safe_zone_size_(2));
 
+  /* cloud 模式多层级地图：coarse 分辨率必须为 fine(grid_map/resolution) 的整数倍 */
+  node_->declare_parameter("grid_map/coarse_resolution", 0.2);
+  double coarse_res = 0.2;
+  node_->get_parameter("grid_map/coarse_resolution", coarse_res);
+  mp_.fine_resolution_ = mp_.resolution_;
+  mp_.fine_resolution_inv_ = mp_.resolution_inv_;
+  mp_.multilevel_ = !mp_.enable_depth_raycast_;
+  if (mp_.multilevel_)
+  {
+    int ratio = (int)lround(coarse_res / mp_.fine_resolution_);
+    if (ratio < 2 || fabs(coarse_res - ratio * mp_.fine_resolution_) > 1e-4 * mp_.fine_resolution_)
+    {
+      RCLCPP_WARN(node_->get_logger(),
+                  "[grid_map] coarse_resolution %.3f 不是 fine %.3f 的整数倍, 强制 ratio=4 (%.3f)",
+                  coarse_res, mp_.fine_resolution_, 4 * mp_.fine_resolution_);
+      ratio = 4;
+      coarse_res = ratio * mp_.fine_resolution_;
+    }
+    mp_.coarse_ratio_ = ratio;
+    mp_.coarse_resolution_ = coarse_res;
+  }
+  else
+  {
+    mp_.coarse_ratio_ = 1;
+    mp_.coarse_resolution_ = mp_.resolution_;
+  }
+  mp_.coarse_resolution_inv_ = 1.0 / mp_.coarse_resolution_;
+
   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
   {
     mp_.virtual_ceil_height_ = mp_.ground_height_ + z_size;
@@ -176,16 +204,55 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   size_t buffer_size = (size_t)mp_.map_voxel_num_(0) * (size_t)mp_.map_voxel_num_(1) *
                        (size_t)mp_.map_voxel_num_(2);
 
-  md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
-
-  // 点云模式下不启用深度射线投射：不分配这几块随全图尺寸增长的大缓冲，避免无谓内存占用
-  if (mp_.enable_depth_raycast_)
+  if (mp_.multilevel_)
   {
-    md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
-    md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
-    md_.count_hit_ = vector<short>(buffer_size, 0);
-    md_.flag_rayend_ = vector<char>(buffer_size, -1);
-    md_.flag_traverse_ = vector<char>(buffer_size, -1);
+    // 多层级：全图 inflate 缓冲不分配（fine 分辨率下单层全图会爆炸），
+    // 改为 coarse 全局层(整数倍粗分辨率, 持久记忆) + fine 环形滚动窗口层
+    md_.occupancy_buffer_inflate_.clear();
+
+    for (int i = 0; i < 3; ++i)
+      md_.coarse_voxel_num_(i) = ceil(mp_.map_size_(i) * mp_.coarse_resolution_inv_);
+    size_t coarse_size = (size_t)md_.coarse_voxel_num_(0) * (size_t)md_.coarse_voxel_num_(1) *
+                         (size_t)md_.coarse_voxel_num_(2);
+    md_.occupancy_buffer_coarse_ = vector<char>(coarse_size, 0);
+
+    // 窗口半宽 = local_update_range + 最大膨胀 + 1 个 coarse 格（重叠带，保证无缝切换）
+    double infl_max = max(mp_.obstacles_inflation_, mp_.obstacles_inflation_z_);
+    for (int i = 0; i < 3; ++i)
+    {
+      double win_half = mp_.local_update_range_(i) + infl_max + mp_.coarse_resolution_;
+      md_.fine_n_(i) = (int)ceil(2.0 * win_half * mp_.fine_resolution_inv_) + 1;
+    }
+    size_t fine_size = (size_t)md_.fine_n_(0) * (size_t)md_.fine_n_(1) * (size_t)md_.fine_n_(2);
+    md_.occupancy_buffer_fine_ = vector<char>(fine_size, 0);
+    md_.fine_window_init_ = false;
+
+    // 单层语义下 map_voxel_num_ 按 fine 计，仅用于边界钳制，不用于分配整图缓冲
+    mp_.fine_resolution_ = mp_.resolution_;
+    mp_.fine_resolution_inv_ = mp_.resolution_inv_;
+    md_.fine_inf_step_ = max(0, (int)ceil(mp_.obstacles_inflation_ / mp_.fine_resolution_));
+    md_.fine_inf_step_z_ = max(0, (int)ceil(mp_.obstacles_inflation_z_ / mp_.fine_resolution_));
+
+    RCLCPP_INFO(node_->get_logger(),
+                "[grid_map] 多层级地图: fine %.3fm 窗口 %d x %d x %d (%.0f MB) + coarse %.3fm 全图 %d x %d x %d (%.0f MB)",
+                mp_.fine_resolution_, md_.fine_n_(0), md_.fine_n_(1), md_.fine_n_(2),
+                fine_size / 1048576.0, mp_.coarse_resolution_,
+                md_.coarse_voxel_num_(0), md_.coarse_voxel_num_(1), md_.coarse_voxel_num_(2),
+                coarse_size / 1048576.0);
+  }
+  else
+  {
+    md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
+
+    // 点云模式下不启用深度射线投射：不分配这几块随全图尺寸增长的大缓冲，避免无谓内存占用
+    if (mp_.enable_depth_raycast_)
+    {
+      md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
+      md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
+      md_.count_hit_ = vector<short>(buffer_size, 0);
+      md_.flag_rayend_ = vector<char>(buffer_size, -1);
+      md_.flag_traverse_ = vector<char>(buffer_size, -1);
+    }
   }
 
   md_.raycast_num_ = 0;
@@ -340,20 +407,62 @@ void GridMap::clearOriginSafeZone()
   boundIndex(max_id);
 
   int cleared_count = 0;
-  for (int x = min_id(0); x <= max_id(0); ++x)
-    for (int y = min_id(1); y <= max_id(1); ++y)
-      for (int z = min_id(2); z <= max_id(2); ++z)
-      {
-        size_t idx = toAddress(x, y, z);
-        if (md_.occupancy_buffer_inflate_[idx] != 0 ||
-            (mp_.enable_depth_raycast_ && md_.occupancy_buffer_[idx] > mp_.clamp_min_log_))
+  if (mp_.multilevel_)
+  {
+    // fine：清窗口内落在安全区的占据格
+    for (int x = min_id(0); x <= max_id(0); ++x)
+      for (int y = min_id(1); y <= max_id(1); ++y)
+        for (int z = min_id(2); z <= max_id(2); ++z)
         {
-          md_.occupancy_buffer_inflate_[idx] = 0;
-          if (mp_.enable_depth_raycast_)
-            md_.occupancy_buffer_[idx] = mp_.clamp_min_log_;
-          cleared_count++;
+          Eigen::Vector3i id(x, y, z);
+          if (!isFineActive(id))
+            continue;
+          size_t faddr = toFineAddress(id);
+          if (md_.occupancy_buffer_fine_[faddr])
+          {
+            md_.occupancy_buffer_fine_[faddr] = 0;
+            cleared_count++;
+          }
         }
-      }
+
+    // coarse：清安全区覆盖的粗格；有变更才重建可视化脏点缓存（罕见事件，可接受全扫）
+    int cr = mp_.coarse_ratio_;
+    bool coarse_changed = false;
+    int cx1 = min(max_id(0) / cr, md_.coarse_voxel_num_(0) - 1);
+    int cy1 = min(max_id(1) / cr, md_.coarse_voxel_num_(1) - 1);
+    int cz1 = min(max_id(2) / cr, md_.coarse_voxel_num_(2) - 1);
+    for (int cx = min_id(0) / cr; cx <= cx1; ++cx)
+      for (int cy = min_id(1) / cr; cy <= cy1; ++cy)
+        for (int cz = min_id(2) / cr; cz <= cz1; ++cz)
+        {
+          size_t addr = toCoarseAddress(Eigen::Vector3i(cx, cy, cz));
+          if (md_.occupancy_buffer_coarse_[addr])
+          {
+            md_.occupancy_buffer_coarse_[addr] = 0;
+            coarse_changed = true;
+            cleared_count++;
+          }
+        }
+    if (coarse_changed)
+      rebuildCoarseDirty();
+  }
+  else
+  {
+    for (int x = min_id(0); x <= max_id(0); ++x)
+      for (int y = min_id(1); y <= max_id(1); ++y)
+        for (int z = min_id(2); z <= max_id(2); ++z)
+        {
+          size_t idx = toAddress(x, y, z);
+          if (md_.occupancy_buffer_inflate_[idx] != 0 ||
+              (mp_.enable_depth_raycast_ && md_.occupancy_buffer_[idx] > mp_.clamp_min_log_))
+          {
+            md_.occupancy_buffer_inflate_[idx] = 0;
+            if (mp_.enable_depth_raycast_)
+              md_.occupancy_buffer_[idx] = mp_.clamp_min_log_;
+            cleared_count++;
+          }
+        }
+  }
 
   if (cleared_count > 0)
   {
@@ -940,6 +1049,152 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
   md_.has_odom_ = true;
 }
 
+/* ---------------- 多层级地图（cloud 模式） ---------------- */
+
+void GridMap::rebuildCoarseDirty()
+{
+  // coarse 全图扫一遍重建可视化脏点缓存（仅在初始化和安全区清除后调用）
+  md_.coarse_dirty_pts_.clear();
+  size_t cn2 = (size_t)md_.coarse_voxel_num_(2);
+  for (int x = 0; x < md_.coarse_voxel_num_(0); ++x)
+    for (int y = 0; y < md_.coarse_voxel_num_(1); ++y)
+    {
+      size_t base = ((size_t)x * (size_t)md_.coarse_voxel_num_(1) + (size_t)y) * cn2;
+      for (int z = 0; z < md_.coarse_voxel_num_(2); ++z)
+      {
+        if (!md_.occupancy_buffer_coarse_[base + (size_t)z])
+          continue;
+        if (md_.coarse_dirty_pts_.size() >= 2000000)
+          return;
+        md_.coarse_dirty_pts_.push_back(mp_.map_origin_ +
+            (Eigen::Vector3d((double)x, (double)y, (double)z) + Eigen::Vector3d(0.5, 0.5, 0.5)) *
+            mp_.coarse_resolution_);
+      }
+    }
+}
+
+void GridMap::resetFineWindow(const Eigen::Vector3d &camera_pos)
+{
+  // 大跳变（起飞/重置）：旧窗口全部写穿进 coarse，再以相机为中心重建并用 coarse 记忆播种
+  Eigen::Vector3i g = md_.fine_min_gidx_;
+  for (int x0 = 0; x0 < md_.fine_n_(0); ++x0)
+  {
+    g(0) = md_.fine_min_gidx_(0) + x0;
+    for (int y0 = 0; y0 < md_.fine_n_(1); ++y0)
+    {
+      g(1) = md_.fine_min_gidx_(1) + y0;
+      for (int z0 = 0; z0 < md_.fine_n_(2); ++z0)
+      {
+        g(2) = md_.fine_min_gidx_(2) + z0;
+        if (md_.occupancy_buffer_fine_[toFineAddress(g)])
+          markCoarseFromFineG(g);
+      }
+    }
+  }
+
+  posToFineIndex(camera_pos, md_.fine_min_gidx_);
+  md_.fine_min_gidx_ -= md_.fine_n_ / 2;
+  for (int slot = 0; slot < md_.fine_n_(0); ++slot)
+  {
+    Eigen::Vector3i g_front = md_.fine_min_gidx_;
+    g_front(0) += slot;
+    upsampleCoarseToFinePlane(0, slot, g_front);
+  }
+  md_.fine_window_init_ = true;
+}
+
+void GridMap::rollFineToCamera(const Eigen::Vector3d &camera_pos)
+{
+  Eigen::Vector3i cam_g;
+  posToFineIndex(camera_pos, cam_g);
+
+  if (!md_.fine_window_init_)
+  {
+    // 首帧：缓冲刚分配全 0，coarse 也为空，直接定心即可
+    md_.fine_min_gidx_ = cam_g - md_.fine_n_ / 2;
+    md_.fine_window_init_ = true;
+    return;
+  }
+
+  Eigen::Vector3i desired = cam_g - md_.fine_n_ / 2;
+  bool teleport = false;
+  for (int axis = 0; axis < 3; ++axis)
+    if (abs(desired(axis) - md_.fine_min_gidx_(axis)) >= md_.fine_n_(axis) / 2)
+      teleport = true;
+
+  if (teleport)
+  {
+    resetFineWindow(camera_pos);
+    return;
+  }
+
+  for (int axis = 0; axis < 3; ++axis)
+  {
+    int delta = desired(axis) - md_.fine_min_gidx_(axis);
+    if (delta != 0)
+      rollFineAxis(axis, delta);
+  }
+}
+
+void GridMap::rollFineAxis(int axis, int delta)
+{
+  // 环形绝对寻址下窗口平移 = min 逐格推进：每次滚 1 层，
+  // 被挤出的那一层先写穿 coarse，腾出的同槽位再用 coarse 记忆播种新前沿层
+  int n = md_.fine_n_(axis);
+  int a1 = (axis + 1) % 3, a2 = (axis + 2) % 3;
+  bool dir_pos = delta > 0;
+  int steps = dir_pos ? delta : -delta;
+
+  for (int k = 0; k < steps; ++k)
+  {
+    int g_discard = dir_pos ? md_.fine_min_gidx_(axis) : md_.fine_min_gidx_(axis) + n - 1;
+    int slot = (int)((size_t)g_discard % (size_t)n);
+
+    for (int v1 = 0; v1 < md_.fine_n_(a1); ++v1)
+      for (int v2 = 0; v2 < md_.fine_n_(a2); ++v2)
+      {
+        Eigen::Vector3i g = md_.fine_min_gidx_;
+        g(axis) = g_discard;
+        g(a1) += v1;
+        g(a2) += v2;
+        if (md_.occupancy_buffer_fine_[toFineAddress(g)])
+          markCoarseFromFineG(g);
+      }
+
+    md_.fine_min_gidx_(axis) += dir_pos ? 1 : -1;
+    Eigen::Vector3i g_front = md_.fine_min_gidx_;
+    if (dir_pos)
+      g_front(axis) += n - 1;
+    upsampleCoarseToFinePlane(axis, slot, g_front);
+  }
+}
+
+void GridMap::markInflatedPointFine(const Eigen::Vector3d &p3d)
+{
+  Eigen::Vector3i g0;
+  posToFineIndex(p3d, g0);
+  int st = md_.fine_inf_step_, stz = md_.fine_inf_step_z_;
+  for (int dx = -st; dx <= st; ++dx)
+    for (int dy = -st; dy <= st; ++dy)
+      for (int dz = -stz; dz <= stz; ++dz)
+      {
+        Eigen::Vector3i g(g0(0) + dx, g0(1) + dy, g0(2) + dz);
+        if (isFineActive(g))
+          md_.occupancy_buffer_fine_[toFineAddress(g)] = 1;
+        else
+          markCoarseFromFineG(g);  // 越过窗口裕量的罕见情况兜底写 coarse，绝不让障碍丢失
+      }
+}
+
+void GridMap::markInflatedPointCoarse(const Eigen::Vector3d &p3d)
+{
+  if (!isInMap(p3d))
+    return;
+  Eigen::Vector3i c;
+  posToCoarseIndex(p3d, c);
+  setCoarseCell(c);  // 体素内有点云即占据，coarse 层不膨胀
+}
+
 void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img)
 {
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
@@ -1077,7 +1332,11 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   // 即「本帧回波确认是自由空间的地方」才清空；射线打不到、无回波确认的区域保留历史记忆。
   // 远处的点同样参与雕刻（射线截断到 max_ray_length_），用远端命中清理近端射线。
   // 后面的标记循环为第二遍，命中点会被重新置 1，保证「击中赢」。
-  if (mp_.reset_buffer_enabled_)
+  // 多层级：每次点云处理前先把 fine 窗口平移到相机位置（滚出部分写穿 coarse，滚入部分用 coarse 播种）
+  if (mp_.multilevel_)
+    rollFineToCamera(md_.camera_pos_);
+
+  if (mp_.multilevel_ || mp_.reset_buffer_enabled_)
   {
     RayCaster raycaster;
     Eigen::Vector3d half = Eigen::Vector3d(0.5, 0.5, 0.5);
@@ -1122,8 +1381,14 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
             id(2) < clear_min_id(2) || id(2) > clear_max_id(2))
           break;
 
-        // 写 0 幂等，无需帧戳去重
-        md_.occupancy_buffer_inflate_[toAddress(id)] = 0;
+        // 写 0 幂等，无需帧戳去重。raycast 消减只作用于 fine 层；coarse 层持久不清
+        if (mp_.multilevel_)
+        {
+          if (isFineActive(id))
+            md_.occupancy_buffer_fine_[toFineAddress(id)] = 0;
+        }
+        else
+          md_.occupancy_buffer_inflate_[toAddress(id)] = 0;
       }
     }
   }
@@ -1159,35 +1424,56 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     if (fabs(devi(0)) < mp_.local_update_range_(0) && fabs(devi(1)) < mp_.local_update_range_(1) &&
         fabs(devi(2)) < mp_.local_update_range_(2))
     {
+      if (mp_.multilevel_)
+      {
+        // fine 层膨胀标记（步数用 fine_inf_step_，出窗兜底写穿 coarse），只更新包围盒
+        markInflatedPointFine(p3d);
+        double inf_xy = mp_.obstacles_inflation_;
+        double inf_z = mp_.obstacles_inflation_z_;
+        max_x = max(max_x, p3d(0) + inf_xy);
+        max_y = max(max_y, p3d(1) + inf_xy);
+        max_z = max(max_z, p3d(2) + inf_z);
+        min_x = min(min_x, p3d(0) - inf_xy);
+        min_y = min(min_y, p3d(1) - inf_xy);
+        min_z = min(min_z, p3d(2) - inf_z);
+      }
+      else
+      {
 
-      /* inflate the point */
-      // 点云膨胀
-      for (int x = -inf_step; x <= inf_step; ++x)
-        for (int y = -inf_step; y <= inf_step; ++y)
-          for (int z = -inf_step_z; z <= inf_step_z; ++z)
-          {
+        /* inflate the point */
+        // 点云膨胀
+        for (int x = -inf_step; x <= inf_step; ++x)
+          for (int y = -inf_step; y <= inf_step; ++y)
+            for (int z = -inf_step_z; z <= inf_step_z; ++z)
+            {
 
-            p3d_inf(0) = pt.x + x * mp_.resolution_;
-            p3d_inf(1) = pt.y + y * mp_.resolution_;
-            p3d_inf(2) = pt.z + z * mp_.resolution_;
+              p3d_inf(0) = pt.x + x * mp_.resolution_;
+              p3d_inf(1) = pt.y + y * mp_.resolution_;
+              p3d_inf(2) = pt.z + z * mp_.resolution_;
 
-            max_x = max(max_x, p3d_inf(0));
-            max_y = max(max_y, p3d_inf(1));
-            max_z = max(max_z, p3d_inf(2));
+              max_x = max(max_x, p3d_inf(0));
+              max_y = max(max_y, p3d_inf(1));
+              max_z = max(max_z, p3d_inf(2));
 
-            min_x = min(min_x, p3d_inf(0));
-            min_y = min(min_y, p3d_inf(1));
-            min_z = min(min_z, p3d_inf(2));
+              min_x = min(min_x, p3d_inf(0));
+              min_y = min(min_y, p3d_inf(1));
+              min_z = min(min_z, p3d_inf(2));
 
-            posToIndex(p3d_inf, inf_pt);
+              posToIndex(p3d_inf, inf_pt);
 
-            if (!isInMap(inf_pt))
-              continue;
+              if (!isInMap(inf_pt))
+                continue;
 
-            size_t idx_inf = toAddress(inf_pt);
+              size_t idx_inf = toAddress(inf_pt);
 
-            md_.occupancy_buffer_inflate_[idx_inf] = 1;
-          }
+              md_.occupancy_buffer_inflate_[idx_inf] = 1;
+            }
+      }
+    }
+    else if (mp_.multilevel_)
+    {
+      // local_update_range 外的点：直接命中 coarse 格（体素内有点即占据，不膨胀）
+      markInflatedPointCoarse(p3d);
     }
   }
 
@@ -1216,11 +1502,39 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
                       (int)floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1);
     int ceil_bottom_id = max(0, ceil_id - max(1, inf_step_z) + 1);
     // RCLCPP_INFO(node_->get_logger(), "添加虚拟天花板: 高度=%.2f, 栅格ID=%d", mp_.virtual_ceil_height_, ceil_id);
-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
-        for (int z = ceil_bottom_id; z <= ceil_id; ++z) {
-          md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
-        }
+    if (mp_.multilevel_)
+    {
+      // fine：窗口滚入新层时由 coarse 播种，天花板不在 coarse 里，必须每帧铺满整个窗口带
+      Eigen::Vector3i gmin = md_.fine_min_gidx_;
+      Eigen::Vector3i gmax = md_.fine_min_gidx_ + md_.fine_n_ - Eigen::Vector3i::Ones();
+      int x0 = max(gmin(0), 0), x1 = min(gmax(0), mp_.map_voxel_num_(0) - 1);
+      int y0 = max(gmin(1), 0), y1 = min(gmax(1), mp_.map_voxel_num_(1) - 1);
+      for (int x = x0; x <= x1; ++x)
+        for (int y = y0; y <= y1; ++y)
+          for (int z = ceil_bottom_id; z <= ceil_id; ++z)
+            md_.occupancy_buffer_fine_[toFineAddress(Eigen::Vector3i(x, y, z))] = 1;
+
+      // coarse：只铺本帧包围盒覆盖的粗格一层（远场无规划，兜底查询够用）
+      int cr = mp_.coarse_ratio_;
+      int cceil = min(md_.coarse_voxel_num_(2) - 1,
+                      (int)floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.coarse_resolution_inv_) - 1);
+      if (cceil >= 0)
+        for (int cx = md_.local_bound_min_(0) / cr; cx <= md_.local_bound_max_(0) / cr; ++cx)
+          for (int cy = md_.local_bound_min_(1) / cr; cy <= md_.local_bound_max_(1) / cr; ++cy)
+          {
+            Eigen::Vector3i c(cx, cy, cceil);
+            boundCoarseIndex(c);
+            setCoarseCell(c);
+          }
+    }
+    else
+    {
+      for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
+        for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+          for (int z = ceil_bottom_id; z <= ceil_id; ++z) {
+            md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
+          }
+    }
   }
   clearOriginSafeZone();
   is_map_updating_ = false;
@@ -1309,8 +1623,48 @@ void GridMap::publishMapInflate(bool all_info){
   boundIndex(min_cut);
   boundIndex(max_cut);
 
-  for (int x = min_cut(0); x <= max_cut(0); ++x)
-    for (int y = min_cut(1); y <= max_cut(1); ++y)
+  if (mp_.multilevel_)
+  {
+    // fine：显示窗口(min_cut/max_cut 已是 fine 全局索引)与滚动窗口求交后扫描
+    Eigen::Vector3i gmin = md_.fine_min_gidx_;
+    Eigen::Vector3i gmax = md_.fine_min_gidx_ + md_.fine_n_ - Eigen::Vector3i::Ones();
+    Eigen::Vector3i smin = min_cut.cwiseMax(gmin);
+    Eigen::Vector3i smax = max_cut.cwiseMin(gmax);
+    for (int x = smin(0); x <= smax(0); ++x)
+      for (int y = smin(1); y <= smax(1); ++y)
+        for (int z = smin(2); z <= smax(2); ++z)
+        {
+          Eigen::Vector3i g(x, y, z);
+          if (md_.occupancy_buffer_fine_[toFineAddress(g)] == 0)
+            continue;
+
+          Eigen::Vector3d pos;
+          indexToPos(g, pos);
+          if (pos(2) > mp_.visualization_truncate_height_)
+            continue;
+
+          pt.x = pos(0);
+          pt.y = pos(1);
+          pt.z = pos(2);
+          cloud.push_back(pt);
+        }
+
+    // coarse：直接发布增量脏点缓存（持久记忆区，滚出窗口的历史占据）
+    for (size_t i = 0; i < md_.coarse_dirty_pts_.size(); ++i)
+    {
+      const Eigen::Vector3d &p = md_.coarse_dirty_pts_[i];
+      if (p(2) > mp_.visualization_truncate_height_)
+        continue;
+      pt.x = p(0);
+      pt.y = p(1);
+      pt.z = p(2);
+      cloud.push_back(pt);
+    }
+  }
+  else
+  {
+    for (int x = min_cut(0); x <= max_cut(0); ++x)
+      for (int y = min_cut(1); y <= max_cut(1); ++y)
       for (int z = min_cut(2); z <= max_cut(2); ++z)
       {
         if (md_.occupancy_buffer_inflate_[toAddress(x, y, z)] == 0)
@@ -1326,6 +1680,7 @@ void GridMap::publishMapInflate(bool all_info){
         pt.z = pos(2);
         cloud.push_back(pt);
       }
+  }
 
   cloud.width = cloud.points.size();
   cloud.height = 1;
