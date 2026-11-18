@@ -72,6 +72,14 @@ struct MappingParameters
   /* z 方向独立膨胀半径（对应机体半高）；横向用 obstacles_inflation_（对应桨叶半径）。
      两者都会按 ceil(inflation / resolution) 量化到整格，所以不要指望配出的值精确相等 */
   double obstacles_inflation_z_;
+  /* cloud 自过滤半径(米): 与传感器距离小于该值的回波视为机身/支架自反射，直接丢弃；
+     0 表示不过滤。不加此过滤时自反射点会被膨胀标记，机身周围常驻虚假占据，
+     多层级下还会经滚出写穿永久进入 coarse 记忆 */
+  double cloud_self_filter_radius_;
+  /* 点云"只处理最新帧"阈值(秒)：本帧时间戳落后当前 ROS 时钟超过该值，说明回调已被点云
+     积压拖住（单帧耗时 > 周期），此时整帧丢弃、把执行器线程让给 odom 回调；<=0 关闭。
+     代价：地图更新频率上限被压到 1/耗时，但每帧都是当时能拿到的最新观测 */
+  double cloud_stale_max_age_;
   string frame_id_;
   int pose_type_;
 
@@ -135,6 +143,7 @@ struct MappingData
   Eigen::Vector3i fine_min_gidx_;  // 精细窗口最小角（全局精细索引）
   int fine_inf_step_, fine_inf_step_z_;
   bool fine_window_init_;
+  bool fine_window_dirty_;  // fine 窗口本帧被铺/滚/重建，虚拟天花板细带需全窗口重铺一次
   std::vector<Eigen::Vector3d> coarse_dirty_pts_;  // coarse 0->1 增量记录（仅可视化用）
 
   // camera position and pose data
@@ -290,7 +299,8 @@ private:
   void rollFineAxis(int axis, int delta);
   void resetFineWindow(const Eigen::Vector3d &camera_pos);
   void rebuildCoarseDirty();
-  void markInflatedPointFine(const Eigen::Vector3d &p3d);
+  // 以全局 fine 索引为中心的膨胀标记；内部按槽位地址增量推进，不做逐格取模
+  void markInflatedPointFine(const Eigen::Vector3i &g0);
   void markInflatedPointCoarse(const Eigen::Vector3d &p3d);
   inline void setCoarseCell(const Eigen::Vector3i &c, char val = OCC_INFLATE);
   inline void markCoarseFromFineG(const Eigen::Vector3i &g, char val = OCC_INFLATE);
@@ -618,13 +628,22 @@ inline bool GridMap::isFineActive(const Eigen::Vector3i &g)
          g(2) >= md_.fine_min_gidx_(2) && g(2) < md_.fine_min_gidx_(2) + md_.fine_n_(2);
 }
 
+// 全局 fine 索引 -> 环形槽位。必须先按有符号数取模再补 n：
+// 旧写法 (size_t)g % (size_t)n 依赖 n 整除 2^64（即 n 为 2 的幂）才对负数成立，
+// 而窗口边长按 local_update_range 算出的 n（如 659）不是 2 的幂，
+// 机体靠近地图边界使 fine_min_gidx_ 为负时，负索引会落到完全无关的槽位（错位写坏地图）
+inline int fine_slot(int g, int n)
+{
+  int s = g % n;
+  return s < 0 ? s + n : s;
+}
+
 inline size_t GridMap::toFineAddress(const Eigen::Vector3i &g)
 {
-  // 绝对取模环形寻址：slot = g mod n，窗口 min 平移时无需搬迁数据。
-  // int 转 size_t 后取模对负数同样得到正确的环绕槽位
-  size_t s0 = (size_t)g(0) % (size_t)md_.fine_n_(0);
-  size_t s1 = (size_t)g(1) % (size_t)md_.fine_n_(1);
-  size_t s2 = (size_t)g(2) % (size_t)md_.fine_n_(2);
+  // 绝对取模环形寻址：slot = g mod n，窗口 min 平移时无需搬迁数据
+  size_t s0 = (size_t)fine_slot(g(0), md_.fine_n_(0));
+  size_t s1 = (size_t)fine_slot(g(1), md_.fine_n_(1));
+  size_t s2 = (size_t)fine_slot(g(2), md_.fine_n_(2));
   return (s0 * (size_t)md_.fine_n_(1) + s1) * (size_t)md_.fine_n_(2) + s2;
 }
 
