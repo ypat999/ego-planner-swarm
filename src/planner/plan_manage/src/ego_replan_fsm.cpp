@@ -6,52 +6,6 @@
 #include <cmath>
 #include <chrono>
 
-// ===== 临时探针：单线程执行器上各回调的占用时长（排查 odom 饿死；定位后整体删除） =====
-namespace
-{
-  struct FsmProbe
-  {
-    using clock = std::chrono::steady_clock;
-    struct Acc
-    {
-      double sum = 0.0, maxv = 0.0;
-      int n = 0;
-      void add(double v) { ++n; sum += v; if (v > maxv) maxv = v; }
-    };
-    Acc exec, collision, replan, odomcb;
-    clock::time_point last_print{};
-
-    static double ms(clock::time_point a, clock::time_point b)
-    { return std::chrono::duration<double, std::milli>(b - a).count(); }
-
-    struct Guard
-    {
-      Acc *acc;
-      clock::time_point t0;
-      Guard(Acc &a) : acc(&a), t0(clock::now()) {}
-      ~Guard() { acc->add(ms(t0, clock::now())); }
-    };
-
-    void maybePrint(const rclcpp::Logger &log)
-    {
-      const auto now = clock::now();
-      if (last_print.time_since_epoch().count() != 0 &&
-          now - last_print <= std::chrono::milliseconds(2000))
-        return;
-      RCLCPP_WARN(log,
-                  "[probe] 同线程占用 | execFSM n=%d avg %.1f/max %.1f | collision n=%d avg %.1f/max %.1f | "
-                  "reboundReplan n=%d avg %.1f/max %.1f | odomCb n=%d avg %.2f/max %.2f (ms)",
-                  exec.n, exec.n ? exec.sum / exec.n : 0.0, exec.maxv,
-                  collision.n, collision.n ? collision.sum / collision.n : 0.0, collision.maxv,
-                  replan.n, replan.n ? replan.sum / replan.n : 0.0, replan.maxv,
-                  odomcb.n, odomcb.n ? odomcb.sum / odomcb.n : 0.0, odomcb.maxv);
-      exec = {}; collision = {}; replan = {}; odomcb = {};
-      last_print = now;
-    }
-  };
-  FsmProbe fprobe;
-}
-
 namespace
 {
   // 限频日志：同一调用点最多每 interval_sec 秒输出一条，下次输出时附带期间被压掉的条数。
@@ -862,7 +816,6 @@ namespace ego_planner
 
   void EGOReplanFSM::odometryCallback(const std::shared_ptr<const nav_msgs::msg::Odometry> &msg)
   {
-    FsmProbe::Guard probe_odomcb(fprobe.odomcb); // 临时探针：本回调自身应极轻，用于反证饿死来自别处
     static rclcpp::Time last_odom_time;
     static int odom_count = 0;
     static double total_position_error = 0.0;
@@ -1300,8 +1253,6 @@ namespace ego_planner
 
   void EGOReplanFSM::execFSMCallback()
   {
-    FsmProbe::Guard probe_exec(fprobe.exec); // 临时探针
-    fprobe.maybePrint(node_->get_logger());  // 临时探针（10ms 节拍，最频繁，借它输出）
     // 不再取消计时器，避免计时器管理问题
     // exec_timer_->cancel(); // To avoid blockage
 
@@ -1600,7 +1551,6 @@ namespace ego_planner
 
   void EGOReplanFSM::checkCollisionCallback()
   {
-    FsmProbe::Guard probe_collision(fprobe.collision); // 临时探针
     // 失效降级互通：在既有 50ms 安全节拍上 20 分频发 1Hz HEARTBEAT（不新增 timer）。
     // safety 侧 2.5s 收不到即判 PLANNER_ALIVE=0 → HOVER（§16.3-C / P5）。
     if (++hb_tick_ >= 20)
@@ -1795,8 +1745,6 @@ namespace ego_planner
 
   bool EGOReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
-    FsmProbe::Guard probe_replan(fprobe.replan); // 临时探针：A* 走廊 + L-BFGS 全程
-
     getLocalTarget();
 
     // 只有局部目标就是最终目标时，才在优化器里启用“末段减速到 0”；

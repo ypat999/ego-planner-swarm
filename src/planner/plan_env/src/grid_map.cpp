@@ -12,31 +12,6 @@
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
 
-// ===== 临时探针：cloudCallback 分段计时（排查 odom 回调饥饿 ~1.1s；定位后删除） =====
-namespace
-{
-  struct StageProbe
-  {
-    using clock = std::chrono::steady_clock;
-    struct Acc
-    {
-      double sum = 0.0, maxv = 0.0;
-      void add(double v) { sum += v; if (v > maxv) maxv = v; }
-    };
-    Acc parse, roll, clear, mark, ceilz, safez, vis;
-    int frames = 0, teleports = 0, rebuilds = 0;
-    int drops = 0, drop_cnt = 0;
-    int vis_calls = 0;
-    long long vis_cells = 0;   // multilevel fine 扫描体积累加（不含 coarse）
-    clock::time_point last_print{};
-    clock::time_point last_tp_log{};
-    clock::time_point last_vis{};
-    static double ms(clock::time_point a, clock::time_point b)
-    { return std::chrono::duration<double, std::milli>(b - a).count(); }
-  };
-  StageProbe probe;
-}
-
 void GridMap::initMap(rclcpp::Node::SharedPtr node)
 {
   node_ = node;
@@ -982,29 +957,8 @@ void GridMap::visCallback()
   if (is_map_updating_)
     return;
 
-  // ===== 临时探针：vis 是 110ms 独立定时器，与 cloud 同线程串行，单独限频打印（定位后删除） =====
-  const auto t_vis0 = StageProbe::clock::now();
   publishMapInflate(true);
   publishMap();
-  const auto t_vis1 = StageProbe::clock::now();
-
-  probe.vis.add(StageProbe::ms(t_vis0, t_vis1));
-  ++probe.vis_calls;
-  if (probe.last_vis.time_since_epoch().count() == 0 ||
-      t_vis1 - probe.last_vis > std::chrono::milliseconds(2000))
-  {
-    const double n = probe.vis_calls > 0 ? (double)probe.vis_calls : 1.0;
-    RCLCPP_WARN(node_->get_logger(),
-                "[probe] vis calls=%d | avg %.1f/%.1f ms | 每次扫描 fine 格数均值 %.3g"
-                "（inflate 订阅者 %d）",
-                probe.vis_calls, probe.vis.sum / n, probe.vis.maxv,
-                (double)probe.vis_cells / n,
-                (int)map_inf_pub_->get_subscription_count());
-    probe.vis = {};
-    probe.vis_calls = 0;
-    probe.vis_cells = 0;
-    probe.last_vis = t_vis1;
-  }
 }
 
 void GridMap::updateOccupancyCallback()
@@ -1116,7 +1070,6 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
 
 void GridMap::rebuildCoarseDirty()
 {
-  ++probe.rebuilds; // 临时探针
   // coarse 全图扫一遍重建可视化脏点缓存（仅在初始化和安全区清除后调用）
   md_.coarse_dirty_pts_.clear();
   size_t cn2 = (size_t)md_.coarse_voxel_num_(2);
@@ -1191,19 +1144,6 @@ void GridMap::rollFineToCamera(const Eigen::Vector3d &camera_pos)
 
   if (teleport)
   {
-    ++probe.teleports;
-    const auto tp_now = StageProbe::clock::now();
-    if (probe.last_tp_log.time_since_epoch().count() == 0 ||
-        tp_now - probe.last_tp_log > std::chrono::milliseconds(2000))
-    {
-      Eigen::Vector3i d = desired - md_.fine_min_gidx_;
-      RCLCPP_WARN(node_->get_logger(),
-                  "[probe] teleport cam=[%.2f,%.2f,%.2f] delta=[%d,%d,%d] fine_n=[%d,%d,%d]",
-                  camera_pos(0), camera_pos(1), camera_pos(2),
-                  d(0), d(1), d(2),
-                  (int)md_.fine_n_(0), (int)md_.fine_n_(1), (int)md_.fine_n_(2));
-      probe.last_tp_log = tp_now;
-    }
     resetFineWindow(camera_pos);
     return;
   }
@@ -1362,7 +1302,6 @@ void GridMap::endEscapeWindow()
 
 void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img)
 {
-  const auto t_entry = StageProbe::clock::now();
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
 
   // 获取点云的时间戳
@@ -1379,12 +1318,12 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     const double late = (node_->now() - cloud_stamp).seconds();
     if (late > mp_.cloud_stale_max_age_)
     {
-      ++probe.drops;
-      if (++probe.drop_cnt % 50 == 1)
+      static long long drop_cnt = 0;
+      if (++drop_cnt % 50 == 1)
         RCLCPP_WARN(node_->get_logger(),
-                    "[grid_map] 丢弃过期点云（累计 %d 次）：本帧迟到 %.3fs > 阈值 %.3fs，"
+                    "[grid_map] 丢弃过期点云（累计 %lld 次）：本帧迟到 %.3fs > 阈值 %.3fs，"
                     "地图处理跟不上点云频率，把 CPU 让给 odom",
-                    probe.drop_cnt, late, mp_.cloud_stale_max_age_);
+                    drop_cnt, late, mp_.cloud_stale_max_age_);
       return;
     }
   }
@@ -1532,10 +1471,8 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   // 远处的点同样参与雕刻（射线截断到 max_ray_length_），用远端命中清理近端射线。
   // 后面的标记循环为第二遍，命中点会被重新置 1，保证「击中赢」。
   // 多层级：每次点云处理前先把 fine 窗口平移到相机位置（滚出部分写穿 coarse，滚入部分用 coarse 播种）
-  const auto t_parse = StageProbe::clock::now();
   if (mp_.multilevel_)
     rollFineToCamera(md_.camera_pos_);
-  const auto t_roll = StageProbe::clock::now();
 
   /* fine 体素去重（仅多层级）：同一 0.05m 体素内的多个回波，标记结果与体素中心绑定、
      清除射线在体素级几乎重合，逐点重算纯属浪费（~1.5 万点里约七成落在重复体素）。
@@ -1707,8 +1644,6 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     }
   }
 
-  const auto t_clear = StageProbe::clock::now();
-
   pcl::PointXYZ pt;
   Eigen::Vector3d p3d, p3d_inf;
 
@@ -1841,8 +1776,6 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   boundIndex(md_.local_bound_min_);
   boundIndex(md_.local_bound_max_);
 
-  const auto t_mark = StageProbe::clock::now();
-
   // add virtual ceiling to limit flight height
   // 添加虚拟天花板控制飞行高度：向下铺 inf_step_z 格的禁飞带（厚度 >= obstacles_inflation_z），
   // 原来只铺 1 格，等于机体上半高没算进天花板余量
@@ -1890,41 +1823,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     }
   }
   md_.fine_window_dirty_ = false;  // 本帧的天花板重铺需求已消费
-  const auto t_ceil = StageProbe::clock::now();
   clearOriginSafeZone();
-  const auto t_end = StageProbe::clock::now();
-
-  // ===== 临时探针输出（每 2s 一条，定位后删除） =====
-  ++probe.frames;
-  probe.parse.add(probe.ms(t_entry, t_parse));
-  probe.roll.add(probe.ms(t_parse, t_roll));
-  probe.clear.add(probe.ms(t_roll, t_clear));
-  probe.mark.add(probe.ms(t_clear, t_mark));
-  probe.ceilz.add(probe.ms(t_mark, t_ceil));
-  probe.safez.add(probe.ms(t_ceil, t_end));
-  if (probe.last_print.time_since_epoch().count() == 0 ||
-      t_end - probe.last_print > std::chrono::milliseconds(2000))
-  {
-    const double n = probe.frames > 0 ? (double)probe.frames : 1.0;
-    const double tot = probe.parse.sum + probe.roll.sum + probe.clear.sum +
-                       probe.mark.sum + probe.ceilz.sum + probe.safez.sum;
-    RCLCPP_WARN(node_->get_logger(),
-                "[probe] frames=%d pts=%zu uniq=%zu | parse %.1f/%.1f | roll %.1f/%.1f(tp=%d) | clear %.1f/%.1f | "
-                "mark %.1f/%.1f | ceil %.1f/%.1f | safe %.1f/%.1f(rb=%d) | drop=%d | avg_total %.1f ms",
-                probe.frames, latest_cloud.points.size(), uniq_pts.size(),
-                probe.parse.sum / n, probe.parse.maxv,
-                probe.roll.sum / n, probe.roll.maxv, probe.teleports,
-                probe.clear.sum / n, probe.clear.maxv,
-                probe.mark.sum / n, probe.mark.maxv,
-                probe.ceilz.sum / n, probe.ceilz.maxv,
-                probe.safez.sum / n, probe.safez.maxv, probe.rebuilds,
-                probe.drops,
-                tot / n);
-    probe.frames = 0; probe.teleports = 0; probe.rebuilds = 0; probe.drops = 0;
-    probe.parse = {}; probe.roll = {}; probe.clear = {};
-    probe.mark = {}; probe.ceilz = {}; probe.safez = {};
-    probe.last_print = t_end;
-  }
 
   is_map_updating_ = false;
 }
@@ -2019,11 +1918,6 @@ void GridMap::publishMapInflate(bool all_info){
     Eigen::Vector3i gmax = md_.fine_min_gidx_ + md_.fine_n_ - Eigen::Vector3i::Ones();
     Eigen::Vector3i smin = min_cut.cwiseMax(gmin);
     Eigen::Vector3i smax = max_cut.cwiseMin(gmax);
-    // 临时探针：累计本次要扫的 fine 格数（不逐格计数，避免扰动）
-    long long vvx = smax(0) - smin(0) + 1; if (vvx < 0) vvx = 0;
-    long long vvy = smax(1) - smin(1) + 1; if (vvy < 0) vvy = 0;
-    long long vvz = smax(2) - smin(2) + 1; if (vvz < 0) vvz = 0;
-    probe.vis_cells += vvx * vvy * vvz;
     for (int x = smin(0); x <= smax(0); ++x)
       for (int y = smin(1); y <= smax(1); ++y)
         for (int z = smin(2); z <= smax(2); ++z)
