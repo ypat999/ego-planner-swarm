@@ -310,7 +310,10 @@ private:
   inline bool isFineActive(const Eigen::Vector3i &g);
   inline size_t toFineAddress(const Eigen::Vector3i &g);
   inline size_t toCoarseAddress(const Eigen::Vector3i &c);
-  inline void boundCoarseIndex(Eigen::Vector3i &c);
+  // coarse 界外读取：越界不再夹到边界格，而是按「无记忆=自由」返回
+  inline char readCoarseCell(const Eigen::Vector3i &c);
+  // 多层级查询（fine 窗口优先，其次 coarse），不受全局地图边界限制
+  inline int multilevelOccupancy(const Eigen::Vector3d &pos, bool raw_only);
 
   inline void inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts);
   int setCacheOccupancy(Eigen::Vector3d pos, int occ);
@@ -359,6 +362,9 @@ private:
   bool escape_active_{false};
   Eigen::Vector3d escape_center_{Eigen::Vector3d::Zero()};
   double escape_half_{0.5};
+
+  // 机体首次飞出 coarse（全局地图）范围时提示一次，回到范围内复位
+  bool warned_outside_coarse_{false};
 };
 
 /* ============================== definition of inline function
@@ -460,7 +466,10 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos)
 
 inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
 {
-  if (!isInMap(pos))
+  // 多层级（cloud）模式：fine 环形窗口随相机无限滚动，查询不受全局地图边界限制。
+  // 若在此处用 isInMap 拒绝，越界一律返回 -1，而规划器大量 `if (getInflateOccupancy(pt))`
+  // 写法把非零（含 -1）当障碍，机体一到 coarse 范围边界就再也规划不出去
+  if (mp_.enable_depth_raycast_ && !isInMap(pos))
     return -1;
 
   // 脱困窗口内只认原始命中格：临时关掉膨胀，给规划器留出空间
@@ -470,24 +479,33 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
   return getInflateOccupancyNoEscape(pos);
 }
 
-inline int GridMap::getInflateOccupancyNoEscape(Eigen::Vector3d pos)
+inline int GridMap::multilevelOccupancy(const Eigen::Vector3d &pos, bool raw_only)
 {
-  if (!isInMap(pos))
-    return -1;
+  Eigen::Vector3i g;
+  posToFineIndex(pos, g);
 
-  if (!mp_.enable_depth_raycast_)
+  char val;
+  if (isFineActive(g))
+    val = md_.occupancy_buffer_fine_[toFineAddress(g)];
+  else
   {
-    // cloud 模式：精细窗口优先，否则粗糙全局层
-    Eigen::Vector3i g;
-    posToFineIndex(pos, g);
-    if (isFineActive(g))
-      return md_.occupancy_buffer_fine_[toFineAddress(g)] > OCC_FREE ? 1 : 0;
-
+    // 窗口之外查 coarse 持久记忆。coarse 只覆盖全局地图范围，范围外从未观测过，
+    // 按未观测（自由）返回 —— 机体因此可以飞出 coarse 范围，靠滚动的 fine 窗口导航
     Eigen::Vector3i c;
     posToCoarseIndex(pos, c);
-    boundCoarseIndex(c);
-    return md_.occupancy_buffer_coarse_[toCoarseAddress(c)] > OCC_FREE ? 1 : 0;
+    val = readCoarseCell(c);
   }
+
+  return raw_only ? (val == OCC_RAW ? 1 : 0) : (val > OCC_FREE ? 1 : 0);
+}
+
+inline int GridMap::getInflateOccupancyNoEscape(Eigen::Vector3d pos)
+{
+  if (!mp_.enable_depth_raycast_)
+    return multilevelOccupancy(pos, false);
+
+  if (!isInMap(pos))
+    return -1;
 
   // depth 模式：单层全局栅格
   Eigen::Vector3i id;
@@ -498,21 +516,11 @@ inline int GridMap::getInflateOccupancyNoEscape(Eigen::Vector3d pos)
 
 inline int GridMap::getRawOccupancy(Eigen::Vector3d pos)
 {
+  if (!mp_.enable_depth_raycast_)
+    return multilevelOccupancy(pos, true);
+
   if (!isInMap(pos))
     return -1;
-
-  if (!mp_.enable_depth_raycast_)
-  {
-    Eigen::Vector3i g;
-    posToFineIndex(pos, g);
-    if (isFineActive(g))
-      return md_.occupancy_buffer_fine_[toFineAddress(g)] == OCC_RAW ? 1 : 0;
-
-    Eigen::Vector3i c;
-    posToCoarseIndex(pos, c);
-    boundCoarseIndex(c);
-    return md_.occupancy_buffer_coarse_[toCoarseAddress(c)] == OCC_RAW ? 1 : 0;
-  }
 
   // depth 模式没有原始层，退回膨胀层，避免脱困窗口放行未知障碍
   Eigen::Vector3i id;
@@ -653,11 +661,13 @@ inline size_t GridMap::toCoarseAddress(const Eigen::Vector3i &c)
          (size_t)c(2);
 }
 
-inline void GridMap::boundCoarseIndex(Eigen::Vector3i &c)
+inline char GridMap::readCoarseCell(const Eigen::Vector3i &c)
 {
-  c(0) = max(min(c(0), md_.coarse_voxel_num_(0) - 1), 0);
-  c(1) = max(min(c(1), md_.coarse_voxel_num_(1) - 1), 0);
-  c(2) = max(min(c(2), md_.coarse_voxel_num_(2) - 1), 0);
+  if (c(0) < 0 || c(1) < 0 || c(2) < 0 ||
+      c(0) >= md_.coarse_voxel_num_(0) || c(1) >= md_.coarse_voxel_num_(1) ||
+      c(2) >= md_.coarse_voxel_num_(2))
+    return OCC_FREE;
+  return md_.occupancy_buffer_coarse_[toCoarseAddress(c)];
 }
 
 // coarse 格置占据；只升级不降级（原始标记 OCC_RAW 不能被膨胀格覆盖），升级时记录可视化脏点
@@ -710,8 +720,8 @@ inline void GridMap::upsampleCoarseToFinePlane(int axis, int slot, const Eigen::
 
       Eigen::Vector3i s;
       s(axis) = slot;
-      s(a1) = (size_t)g(a1) % (size_t)md_.fine_n_(a1);
-      s(a2) = (size_t)g(a2) % (size_t)md_.fine_n_(a2);
+      s(a1) = fine_slot(g(a1), md_.fine_n_(a1));
+      s(a2) = fine_slot(g(a2), md_.fine_n_(a2));
       md_.occupancy_buffer_fine_[(s(0) * (size_t)md_.fine_n_(1) + s(1)) * (size_t)md_.fine_n_(2) + s(2)] = val;
     }
 }

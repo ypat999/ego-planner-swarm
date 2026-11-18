@@ -1171,7 +1171,7 @@ void GridMap::rollFineAxis(int axis, int delta)
   for (int k = 0; k < steps; ++k)
   {
     int g_discard = dir_pos ? md_.fine_min_gidx_(axis) : md_.fine_min_gidx_(axis) + n - 1;
-    int slot = (int)((size_t)g_discard % (size_t)n);
+    int slot = fine_slot(g_discard, n);
 
     for (int v1 = 0; v1 < md_.fine_n_(a1); ++v1)
       for (int v2 = 0; v2 < md_.fine_n_(a2); ++v2)
@@ -1472,7 +1472,27 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   // 后面的标记循环为第二遍，命中点会被重新置 1，保证「击中赢」。
   // 多层级：每次点云处理前先把 fine 窗口平移到相机位置（滚出部分写穿 coarse，滚入部分用 coarse 播种）
   if (mp_.multilevel_)
+  {
     rollFineToCamera(md_.camera_pos_);
+
+    // 飞出 coarse（全局地图）范围后的行为：fine 窗口继续滚动建图，但界外没有任何持久记忆，
+    // 规划视野超出 fine 窗口的部分按「未观测=自由」处理。首次越界提示一次，回到范围内复位
+    if (!isInMap(md_.camera_pos_))
+    {
+      if (!warned_outside_coarse_)
+      {
+        warned_outside_coarse_ = true;
+        RCLCPP_WARN(node_->get_logger(),
+                    "[grid_map] 机体已飞出 coarse 持久记忆范围 (%.0f x %.0f x %.0f m)："
+                    "该区域无历史地图，仅靠滚动的 fine 窗口（±%.1f m）实时建图导航，"
+                    "超出窗口的规划视野按自由处理",
+                    mp_.map_size_(0), mp_.map_size_(1), mp_.map_size_(2),
+                    mp_.local_update_range_(0));
+      }
+    }
+    else
+      warned_outside_coarse_ = false;
+  }
 
   /* fine 体素去重（仅多层级）：同一 0.05m 体素内的多个回波，标记结果与体素中心绑定、
      清除射线在体素级几乎重合，逐点重算纯属浪费（~1.5 万点里约七成落在重复体素）。
@@ -1526,8 +1546,13 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     Eigen::Vector3i clear_min_id, clear_max_id;
     posToIndex(md_.camera_pos_ - mp_.clear_range_, clear_min_id);
     posToIndex(md_.camera_pos_ + mp_.clear_range_, clear_max_id);
-    boundIndex(clear_min_id);
-    boundIndex(clear_max_id);
+    // 多层级的 clear 盒是相对相机的滚动范围，不能钳到全局地图索引：越界一侧一旦被夹平，
+    // clear 盒退化成贴边的窄片，机体飞出 coarse 范围后连近端自由都清不出来
+    if (!mp_.multilevel_)
+    {
+      boundIndex(clear_min_id);
+      boundIndex(clear_max_id);
+    }
 
     // 多层级下天花板改为按需铺，射线若擦过天花板带当帧不再重铺补回，故带内不参与清除。
     // 原实现每帧铺满整带，擦除后立即被覆写，最终态相同
@@ -1572,8 +1597,10 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
         pt_w(0) = cpt.x, pt_w(1) = cpt.y, pt_w(2) = cpt.z;
       }
 
-      // 越界点截断到地图边界，超长射线截断到 max_ray_length_（与 raycastProcess 一致）
-      if (!isInMap(pt_w))
+      // 越界点截断到地图边界，超长射线截断到 max_ray_length_（与 raycastProcess 一致）。
+      // 多层级不截断：fine 窗口随相机滚动，边界外的回波同样有效，截断会把真实障碍位置压到
+      // 边界上形成假墙；射线出 clear 盒即 break，越界终点不会写到窗口外
+      if (!mp_.multilevel_ && !isInMap(pt_w))
         pt_w = closetPointInMap(pt_w, md_.camera_pos_);
 
       double ray_len = (pt_w - md_.camera_pos_).norm();
@@ -1792,11 +1819,15 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
       {
         Eigen::Vector3i gmin = md_.fine_min_gidx_;
         Eigen::Vector3i gmax = md_.fine_min_gidx_ + md_.fine_n_ - Eigen::Vector3i::Ones();
-        int x0 = max(gmin(0), 0), x1 = min(gmax(0), mp_.map_voxel_num_(0) - 1);
-        int y0 = max(gmin(1), 0), y1 = min(gmax(1), mp_.map_voxel_num_(1) - 1);
+        // 铺带范围 = fine 窗口 ∩ 天花板高度带。x/y 不钳到全局地图（窗口滚到 coarse 范围外
+        // 同样要铺，否则界外顶部失去限高）；z 与窗口求交，避免 ceil_id 落在窗口外时
+        // toFineAddress 环形回绕写到别的层上
+        int x0 = gmin(0), x1 = gmax(0);
+        int y0 = gmin(1), y1 = gmax(1);
+        int z0 = max(ceil_bottom_id, gmin(2)), z1 = min(ceil_id, gmax(2));
         for (int x = x0; x <= x1; ++x)
           for (int y = y0; y <= y1; ++y)
-            for (int z = ceil_bottom_id; z <= ceil_id; ++z)
+            for (int z = z0; z <= z1; ++z)
               md_.occupancy_buffer_fine_[toFineAddress(Eigen::Vector3i(x, y, z))] = OCC_RAW;
       }
 
@@ -1809,8 +1840,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
           for (int cy = md_.local_bound_min_(1) / cr; cy <= md_.local_bound_max_(1) / cr; ++cy)
           {
             Eigen::Vector3i c(cx, cy, cceil);
-            boundCoarseIndex(c);
-            setCoarseCell(c, OCC_RAW);
+            setCoarseCell(c, OCC_RAW); // 界外由 setCoarseCell 自行丢弃（coarse 不覆盖范围外）
           }
     }
     else
@@ -1908,8 +1938,13 @@ void GridMap::publishMapInflate(bool all_info){
     max_cut += Eigen::Vector3i(lmm, lmm, lmm);
   }
 
-  boundIndex(min_cut);
-  boundIndex(max_cut);
+  // 多层级不钳制显示窗口：fine 窗口可滚到 coarse 范围外，钳回全局索引会让界外的
+  // fine 占据从话题里消失，RViz 上表现为"地图边界处断了一截"
+  if (!mp_.multilevel_)
+  {
+    boundIndex(min_cut);
+    boundIndex(max_cut);
+  }
 
   if (mp_.multilevel_)
   {
