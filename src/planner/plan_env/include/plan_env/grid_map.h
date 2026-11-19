@@ -6,11 +6,15 @@
 #include <cmath>
 #include <cv_bridge/cv_bridge.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <atomic>
+#include <condition_variable>
 #include <iostream>
+#include <mutex>
 #include <random>
 #include <nav_msgs/msg/odometry.hpp>
 #include <queue>
 #include <rclcpp/rclcpp.hpp>
+#include <thread>
 #include <tuple>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -149,6 +153,9 @@ struct MappingData
   // camera position and pose data
 
   Eigen::Vector3d camera_pos_, last_camera_pos_;
+  /* 多层级下 camera_pos_ 归 cloud worker 独占（本帧地图的唯一基准位姿），
+     odomCallback 只把最新里程计位姿写到这里，由 executor 侧转发时加锁取用 */
+  Eigen::Vector3d odom_pos_{Eigen::Vector3d::Zero()};
   Eigen::Matrix3d camera_r_m_, last_camera_r_m_;
   Eigen::Matrix4d cam2body_;
 
@@ -196,7 +203,7 @@ class GridMap
 {
 public:
   GridMap() : tf_buffer_(nullptr), tf_listener_(nullptr) {}
-  ~GridMap() {}
+  ~GridMap() { stopCloudWorker(); }
 
   enum
   {
@@ -282,7 +289,7 @@ private:
                          const geometry_msgs::msg::PoseStamped::ConstPtr &pose);
   void extrinsicCallback(const nav_msgs::msg::Odometry::ConstPtr &odom);
   void depthOdomCallback(const sensor_msgs::msg::Image::ConstPtr &img, const nav_msgs::msg::Odometry::ConstPtr &odom);
-  void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img);
+  void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom);
 
   // update occupancy by raycasting
@@ -356,7 +363,7 @@ private:
   normal_distribution<double> rand_noise2_;
   default_random_engine eng_;
 
-  bool is_map_updating_;
+  std::atomic<bool> is_map_updating_{false};  // 多层级下写者是 cloud worker，vis 只读
 
   /* 脱困窗口：window 内忽略膨胀层（只认原始命中格），由 EGOReplanFSM 开关 */
   bool escape_active_{false};
@@ -365,6 +372,86 @@ private:
 
   // 机体首次飞出 coarse（全局地图）范围时提示一次，回到范围内复位
   bool warned_outside_coarse_{false};
+
+  /* ================= cloud 独立线程 + fine 双缓冲（仅多层级） =================
+     建图整帧（roll/clear/mark/ceil/safezone）挪到专用线程；executor 线程只做"能不能处理"
+     与必须留在 executor 的事：取 TF（tf2::BufferCore 内部无锁，不能跨线程 lookup）、
+     快照位姿、解析/过滤/变换点云，然后把这一帧交给 worker（最新帧优先，排队中的旧帧顶掉）。
+
+     规划器与可视化都不碰"正在被写的"缓冲：
+       live = md_.occupancy_buffer_fine_  唯一写者是 cloud worker
+       view = fine_view_                 读者唯一入口
+     帧末同步只搬运本帧真正翻转过的格子（fine_diff_），代价随场景变化量而非窗口体积增长；
+     另按槽位每帧巡检 1/kFineFullSyncEvery，使全量同步仍保持 20 帧一轮而不出现单帧拷贝尖峰；
+     整窗拷贝只留给窗口重建与 diff 记录溢出。
+
+     为什么必须双缓冲而不是共享加锁：一帧内是「先清 clear 盒、再打 mark」，读者插进这两步
+     之间会在真实障碍处读到 FREE（幻影自由空间）。读到上一帧的值只损失一帧延迟，无害。
+     双缓冲把读者能看到的"半帧状态"从整帧（实机 ~150ms）压缩到帧末同步那一小段，
+     且同步期间每个格子仍是某个全局位置的合法值。另一个致命点是环形寻址：窗口平移会让旧槽位
+     代表别的全局位置，所以视图边界必须与内容配套发布（syncFineView 的三段式收缩-回放-展开）。 */
+  struct CloudFrame
+  {
+    pcl::PointCloud<pcl::PointXYZ> cloud;               // 已解析、已过滤、已在 world 系
+    Eigen::Vector3d cam_pos = Eigen::Vector3d::Zero();  // 与该点云同时刻的传感器原点（world）
+  };
+
+  std::thread cloud_worker_;
+  std::mutex cloud_mtx_;
+  std::condition_variable cloud_cv_;
+  CloudFrame cloud_pending_;
+  bool cloud_has_pending_{false};
+  std::atomic<bool> cloud_worker_run_{false};
+
+  /* live 缓冲的写锁：worker 独占整帧；外部偶发写（resetBuffer 区间清除）等锁即可 */
+  std::mutex live_write_mtx_;
+  /* 跨线程位姿：odomCallback 在 executor 写 odom_pos_，cloudCallback 加锁快照后交给 worker */
+  std::mutex cam_mtx_;
+
+  std::vector<char> fine_view_;     // 读侧快照，与 live 等长、同槽位寻址
+  std::vector<uint64_t> fine_diff_; // 本帧变更记录：槽位地址 << 2 | 值
+  bool fine_full_dirty_{false};     // diff 不可用（整窗重建 / 记录溢出），同步走一次整窗拷贝
+  size_t fine_diff_cap_{0};         // 记录数超过它，整窗拷贝更划算
+
+  /* 视图元数据用 seqlock 发布：读者无锁，只在边界改动的瞬间重试 */
+  struct FineViewMeta
+  {
+    Eigen::Vector3i lo, hi;     // fine 有效全局索引区间 [lo, hi)
+    Eigen::Vector3i bmin, bmax; // 本帧点云包围盒（fine 全局索引，可视化用）
+    Eigen::Vector3d cam;        // 与该视图配套的相机原点
+  };
+  FineViewMeta view_meta_;
+  std::atomic<uint64_t> view_seq_{0};
+
+  /* 全量同步的节奏。不做"每 N 帧一次整窗 memcpy"：实机 res=0.05 / range=16m 时 fine 窗口是
+     659x659x339 ≈ 140MB，整窗一次拷贝在 RK 上就是几十毫秒，而且这段时间读侧一直在看混合内容。
+     改成每帧顺带把缓冲区按槽位连续切成 N 份巡检一份（140MB/20 ≈ 7MB ≈ 1~2ms），
+     同样保证任何 diff 漏记/错位最迟一整套 N 帧被纠正，代价恒定可预算。
+     按槽位分片之所以安全：发布边界始终是当帧窗口，槽位 s 的内容与它此刻代表的全局位置同源；
+     刚滚动进来、语义换过主人的那一层本来就是本帧新铺的，已被 diff 覆盖。 */
+  static const int kFineFullSyncEvery = 20;
+  size_t sweep_pos_{0};   // 巡检游标（槽位地址）
+  size_t sweep_chunk_{0}; // 每帧巡检的槽位数 = ceil(窗口体积 / kFineFullSyncEvery)
+
+  /* coarse 脏点列表（仅可视化）：写者只有 cloud worker，读者是 vis 回调。
+     initMap 一次性 reserve 到上限后永不再扩容（避免搬迁使读者拿到失效指针），
+     元素先写、后以 release 发布计数，vis 只遍历到该计数 */
+  static const size_t kCoarseDirtyCap = 2000000;
+  std::atomic<size_t> coarse_dirty_cnt_{0};
+  inline void pushCoarseDirty(const Eigen::Vector3d &pos);
+
+  void startCloudWorker();
+  void stopCloudWorker();
+  void cloudWorkerLoop();
+  void processCloudFrame(const CloudFrame &frame);
+  void syncFineView();
+  inline void setFineLive(size_t adr, char val);
+  inline void setFineLiveG(const Eigen::Vector3i &g, char val);
+  /* 只升不降的两个语义：膨胀只改写自由格，命中格取 max */
+  inline void setFineLiveIfFree(size_t adr, char val);
+  inline void setFineLiveMax(size_t adr, char val);
+  inline bool readFineViewCell(const Eigen::Vector3i &g, char &val);
+  inline bool readViewMeta(FineViewMeta &m);
 };
 
 /* ============================== definition of inline function
@@ -485,16 +572,16 @@ inline int GridMap::multilevelOccupancy(const Eigen::Vector3d &pos, bool raw_onl
   posToFineIndex(pos, g);
 
   char val;
-  if (isFineActive(g))
-    val = md_.occupancy_buffer_fine_[toFineAddress(g)];
-  else
-  {
-    // 窗口之外查 coarse 持久记忆。coarse 只覆盖全局地图范围，范围外从未观测过，
-    // 按未观测（自由）返回 —— 机体因此可以飞出 coarse 范围，靠滚动的 fine 窗口导航
-    Eigen::Vector3i c;
-    posToCoarseIndex(pos, c);
-    val = readCoarseCell(c);
-  }
+  // 读侧只碰 fine_view_：规划器与 cloud worker 之间没有任何锁，seqlock 保证
+  // 边界与该格内容取自同一次发布，看到的必然是某帧同步完成时的一致状态
+  if (readFineViewCell(g, val))
+    return raw_only ? (val == OCC_RAW ? 1 : 0) : (val > OCC_FREE ? 1 : 0);
+
+  // 窗口之外（或视图正在切换）查 coarse 持久记忆。coarse 只覆盖全局地图范围，范围外从未观测过，
+  // 按未观测（自由）返回 —— 机体因此可以飞出 coarse 范围，靠滚动的 fine 窗口导航
+  Eigen::Vector3i c;
+  posToCoarseIndex(pos, c);
+  val = readCoarseCell(c);
 
   return raw_only ? (val == OCC_RAW ? 1 : 0) : (val > OCC_FREE ? 1 : 0);
 }
@@ -655,6 +742,98 @@ inline size_t GridMap::toFineAddress(const Eigen::Vector3i &g)
   return (s0 * (size_t)md_.fine_n_(1) + s1) * (size_t)md_.fine_n_(2) + s2;
 }
 
+/* ---------------- cloud 线程与 fine 双缓冲 ---------------- */
+
+/* 写 live 缓冲的唯一入口：值真变了才记 diff。mark 的膨胀盒快路径本来就只在
+   FREE->INFLATE 时写，所以稳态（静止场景）每帧变更记录很少，同步代价随变化量走 */
+inline void GridMap::setFineLive(size_t adr, char val)
+{
+  char *live = md_.occupancy_buffer_fine_.data();
+  if (live[adr] == val)
+    return;
+  if (!fine_full_dirty_)
+  {
+    if (fine_diff_.size() >= fine_diff_cap_)
+      fine_full_dirty_ = true; // 变化量过大：整窗拷贝更划算
+    else
+      fine_diff_.push_back((uint64_t(adr) << 2) | uint64_t(val));
+  }
+  live[adr] = val;
+}
+
+inline void GridMap::setFineLiveG(const Eigen::Vector3i &g, char val)
+{
+  setFineLive(toFineAddress(g), val);
+}
+
+/* 膨胀盒内：只把自由格升级为膨胀格（原始命中格不能被覆盖） */
+inline void GridMap::setFineLiveIfFree(size_t adr, char val)
+{
+  if (md_.occupancy_buffer_fine_[adr] == OCC_FREE)
+    setFineLive(adr, val);
+}
+
+/* 命中格：取 max，低态不会把已标的原始障碍降级 */
+inline void GridMap::setFineLiveMax(size_t adr, char val)
+{
+  if (md_.occupancy_buffer_fine_[adr] < val)
+    setFineLive(adr, val);
+}
+
+/* coarse 脏点追加：容量已在 initMap 一次 reserve 到位，push_back 不会搬迁内存，
+ * 因此 vis 侧即使读到老 size 也只会读到仍然有效的旧元素，不会拿到悬垂指针 */
+inline void GridMap::pushCoarseDirty(const Eigen::Vector3d &pos)
+{
+  if (md_.coarse_dirty_pts_.size() >= kCoarseDirtyCap)
+    return;
+  md_.coarse_dirty_pts_.push_back(pos);
+  coarse_dirty_cnt_.store(md_.coarse_dirty_pts_.size(), std::memory_order_release);
+}
+
+/* seqlock 读一个 fine 格：把「边界」和「该槽位的内容」夹在同一次发布之内。
+   只验边界是不够的——读者可能在"拿到旧边界"与"读槽位"之间被 worker 的帧末同步插进去，
+   窗口一旦平移，那个槽位已经代表另一个全局位置，读到的是毫不相干的值。
+   seq 前后两次读取不变，就说明这两步之间没有任何同步发生，结果必然合法。
+   计数器每帧只变 4 次（收缩、展开各一对奇偶），正常首次即成功；
+   连续读不稳（理论不可能）按"窗口外"处理，宁可退回 coarse 也不碰可能错位的槽位 */
+inline bool GridMap::readFineViewCell(const Eigen::Vector3i &g, char &val)
+{
+  for (int spin = 0; spin < 4; ++spin)
+  {
+    uint64_t s0 = view_seq_.load(std::memory_order_acquire);
+    if (s0 & 1)
+      continue;
+    Eigen::Vector3i lo = view_meta_.lo;
+    Eigen::Vector3i hi = view_meta_.hi;
+    bool inside = g(0) >= lo(0) && g(1) >= lo(1) && g(2) >= lo(2) &&
+                  g(0) < hi(0) && g(1) < hi(1) && g(2) < hi(2);
+    char v = inside ? fine_view_[toFineAddress(g)] : OCC_FREE;
+    if (s0 != view_seq_.load(std::memory_order_acquire))
+      continue;
+    if (!inside)
+      return false;
+    val = v;
+    return true;
+  }
+  return false;
+}
+
+inline bool GridMap::readViewMeta(FineViewMeta &m)
+{
+  for (int spin = 0; spin < 4; ++spin)
+  {
+    uint64_t s0 = view_seq_.load(std::memory_order_acquire);
+    if (s0 & 1)
+      continue;
+    FineViewMeta t = view_meta_;
+    if (s0 != view_seq_.load(std::memory_order_acquire))
+      continue;
+    m = t;
+    return true;
+  }
+  return false;
+}
+
 inline size_t GridMap::toCoarseAddress(const Eigen::Vector3i &c)
 {
   return ((size_t)c(0) * (size_t)md_.coarse_voxel_num_(1) + (size_t)c(1)) * (size_t)md_.coarse_voxel_num_(2) +
@@ -681,12 +860,8 @@ inline void GridMap::setCoarseCell(const Eigen::Vector3i &c, char val)
   if (md_.occupancy_buffer_coarse_[addr] >= val)
     return;
   md_.occupancy_buffer_coarse_[addr] = val;
-  if (md_.coarse_dirty_pts_.size() < 2000000)
-  {
-    Eigen::Vector3d pos = mp_.map_origin_ +
-                          (c.cast<double>() + Eigen::Vector3d(0.5, 0.5, 0.5)) * mp_.coarse_resolution_;
-    md_.coarse_dirty_pts_.push_back(pos);
-  }
+  pushCoarseDirty(mp_.map_origin_ +
+                  (c.cast<double>() + Eigen::Vector3d(0.5, 0.5, 0.5)) * mp_.coarse_resolution_);
 }
 
 // fine 全局索引 -> coarse 占据（用于 fine 滚出窗口时的写穿），val 沿用 fine 的三态值
@@ -722,7 +897,7 @@ inline void GridMap::upsampleCoarseToFinePlane(int axis, int slot, const Eigen::
       s(axis) = slot;
       s(a1) = fine_slot(g(a1), md_.fine_n_(a1));
       s(a2) = fine_slot(g(a2), md_.fine_n_(a2));
-      md_.occupancy_buffer_fine_[(s(0) * (size_t)md_.fine_n_(1) + s(1)) * (size_t)md_.fine_n_(2) + s(2)] = val;
+      setFineLive((s(0) * (size_t)md_.fine_n_(1) + s(1)) * (size_t)md_.fine_n_(2) + s(2), val);
     }
 }
 

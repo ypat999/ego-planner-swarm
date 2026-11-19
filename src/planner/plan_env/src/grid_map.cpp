@@ -7,6 +7,7 @@
 #include <pcl/common/transforms.h>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <unordered_map>
 
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
@@ -246,6 +247,21 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
     md_.fine_window_init_ = false;
     md_.fine_window_dirty_ = false;
 
+    /* 读侧快照与写侧等长、同槽位寻址；同步逐帧搬运 diff，另按槽位巡检整窗 */
+    fine_view_ = vector<char>(fine_size, 0);
+    /* diff 上限按绝对条数而非 fine_size/8 取：实机窗口可达 140MB，按体积算会白白 reserve
+       140MB。2M 条已覆盖"多轴快速滚动 + 稠密场景播种"的单帧变化量，真超了就转整窗拷贝，
+       正确性不受影响（溢出走整窗是即时纠正，巡检只是兜底慢一周期） */
+    fine_diff_cap_ = min<size_t>(2u * 1024u * 1024u, max<size_t>(4096, fine_size / 8));
+    fine_diff_.reserve(fine_diff_cap_);
+    sweep_chunk_ = (fine_size + kFineFullSyncEvery - 1) / kFineFullSyncEvery;
+    sweep_pos_ = 0;
+    /* 视图初值置空：首次 syncFineView 之前所有查询都落到 coarse（开机时 coarse 为空），
+       不会读到尚未同步过的 fine */
+    view_meta_.lo = view_meta_.hi = Eigen::Vector3i::Zero();
+    /* coarse 脏点容量一次到位：此后 push_back 永不搬迁，vis 才能无锁遍历 */
+    md_.coarse_dirty_pts_.reserve(kCoarseDirtyCap);
+
     md_.fine_inf_step_ = max(0, (int)ceil(mp_.obstacles_inflation_ / mp_.fine_resolution_));
     md_.fine_inf_step_z_ = max(0, (int)ceil(mp_.obstacles_inflation_z_ / mp_.fine_resolution_));
 
@@ -255,6 +271,11 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
                 fine_size / 1048576.0, mp_.coarse_resolution_,
                 md_.coarse_voxel_num_(0), md_.coarse_voxel_num_(1), md_.coarse_voxel_num_(2),
                 coarse_size / 1048576.0);
+    RCLCPP_INFO(node_->get_logger(),
+                "[grid_map] fine 双缓冲额外占用 %.0f MB(读视图) + %.0f MB(diff 容量), 每帧巡检 %.1f MB",
+                double(fine_view_.size()) / 1048576.0,
+                double(fine_diff_cap_ * sizeof(uint64_t)) / 1048576.0,
+                double(sweep_chunk_) / 1048576.0);
   }
   else
   {
@@ -353,6 +374,11 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   // eng_ = default_random_engine(rd());
 
   is_map_updating_ = false;
+
+  /* 双缓冲与 fine_view_ 都已就绪后才能放 worker 进来；depth 模式不分流，
+     cloudCallback 会因 cloud_worker_run_==false 直接内联处理 */
+  if (mp_.multilevel_)
+    startCloudWorker();
 }
 
 void GridMap::resetBuffer()
@@ -436,7 +462,7 @@ void GridMap::clearOriginSafeZone()
           size_t faddr = toFineAddress(id);
           if (md_.occupancy_buffer_fine_[faddr])
           {
-            md_.occupancy_buffer_fine_[faddr] = 0;
+            setFineLive(faddr, 0);
             cleared_count++;
           }
         }
@@ -954,7 +980,10 @@ void GridMap::clearAndInflateLocalMap()
 
 void GridMap::visCallback()
 {
-  if (is_map_updating_)
+  /* 多层级下本回调只读"已发布的一致视图"，与 worker 的写缓冲完全隔离，
+     不需要再被 is_map_updating_ 挡住——否则 worker 一帧 150ms、10Hz 时几乎常驻为真，
+     可视化会被彻底饿死。视图切换的瞬间由 readViewMeta 失败自行跳过本帧 */
+  if (!mp_.multilevel_ && is_map_updating_)
     return;
 
   publishMapInflate(true);
@@ -963,7 +992,10 @@ void GridMap::visCallback()
 
 void GridMap::updateOccupancyCallback()
 {
-  is_map_updating_ = true;
+  /* 多层级（cloud 模式）下地图完全由 cloud worker 维护：本定时器只保留 odom/depth 超时看护，
+     不抢 is_map_updating_，也不并发清除安全区（否则与 worker 同时写 live 缓冲） */
+  if (!mp_.multilevel_)
+    is_map_updating_ = true;
   if (md_.last_occ_update_time_.seconds() < 1.0)
     md_.last_occ_update_time_ = node_->now();
 
@@ -979,8 +1011,11 @@ void GridMap::updateOccupancyCallback()
                    mp_.odom_depth_timeout_);
       md_.flag_depth_odom_timeout_ = true;
     }
-    clearOriginSafeZone();
-    is_map_updating_ = false;
+    if (!mp_.multilevel_)
+    {
+      clearOriginSafeZone();
+      is_map_updating_ = false;
+    }
     return;
   }
   md_.last_occ_update_time_ = node_->now();
@@ -1014,7 +1049,11 @@ void GridMap::updateOccupancyCallback()
 
   md_.occ_need_update_ = false;
   md_.local_updated_ = false;
-  clearOriginSafeZone();
+  /* 多层级下 live 缓冲与 fine_diff_ 归 cloud worker 独占：本回调（20Hz 定时器）若并发清安全区，
+     会与 worker 同时 push_back 同一个 vector（帧末还会 clear()），足以踩坏堆；
+     worker 每帧末尾已调用过 clearOriginSafeZone，语义不丢 */
+  if (!mp_.multilevel_)
+    clearOriginSafeZone();
   is_map_updating_ = false;
 }
 
@@ -1059,9 +1098,20 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
   if (md_.has_first_depth_)
     return;
 
-  md_.camera_pos_(0) = odom->pose.pose.position.x;
-  md_.camera_pos_(1) = odom->pose.pose.position.y;
-  md_.camera_pos_(2) = odom->pose.pose.position.z;
+  /* 多层级下 camera_pos_ 是"本帧地图的基准位姿"，归 cloud worker 独占（cloudCallback 转发时
+     快照给它）。odom 回调在执行器线程，只能写 odom_pos_，由 cloudCallback 加锁取用；
+     否则 worker 正拿上一帧位姿建图时被这里改写，逐格写入会混用两个时刻的位姿。
+     depth 模式仍走原来的串行路径，直接写 camera_pos_ */
+  lock_guard<mutex> lk(cam_mtx_);
+  if (mp_.multilevel_)
+    md_.odom_pos_ = Eigen::Vector3d(odom->pose.pose.position.x, odom->pose.pose.position.y,
+                                    odom->pose.pose.position.z);
+  else
+  {
+    md_.camera_pos_(0) = odom->pose.pose.position.x;
+    md_.camera_pos_(1) = odom->pose.pose.position.y;
+    md_.camera_pos_(2) = odom->pose.pose.position.z;
+  }
 
   md_.has_odom_ = true;
 }
@@ -1071,6 +1121,8 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
 void GridMap::rebuildCoarseDirty()
 {
   // coarse 全图扫一遍重建可视化脏点缓存（仅在初始化和安全区清除后调用）
+  // 先封计数再清空：vis 读到 0 就不再遍历，重建期间它只会发空 coarse 层
+  coarse_dirty_cnt_.store(0, std::memory_order_release);
   md_.coarse_dirty_pts_.clear();
   size_t cn2 = (size_t)md_.coarse_voxel_num_(2);
   for (int x = 0; x < md_.coarse_voxel_num_(0); ++x)
@@ -1081,9 +1133,9 @@ void GridMap::rebuildCoarseDirty()
       {
         if (!md_.occupancy_buffer_coarse_[base + (size_t)z])
           continue;
-        if (md_.coarse_dirty_pts_.size() >= 2000000)
+        if (md_.coarse_dirty_pts_.size() >= kCoarseDirtyCap)
           return;
-        md_.coarse_dirty_pts_.push_back(mp_.map_origin_ +
+        pushCoarseDirty(mp_.map_origin_ +
             (Eigen::Vector3d((double)x, (double)y, (double)z) + Eigen::Vector3d(0.5, 0.5, 0.5)) *
             mp_.coarse_resolution_);
       }
@@ -1093,6 +1145,8 @@ void GridMap::rebuildCoarseDirty()
 void GridMap::resetFineWindow(const Eigen::Vector3d &camera_pos)
 {
   // 大跳变（起飞/重置）：旧窗口全部写穿进 coarse，再以相机为中心重建并用 coarse 记忆播种
+  /* 整窗换血：逐格记 diff 既不划算也不可靠，直接标脏让 syncFineView 做一次全量拷贝 */
+  fine_full_dirty_ = true;
   Eigen::Vector3i g = md_.fine_min_gidx_;
   for (int x0 = 0; x0 < md_.fine_n_(0); ++x0)
   {
@@ -1198,7 +1252,6 @@ void GridMap::markInflatedPointFine(const Eigen::Vector3i &g0)
   int st = md_.fine_inf_step_, stz = md_.fine_inf_step_z_;
   const int n0 = md_.fine_n_(0), n1 = md_.fine_n_(1), n2 = md_.fine_n_(2);
   const Eigen::Vector3i wmin = md_.fine_min_gidx_;
-  char *buf = md_.occupancy_buffer_fine_.data();
 
   /* 膨胀盒整体落在 fine 窗口内（点已按 local_update_range 筛过，窗口边长又取到
      local_update_range + 膨胀 + coarse 余量，正常恒成立）时走快路径：
@@ -1227,9 +1280,7 @@ void GridMap::markInflatedPointFine(const Eigen::Vector3i &g0)
         for (int dz = 0; dz < cntz; ++dz)
         {
           // 只升级不降级：膨胀格不能覆盖已经标记的原始命中格
-          char &cell = buf[row + (size_t)iz];
-          if (cell == OCC_FREE)
-            cell = OCC_INFLATE;
+          setFineLiveIfFree(row + (size_t)iz, OCC_INFLATE);
           if (++iz == n2)
             iz = 0;
         }
@@ -1241,9 +1292,7 @@ void GridMap::markInflatedPointFine(const Eigen::Vector3i &g0)
     }
 
     // 命中点本身记为原始障碍：脱困窗口内只把这一类当障碍
-    char &cell = buf[toFineAddress(g0)];
-    if (cell < OCC_RAW)
-      cell = OCC_RAW;
+    setFineLiveMax(toFineAddress(g0), OCC_RAW);
     return;
   }
 
@@ -1254,21 +1303,13 @@ void GridMap::markInflatedPointFine(const Eigen::Vector3i &g0)
       {
         Eigen::Vector3i g(g0(0) + dx, g0(1) + dy, g0(2) + dz);
         if (isFineActive(g))
-        {
-          char &cell = md_.occupancy_buffer_fine_[toFineAddress(g)];
-          if (cell == OCC_FREE)
-            cell = OCC_INFLATE;
-        }
+          setFineLiveIfFree(toFineAddress(g), OCC_INFLATE);
         else
           markCoarseFromFineG(g, OCC_INFLATE);
       }
 
   if (isFineActive(g0))
-  {
-    char &cell = md_.occupancy_buffer_fine_[toFineAddress(g0)];
-    if (cell < OCC_RAW)
-      cell = OCC_RAW;
-  }
+    setFineLiveMax(toFineAddress(g0), OCC_RAW);
   else
     markCoarseFromFineG(g0, OCC_RAW);
 }
@@ -1382,7 +1423,14 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     return;
   }
 
-  if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2)))
+  /* 本帧基准位姿快照：多层级下 camera_pos_ 归 cloud worker 独占（fine 窗口中心、
+     clear 射线起点都以它为基准），executor 侧只能读 odom 回调发布的最新位姿 */
+  Eigen::Vector3d cam_pos;
+  {
+    lock_guard<mutex> lk(cam_mtx_);
+    cam_pos = mp_.multilevel_ ? md_.odom_pos_ : md_.camera_pos_;
+  }
+  if (isnan(cam_pos(0)) || isnan(cam_pos(1)) || isnan(cam_pos(2)))
   {
     RCLCPP_WARN(node_->get_logger(), "相机位置数据无效");
     return;
@@ -1441,9 +1489,9 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
          camera_pos_ 是机体中心，雷达有安装偏置（下视雷达在机体下方），两者不一致会让
          清除射线起点、self_filter 半径、fine 窗口中心都错位。这里把 camera_pos_ 覆盖为
          TF 得到的雷达原点（world 系），与本次点云严格同时刻、同原点 */
-      md_.camera_pos_ = Eigen::Vector3d(transform.transform.translation.x,
-                                        transform.transform.translation.y,
-                                        transform.transform.translation.z);
+      cam_pos = Eigen::Vector3d(transform.transform.translation.x,
+                                transform.transform.translation.y,
+                                transform.transform.translation.z);
       
       // 预分配内存避免重复分配
       world_cloud.points.resize(latest_cloud.points.size());
@@ -1465,6 +1513,38 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     }
   }
   
+  /* ==== 执行器侧到此为止 ====
+     点云已解析、已过滤、已换到 world 系，本帧基准位姿也已定。剩下的重活（fine 窗口滚动
+     + clear/mark + 虚拟天花板 + 安全区 + 视图同步）全部交给 cloud worker，本回调一返回，
+     同一执行器线程上的 50Hz odom 立刻可以跑 */
+  CloudFrame frame;
+  frame.cloud = std::move(latest_cloud);
+  frame.cam_pos = cam_pos;
+
+  if (!cloud_worker_run_)
+  {
+    // depth 模式没有双缓冲可言（占据缓冲被规划器无锁直读），保持原来的串行路径
+    processCloudFrame(frame);
+    return;
+  }
+
+  {
+    lock_guard<mutex> lk(cloud_mtx_);
+    cloud_pending_ = std::move(frame);  // 只保留最新帧：worker 尚未取走的旧观测直接顶掉
+    cloud_has_pending_ = true;
+  }
+  cloud_cv_.notify_one();
+}
+
+/* cloud worker 线程入口：live 缓冲（fine + coarse）的唯一写者。
+   多层级下 camera_pos_ 由本函数独占（odom 回调只写 odom_pos_），因此下面这段沿用
+   原来的 md_.camera_pos_ 写法即可，逐格写入统一经 setFineLive* 记录本帧 diff */
+void GridMap::processCloudFrame(const CloudFrame &frame)
+{
+  lock_guard<mutex> live_lk(live_write_mtx_);
+  pcl::PointCloud<pcl::PointXYZ> latest_cloud = frame.cloud;
+  md_.camera_pos_ = frame.cam_pos;
+
   // 小范围减：复用 RayCaster 做射线雕刻清除。
   // 对本帧每个回波点，从相机向命中点打射线，只清除落在 clear 盒内的沿途栅格，
   // 即「本帧回波确认是自由空间的地方」才清空；射线打不到、无回波确认的区域保留历史记忆。
@@ -1571,7 +1651,6 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
        DDA 每步只沿一根轴推进 ±1，槽位可以用"加减 1 + 条件环绕"增量维护；
        又因窗口边长 = local_update_range + 余量 > 2×clear_range，clear 盒正常整体落在窗口内，
        于是 isFineActive 也能整帧判一次，逐格不再查 */
-    char *fine_buf = mp_.multilevel_ ? md_.occupancy_buffer_fine_.data() : nullptr;
     const int fn0 = md_.fine_n_(0), fn1 = md_.fine_n_(1), fn2 = md_.fine_n_(2);
     bool clear_in_window = false;
     if (mp_.multilevel_)
@@ -1662,7 +1741,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
                 continue;
               addr = toFineAddress(id);
             }
-            fine_buf[addr] = 0;
+            setFineLive(addr, 0);
           }
         }
         else
@@ -1828,7 +1907,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
         for (int x = x0; x <= x1; ++x)
           for (int y = y0; y <= y1; ++y)
             for (int z = z0; z <= z1; ++z)
-              md_.occupancy_buffer_fine_[toFineAddress(Eigen::Vector3i(x, y, z))] = OCC_RAW;
+              setFineLiveG(Eigen::Vector3i(x, y, z), OCC_RAW);
       }
 
       // coarse：只铺本帧包围盒覆盖的粗格一层（远场无规划，兜底查询够用）
@@ -1855,7 +1934,134 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   md_.fine_window_dirty_ = false;  // 本帧的天花板重铺需求已消费
   clearOriginSafeZone();
 
+  /* 帧末把本帧变更发布给读侧（三段式：收缩边界 → 回放 diff 或全量拷贝 → 发布新边界）。
+     必须在释放 live 写锁之前完成：读侧要么看到上一致帧，要么看到本一致帧，不会看到半帧 */
+  if (mp_.multilevel_)
+    syncFineView();
+
   is_map_updating_ = false;
+}
+
+/* ==================== cloud worker 线程与 fine 视图发布 ==================== */
+
+void GridMap::startCloudWorker()
+{
+  if (cloud_worker_.joinable())
+    return;
+
+  cloud_worker_run_ = true;
+  cloud_worker_ = thread(&GridMap::cloudWorkerLoop, this);
+  RCLCPP_INFO(node_->get_logger(),
+              "[grid_map] cloud worker 已启动：建图整帧移出执行器，帧末同步读视图（逐帧回放 diff + 每 %d 帧巡检一整轮）",
+              kFineFullSyncEvery);
+}
+
+void GridMap::stopCloudWorker()
+{
+  if (!cloud_worker_.joinable())
+  {
+    cloud_worker_run_ = false;
+    return;
+  }
+
+  /* 改标志与 cv 等待方的谓词读取互斥，否则可能在"判定为可睡"与"进入等待"之间丢唤醒 */
+  {
+    lock_guard<mutex> lk(cloud_mtx_);
+    cloud_worker_run_ = false;
+  }
+  cloud_cv_.notify_all();
+  cloud_worker_.join();
+}
+
+void GridMap::cloudWorkerLoop()
+{
+  while (true)
+  {
+    CloudFrame frame;
+    {
+      unique_lock<mutex> lk(cloud_mtx_);
+      cloud_cv_.wait(lk, [this] { return !cloud_worker_run_.load() || cloud_has_pending_; });
+      if (!cloud_worker_run_.load())
+        return;
+      frame = std::move(cloud_pending_);
+      cloud_has_pending_ = false;
+    }
+    processCloudFrame(frame);
+  }
+}
+
+/* 帧末把 live 缓冲的一致性状态发布给读侧，三段式：
+   ① 边界收缩为「旧视图 ∩ 新窗口」；② 搬运内容；③ 边界展开到新窗口并配套发布包围盒与基准位姿。
+
+   为什么必须先收缩（①）：fine 是环形缓冲，窗口平移会让被回收的槽位换主人——同一个槽位地址
+   突然代表另一个全局位置。收缩后的区间里每个全局索引在新旧窗口下槽位一致，搬运才安全；
+   区间外的槽位在②期间根本读不到，③展开时内容已经就位。
+   为什么②期间不能把视图整个关掉：那样读侧会全部退回 coarse，而近处刚打到的障碍往往还没写穿
+   到 coarse，规划器会瞬间看不到眼前的墙。②期间的读结果最多是"本帧部分格子晚一点生效"，
+   与读侧本来就落后一帧同量级，且绝不涉及错位的槽位。
+   为什么整帧的修改要憋到帧末：一帧内是"先 clear 后 mark"，读者插进这两步之间会在真实障碍处
+   读到幻影自由空间——那才是致命的，所以 live 的全部改动只在②这一小段以整格粒度外露。
+
+   同步节奏：逐帧只回放 fine_diff_（代价随场景变化量走），并顺带按槽位巡检 1/kFineFullSyncEvery
+   的连续区间，于是"整窗全量同步一轮"仍每 20 帧完成一次，但不会出现单帧 140MB 的拷贝尖峰。
+   整窗 memcpy 只留给窗口重建（teleport / reset）与 diff 记录溢出这两种 diff 本身就不可用的情况。 */
+void GridMap::syncFineView()
+{
+  const Eigen::Vector3i lo_new = md_.fine_min_gidx_;
+  const Eigen::Vector3i hi_new = md_.fine_min_gidx_ + md_.fine_n_;
+  const size_t ncell = (size_t)md_.fine_n_(0) * (size_t)md_.fine_n_(1) * (size_t)md_.fine_n_(2);
+  if (fine_view_.size() < ncell)
+    return;
+
+  /* ① 收缩：奇数期间读者自旋，偶数发布收缩后的边界 */
+  view_seq_.fetch_add(1, std::memory_order_relaxed);
+  Eigen::Vector3i lo = view_meta_.lo.cwiseMax(lo_new);
+  Eigen::Vector3i hi = view_meta_.hi.cwiseMin(hi_new);
+  for (int i = 0; i < 3; ++i)
+    if (hi(i) < lo(i))
+      hi(i) = lo(i);
+  view_meta_.lo = lo;
+  view_meta_.hi = hi;
+  view_seq_.fetch_add(1, std::memory_order_release);
+
+  /* ② 搬运 */
+  char *dst = fine_view_.data();
+  const char *src = md_.occupancy_buffer_fine_.data();
+  if (fine_full_dirty_)
+  {
+    /* diff 不可用（窗口重建 / 记录溢出）：整窗拷贝，并把巡检游标归零重新起算 */
+    memcpy(dst, src, ncell);
+    sweep_pos_ = 0;
+  }
+  else
+  {
+    /* 正常路径：按写入顺序回放本帧翻转过的格子 */
+    for (size_t i = 0; i < fine_diff_.size(); ++i)
+    {
+      const uint64_t e = fine_diff_[i];
+      dst[e >> 2] = char(e & 3);
+    }
+    /* 再巡检一整块连续槽位（= 窗口的 1/kFineFullSyncEvery）。它拷贝的是 live 的当前内容，
+       与刚回放过的格子重复也无害；覆盖到的正是 diff 万一漏记的那些老格子 */
+    if (sweep_chunk_ > 0 && sweep_pos_ < ncell)
+    {
+      size_t end = min(ncell, sweep_pos_ + sweep_chunk_);
+      memcpy(dst + sweep_pos_, src + sweep_pos_, end - sweep_pos_);
+      sweep_pos_ = (end >= ncell) ? 0 : end;
+    }
+  }
+
+  /* ③ 展开：release 递增保证上面的内容与边界、包围盒、基准位姿一起被读者看到 */
+  view_seq_.fetch_add(1, std::memory_order_relaxed);
+  view_meta_.lo = lo_new;
+  view_meta_.hi = hi_new;
+  view_meta_.bmin = md_.local_bound_min_;
+  view_meta_.bmax = md_.local_bound_max_;
+  view_meta_.cam = md_.camera_pos_;
+  view_seq_.fetch_add(1, std::memory_order_release);
+
+  fine_diff_.clear();
+  fine_full_dirty_ = false;
 }
 
 void GridMap::publishMap()
@@ -1919,15 +2125,23 @@ void GridMap::publishMapInflate(bool all_info){
   pcl::PointXYZ pt;
   pcl::PointCloud<pcl::PointXYZ> cloud;
 
+  /* 多层级下本回调在 executor 线程，只能碰"已发布的一致视图"：窗口边界、本帧包围盒、
+     基准位姿由 seqlock 配套发布；读失败说明 worker 正在切换，本帧直接跳过发布 */
+  FineViewMeta vmeta;
+  const bool view_ok = readViewMeta(vmeta);
+  if (mp_.multilevel_ && !view_ok)
+    return;
+
   // 显示窗口 = 本帧点云包围盒(local_bound) 与 camera±local_update_range 滚动窗口的并集。
   // 只用包围盒时，贴墙等点云收缩场景会把未删除的历史记忆格"隐藏"在话题之外；
   // 并入滚动窗口后，RViz 显示范围与地图记忆/更新范围一致，纯显示层改动。
-  Eigen::Vector3i min_cut = md_.local_bound_min_;
-  Eigen::Vector3i max_cut = md_.local_bound_max_;
+  Eigen::Vector3i min_cut = mp_.multilevel_ ? vmeta.bmin : md_.local_bound_min_;
+  Eigen::Vector3i max_cut = mp_.multilevel_ ? vmeta.bmax : md_.local_bound_max_;
 
+  const Eigen::Vector3d ref_cam = mp_.multilevel_ ? vmeta.cam : md_.camera_pos_;
   Eigen::Vector3i win_min, win_max;
-  posToIndex(md_.camera_pos_ - mp_.local_update_range_, win_min);
-  posToIndex(md_.camera_pos_ + mp_.local_update_range_, win_max);
+  posToIndex(ref_cam - mp_.local_update_range_, win_min);
+  posToIndex(ref_cam + mp_.local_update_range_, win_max);
   min_cut = min_cut.cwiseMin(win_min);
   max_cut = max_cut.cwiseMax(win_max);
 
@@ -1948,9 +2162,9 @@ void GridMap::publishMapInflate(bool all_info){
 
   if (mp_.multilevel_)
   {
-    // fine：显示窗口(min_cut/max_cut 已是 fine 全局索引)与滚动窗口求交后扫描
-    Eigen::Vector3i gmin = md_.fine_min_gidx_;
-    Eigen::Vector3i gmax = md_.fine_min_gidx_ + md_.fine_n_ - Eigen::Vector3i::Ones();
+    // fine：显示窗口(min_cut/max_cut 已是 fine 全局索引)与已发布视图窗口求交后扫描
+    Eigen::Vector3i gmin = vmeta.lo;
+    Eigen::Vector3i gmax = vmeta.hi - Eigen::Vector3i::Ones();
     Eigen::Vector3i smin = min_cut.cwiseMax(gmin);
     Eigen::Vector3i smax = max_cut.cwiseMin(gmax);
     for (int x = smin(0); x <= smax(0); ++x)
@@ -1958,7 +2172,8 @@ void GridMap::publishMapInflate(bool all_info){
         for (int z = smin(2); z <= smax(2); ++z)
         {
           Eigen::Vector3i g(x, y, z);
-          if (md_.occupancy_buffer_fine_[toFineAddress(g)] == 0)
+          char vcell;
+          if (!readFineViewCell(g, vcell) || vcell == 0)
             continue;
 
           Eigen::Vector3d pos;
@@ -1972,8 +2187,10 @@ void GridMap::publishMapInflate(bool all_info){
           cloud.push_back(pt);
         }
 
-    // coarse：直接发布增量脏点缓存（持久记忆区，滚出窗口的历史占据）
-    for (size_t i = 0; i < md_.coarse_dirty_pts_.size(); ++i)
+    // coarse：直接发布增量脏点缓存（持久记忆区，滚出窗口的历史占据）。
+    // 只遍历到 worker 发布的计数：容量已预留、无搬迁，计数之前的元素必然已写完
+    const size_t ndirty = coarse_dirty_cnt_.load(std::memory_order_acquire);
+    for (size_t i = 0; i < ndirty; ++i)
     {
       const Eigen::Vector3d &p = md_.coarse_dirty_pts_[i];
       if (p(2) > mp_.visualization_truncate_height_)
