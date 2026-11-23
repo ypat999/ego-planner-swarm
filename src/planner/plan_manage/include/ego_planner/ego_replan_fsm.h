@@ -3,8 +3,10 @@
 
 #include <Eigen/Eigen>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <iostream>
+#include <thread>
 #include "nav_msgs/msg/path.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "sensor_msgs/msg/imu.hpp"
@@ -74,8 +76,13 @@ namespace ego_planner
     bool goal_switch_in_progress_; // 标记目标点切换是否正在进行
     FSM_EXEC_STATE exec_state_;
     int continously_called_times_{0};
-    // safety 心跳分频计数：safety_timer_(50ms) 上每 20 拍发一次 1Hz HEARTBEAT
-    int hb_tick_{0};
+    // safety 心跳独立线程：executor 线程会被 execFSMCallback 里的同步 plan()
+    // （首条轨迹生成 / REPLAN_FAILED 重规划风暴）占住 >2.5s，心跳若挂在
+    // 50ms safety_timer_ 上会被饿死，safety 侧误判 PLANNER_LOST → DEGRADED。
+    // 实机 20261120-001 11:42:42 起飞 2.7s 后 PLANNER_LOST 即此。
+    std::thread hb_thread_;
+    std::atomic<bool> hb_stop_{false};
+    void heartbeatLoop();
     // 本轮连续规划失败的墙上时钟起点（逃逸时间帽用：单次状态调用可能烧多次 A* 超时，
     // 仅按次数判定会让尾窗拖到 5~6s，加 3s 时间帽封顶）
     std::chrono::steady_clock::time_point fail_streak_start_{};
@@ -169,6 +176,9 @@ namespace ego_planner
     }
     ~EGOReplanFSM()
     {
+      hb_stop_ = true;
+      if (hb_thread_.joinable())
+        hb_thread_.join();
     }
 
     void init(rclcpp::Node::SharedPtr &node);

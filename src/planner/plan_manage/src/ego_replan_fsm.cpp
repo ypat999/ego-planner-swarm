@@ -169,6 +169,10 @@ namespace ego_planner
     // 失效降级互通：/mission_event（String+JSON，复用方案 §14 字段）
     mission_event_pub_ = node_->create_publisher<std_msgs::msg::String>("/mission_event", 10);
 
+    // 1Hz HEARTBEAT 独立线程：不经 executor，plan() 阻塞不影响心跳（须在 pub 创建后启动）
+    hb_stop_ = false;
+    hb_thread_ = std::thread(&EGOReplanFSM::heartbeatLoop, this);
+
     // 停止规划接口：收到后回到WAIT_TARGET，等待下次goal触发
     stop_planning_sub_ = node_->create_subscription<std_msgs::msg::Empty>(
         "/stop_planning",
@@ -1549,17 +1553,23 @@ namespace ego_planner
     return true;
   }
 
-  void EGOReplanFSM::checkCollisionCallback()
+  void EGOReplanFSM::heartbeatLoop()
   {
-    // 失效降级互通：在既有 50ms 安全节拍上 20 分频发 1Hz HEARTBEAT（不新增 timer）。
-    // safety 侧 2.5s 收不到即判 PLANNER_ALIVE=0 → HOVER（§16.3-C / P5）。
-    if (++hb_tick_ >= 20)
+    // 1Hz HEARTBEAT 独立线程：safety 侧 2.5s 收不到即判 PLANNER_ALIVE=0 →
+    // DEGRADED/HOVER（§16.3-C / P5）。rclcpp Publisher::publish 线程安全；
+    // 本循环只发固定 JSON，不触碰 FSM 状态与规划数据，无锁需求。
+    while (!hb_stop_ && rclcpp::ok())
     {
-      hb_tick_ = 0;
       publishMissionEvent("HEARTBEAT",
                           "\"goal_seq\":\"NA\",\"flight_epoch\":\"NA\"");
+      // 100ms 分片睡眠：停机时 join 快速返回
+      for (int i = 0; i < 10 && !hb_stop_; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+  }
 
+  void EGOReplanFSM::checkCollisionCallback()
+  {
     LocalTrajData *info = &planner_manager_->local_data_;
     auto map = planner_manager_->grid_map_;
     
