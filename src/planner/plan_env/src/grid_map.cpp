@@ -157,16 +157,22 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   if (mp_.multilevel_)
   {
     int ratio = (int)lround(coarse_res / mp_.fine_resolution_);
-    if (ratio < 2 || fabs(coarse_res - ratio * mp_.fine_resolution_) > 1e-4 * mp_.fine_resolution_)
+    /* coarse 格必须是 fine 格的整数倍（整粗格提交要能整除到子格），最少 2 倍否则 coarse 无意义 */
+    if (ratio < 2)
     {
       RCLCPP_WARN(node_->get_logger(),
-                  "[grid_map] coarse_resolution %.3f 不是 fine %.3f 的整数倍, 强制 ratio=4 (%.3f)",
-                  coarse_res, mp_.fine_resolution_, 4 * mp_.fine_resolution_);
-      ratio = 4;
-      coarse_res = ratio * mp_.fine_resolution_;
+                  "[grid_map] coarse_resolution %.3f 不足 fine %.3f 的 2 倍，强制为 %.3f",
+                  coarse_res, mp_.fine_resolution_, 2 * mp_.fine_resolution_);
+      ratio = 2;
+    }
+    else if (fabs(coarse_res - ratio * mp_.fine_resolution_) > 1e-4 * mp_.fine_resolution_)
+    {
+      RCLCPP_WARN(node_->get_logger(),
+                  "[grid_map] coarse_resolution %.3f 不是 fine %.3f 的整数倍，取整为 %d 倍 (%.3f)",
+                  coarse_res, mp_.fine_resolution_, ratio, ratio * mp_.fine_resolution_);
     }
     mp_.coarse_ratio_ = ratio;
-    mp_.coarse_resolution_ = coarse_res;
+    mp_.coarse_resolution_ = ratio * mp_.fine_resolution_;
   }
   else
   {
@@ -235,12 +241,17 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
     mp_.fine_resolution_ = mp_.resolution_;
     mp_.fine_resolution_inv_ = mp_.resolution_inv_;
 
-    // 窗口半宽 = local_update_range + 最大膨胀 + 1 个 coarse 格（重叠带，保证无缝切换）
+    // 窗口半宽 = local_update_range + 最大膨胀 + 2 个 coarse 格：
+    // 一个 coarse 格吸收「窗口起点吸附到 coarse 对齐」造成的偏移，另一个留给膨胀盒量化余量
     double infl_max = max(mp_.obstacles_inflation_, mp_.obstacles_inflation_z_);
+    const int cr = mp_.coarse_ratio_;
     for (int i = 0; i < 3; ++i)
     {
-      double win_half = mp_.local_update_range_(i) + infl_max + mp_.coarse_resolution_;
-      md_.fine_n_(i) = (int)ceil(2.0 * win_half * mp_.fine_resolution_inv_) + 1;
+      double win_half = mp_.local_update_range_(i) + infl_max + 2.0 * mp_.coarse_resolution_;
+      int n = (int)ceil(2.0 * win_half * mp_.fine_resolution_inv_);
+      // 窗口边长必须是 ratio 的整数倍：任何 coarse 格要么整格在窗口内、要么整格在窗口外，
+      // 滚出时才能一次读到它的全部子格并精确提交（这是 1 字节/粗格又能增减都更新的前提）
+      md_.fine_n_(i) = ((n + cr - 1) / cr) * cr;
     }
     size_t fine_size = (size_t)md_.fine_n_(0) * (size_t)md_.fine_n_(1) * (size_t)md_.fine_n_(2);
     md_.occupancy_buffer_fine_ = vector<char>(fine_size, 0);
@@ -467,26 +478,8 @@ void GridMap::clearOriginSafeZone()
           }
         }
 
-    // coarse：清安全区覆盖的粗格；有变更才重建可视化脏点缓存（罕见事件，可接受全扫）
-    int cr = mp_.coarse_ratio_;
-    bool coarse_changed = false;
-    int cx1 = min(max_id(0) / cr, md_.coarse_voxel_num_(0) - 1);
-    int cy1 = min(max_id(1) / cr, md_.coarse_voxel_num_(1) - 1);
-    int cz1 = min(max_id(2) / cr, md_.coarse_voxel_num_(2) - 1);
-    for (int cx = min_id(0) / cr; cx <= cx1; ++cx)
-      for (int cy = min_id(1) / cr; cy <= cy1; ++cy)
-        for (int cz = min_id(2) / cr; cz <= cz1; ++cz)
-        {
-          size_t addr = toCoarseAddress(Eigen::Vector3i(cx, cy, cz));
-          if (md_.occupancy_buffer_coarse_[addr])
-          {
-            md_.occupancy_buffer_coarse_[addr] = 0;
-            coarse_changed = true;
-            cleared_count++;
-          }
-        }
-    if (coarse_changed)
-      rebuildCoarseDirty();
+    // coarse：不直写。安全区清的是 fine 格，这些格子滚出窗口时会以自由态提交到 coarse 位图，
+    // 从而同步清除；coarse 始终保持「只由 fine 更新」这一条唯一通路
   }
   else
   {
@@ -1118,60 +1111,46 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
 
 /* ---------------- 多层级地图（cloud 模式） ---------------- */
 
-void GridMap::rebuildCoarseDirty()
-{
-  // coarse 全图扫一遍重建可视化脏点缓存（仅在初始化和安全区清除后调用）
-  // 先封计数再清空：vis 读到 0 就不再遍历，重建期间它只会发空 coarse 层
-  coarse_dirty_cnt_.store(0, std::memory_order_release);
-  md_.coarse_dirty_pts_.clear();
-  size_t cn2 = (size_t)md_.coarse_voxel_num_(2);
-  for (int x = 0; x < md_.coarse_voxel_num_(0); ++x)
-    for (int y = 0; y < md_.coarse_voxel_num_(1); ++y)
-    {
-      size_t base = ((size_t)x * (size_t)md_.coarse_voxel_num_(1) + (size_t)y) * cn2;
-      for (int z = 0; z < md_.coarse_voxel_num_(2); ++z)
-      {
-        if (!md_.occupancy_buffer_coarse_[base + (size_t)z])
-          continue;
-        if (md_.coarse_dirty_pts_.size() >= kCoarseDirtyCap)
-          return;
-        pushCoarseDirty(mp_.map_origin_ +
-            (Eigen::Vector3d((double)x, (double)y, (double)z) + Eigen::Vector3d(0.5, 0.5, 0.5)) *
-            mp_.coarse_resolution_);
-      }
-    }
-}
-
 void GridMap::resetFineWindow(const Eigen::Vector3d &camera_pos)
 {
-  // 大跳变（起飞/重置）：旧窗口全部写穿进 coarse，再以相机为中心重建并用 coarse 记忆播种
+  // 大跳变（起飞/重置）：旧窗口整粗格提交进 coarse，再以相机为中心重建并用 coarse 记忆播种
   /* 整窗换血：逐格记 diff 既不划算也不可靠，直接标脏让 syncFineView 做一次全量拷贝 */
   fine_full_dirty_ = true;
-  Eigen::Vector3i g = md_.fine_min_gidx_;
-  for (int x0 = 0; x0 < md_.fine_n_(0); ++x0)
-  {
-    g(0) = md_.fine_min_gidx_(0) + x0;
-    for (int y0 = 0; y0 < md_.fine_n_(1); ++y0)
-    {
-      g(1) = md_.fine_min_gidx_(1) + y0;
-      for (int z0 = 0; z0 < md_.fine_n_(2); ++z0)
-      {
-        g(2) = md_.fine_min_gidx_(2) + z0;
-        char v = md_.occupancy_buffer_fine_[toFineAddress(g)];
-        if (v)
-          markCoarseFromFineG(g, v);
-      }
-    }
-  }
 
+  const int r = mp_.coarse_ratio_;
+  const int nc0 = md_.fine_n_(0) / r, nc1 = md_.fine_n_(1) / r, nc2 = md_.fine_n_(2) / r;
+  const int cbase0 = md_.fine_min_gidx_(0) / r;
+  const int cbase1 = md_.fine_min_gidx_(1) / r;
+  const int cbase2 = md_.fine_min_gidx_(2) / r;
+
+  // 1) 旧窗口整粗格提交：窗口按 coarse 对齐，每个粗格的 ratio^3 个子格全在窗内
+  for (int i0 = 0; i0 < nc0; ++i0)
+    for (int i1 = 0; i1 < nc1; ++i1)
+      for (int i2 = 0; i2 < nc2; ++i2)
+      {
+        Eigen::Vector3i c(cbase0 + i0, cbase1 + i1, cbase2 + i2);
+        bool occ = false;
+        for (int u = 0; u < r && !occ; ++u)
+          for (int v = 0; v < r && !occ; ++v)
+            for (int w = 0; w < r && !occ; ++w)
+            {
+              Eigen::Vector3i g(c(0) * r + u, c(1) * r + v, c(2) * r + w);
+              if (md_.occupancy_buffer_fine_[toFineAddress(g)] == OCC_RAW)
+                occ = true;
+            }
+        commitCoarseCell(c, occ);
+      }
+
+  // 2) 重建窗口，并把起点吸附到 coarse 对齐（否则窗口边缘会出现「半截粗格」）
   posToFineIndex(camera_pos, md_.fine_min_gidx_);
   md_.fine_min_gidx_ -= md_.fine_n_ / 2;
-  for (int slot = 0; slot < md_.fine_n_(0); ++slot)
-  {
-    Eigen::Vector3i g_front = md_.fine_min_gidx_;
-    g_front(0) += slot;
-    upsampleCoarseToFinePlane(0, slot, g_front);
-  }
+  for (int i = 0; i < 3; ++i)
+    md_.fine_min_gidx_(i) = (int)floor((double)md_.fine_min_gidx_(i) / r) * r;
+
+  // 3) 用 coarse 记忆逐粗格平面播种整个新窗口
+  for (int i0 = 0; i0 < nc0; ++i0)
+    seedCoarsePlane(0, md_.fine_min_gidx_(0) / r + i0);
+
   md_.fine_window_init_ = true;
   md_.fine_window_dirty_ = true;  // 窗口被重建：本帧需全窗口重铺虚拟天花板
 }
@@ -1181,16 +1160,24 @@ void GridMap::rollFineToCamera(const Eigen::Vector3d &camera_pos)
   Eigen::Vector3i cam_g;
   posToFineIndex(camera_pos, cam_g);
 
+  const int r = mp_.coarse_ratio_;
+
   if (!md_.fine_window_init_)
   {
-    // 首帧：缓冲刚分配全 0，coarse 也为空，直接定心即可
+    // 首帧：缓冲刚分配全 0，coarse 也为空，直接定心（同样吸附到 coarse 对齐）
     md_.fine_min_gidx_ = cam_g - md_.fine_n_ / 2;
+    for (int i = 0; i < 3; ++i)
+      md_.fine_min_gidx_(i) = (int)floor((double)md_.fine_min_gidx_(i) / r) * r;
     md_.fine_window_init_ = true;
     md_.fine_window_dirty_ = true;
     return;
   }
 
+  // 目标窗口起点吸附到 ratio 的整数倍，保证 delta 是整粗格，滚出时能整格提交
   Eigen::Vector3i desired = cam_g - md_.fine_n_ / 2;
+  for (int i = 0; i < 3; ++i)
+    desired(i) = (int)floor((double)desired(i) / r) * r;
+
   bool teleport = false;
   for (int axis = 0; axis < 3; ++axis)
     if (abs(desired(axis) - md_.fine_min_gidx_(axis)) >= md_.fine_n_(axis) / 2)
@@ -1215,35 +1202,54 @@ void GridMap::rollFineToCamera(const Eigen::Vector3d &camera_pos)
 
 void GridMap::rollFineAxis(int axis, int delta)
 {
-  // 环形绝对寻址下窗口平移 = min 逐格推进：每次滚 1 层，
-  // 被挤出的那一层先写穿 coarse，腾出的同槽位再用 coarse 记忆播种新前沿层
-  int n = md_.fine_n_(axis);
-  int a1 = (axis + 1) % 3, a2 = (axis + 2) % 3;
-  bool dir_pos = delta > 0;
-  int steps = dir_pos ? delta : -delta;
+  // 窗口按 coarse 对齐：delta 必为 ratio 的整数倍，一次滚一整个 coarse 平面。
+  // 被挤出的粗格先读它全部 ratio^3 个子格、OR 后写入 coarse（占据/自由都能写），
+  // 腾出的整粗格层再用 coarse 记忆播种新前沿
+  const int r = mp_.coarse_ratio_;
+  const int n = md_.fine_n_(axis);
+  const int a1 = (axis + 1) % 3, a2 = (axis + 2) % 3;
+  const bool dir_pos = delta > 0;
+  const int steps = (dir_pos ? delta : -delta) / r;
+
+  const int nc1 = md_.fine_n_(a1) / r, nc2 = md_.fine_n_(a2) / r;
 
   for (int k = 0; k < steps; ++k)
   {
-    int g_discard = dir_pos ? md_.fine_min_gidx_(axis) : md_.fine_min_gidx_(axis) + n - 1;
-    int slot = fine_slot(g_discard, n);
-
-    for (int v1 = 0; v1 < md_.fine_n_(a1); ++v1)
-      for (int v2 = 0; v2 < md_.fine_n_(a2); ++v2)
+    // 1) 退出的整粗格平面：OR 全部子格后提交
+    const int c_axis = dir_pos ? (md_.fine_min_gidx_(axis) / r)
+                               : ((md_.fine_min_gidx_(axis) + n) / r - 1);
+    const int cbase1 = md_.fine_min_gidx_(a1) / r;
+    const int cbase2 = md_.fine_min_gidx_(a2) / r;
+    for (int i1 = 0; i1 < nc1; ++i1)
+      for (int i2 = 0; i2 < nc2; ++i2)
       {
-        Eigen::Vector3i g = md_.fine_min_gidx_;
-        g(axis) = g_discard;
-        g(a1) += v1;
-        g(a2) += v2;
-        char v = md_.occupancy_buffer_fine_[toFineAddress(g)];
-        if (v)
-          markCoarseFromFineG(g, v);
+        Eigen::Vector3i c;
+        c(axis) = c_axis;
+        c(a1) = cbase1 + i1;
+        c(a2) = cbase2 + i2;
+
+        bool occ = false;
+        for (int u = 0; u < r && !occ; ++u)
+          for (int v = 0; v < r && !occ; ++v)
+            for (int w = 0; w < r && !occ; ++w)
+            {
+              Eigen::Vector3i g;
+              g(axis) = c_axis * r + u;
+              g(a1) = c(a1) * r + v;
+              g(a2) = c(a2) * r + w;
+              if (md_.occupancy_buffer_fine_[toFineAddress(g)] == OCC_RAW)
+                occ = true;
+            }
+        commitCoarseCell(c, occ);
       }
 
-    md_.fine_min_gidx_(axis) += dir_pos ? 1 : -1;
-    Eigen::Vector3i g_front = md_.fine_min_gidx_;
-    if (dir_pos)
-      g_front(axis) += n - 1;
-    upsampleCoarseToFinePlane(axis, slot, g_front);
+    // 2) 平移一整个粗格层
+    md_.fine_min_gidx_(axis) += dir_pos ? r : -r;
+
+    // 3) 新前沿粗格层用 coarse 记忆播种
+    const int c_new = dir_pos ? ((md_.fine_min_gidx_(axis) + n) / r - 1)
+                              : (md_.fine_min_gidx_(axis) / r);
+    seedCoarsePlane(axis, c_new);
   }
 }
 
@@ -1296,7 +1302,17 @@ void GridMap::markInflatedPointFine(const Eigen::Vector3i &g0)
     return;
   }
 
-  // 兜底（窗口贴到地图边界等导致膨胀盒出窗）：逐格判定，出窗写 coarse，绝不让障碍丢失
+  // 兜底：膨胀盒越出 fine 窗口（窗口贴到地图边界等）。出窗的格没有 fine 槽位可写
+  // （环形寻址会回绕写到无关格），而 coarse 禁止被点云直写，故只记录窗口内的部分并告警一次。
+  // 正常配置下窗口边长 = local_update_range + 膨胀 + coarse 余量，此分支不应触发
+  if (!warned_inflate_out_window_)
+  {
+    warned_inflate_out_window_ = true;
+    RCLCPP_WARN(node_->get_logger(),
+                "[grid_map] 膨胀盒越出 fine 窗口 (center=%d,%d,%d)，越界部分未记录；"
+                "请检查 local_update_range 与 obstacles_inflation 配置",
+                g0(0), g0(1), g0(2));
+  }
   for (int dx = -st; dx <= st; ++dx)
     for (int dy = -st; dy <= st; ++dy)
       for (int dz = -stz; dz <= stz; ++dz)
@@ -1304,23 +1320,10 @@ void GridMap::markInflatedPointFine(const Eigen::Vector3i &g0)
         Eigen::Vector3i g(g0(0) + dx, g0(1) + dy, g0(2) + dz);
         if (isFineActive(g))
           setFineLiveIfFree(toFineAddress(g), OCC_INFLATE);
-        else
-          markCoarseFromFineG(g, OCC_INFLATE);
       }
 
   if (isFineActive(g0))
     setFineLiveMax(toFineAddress(g0), OCC_RAW);
-  else
-    markCoarseFromFineG(g0, OCC_RAW);
-}
-
-void GridMap::markInflatedPointCoarse(const Eigen::Vector3d &p3d)
-{
-  if (!isInMap(p3d))
-    return;
-  Eigen::Vector3i c;
-  posToCoarseIndex(p3d, c);
-  setCoarseCell(c, OCC_RAW);  // 体素内有点云即占据，coarse 层不膨胀
 }
 
 void GridMap::beginEscapeWindow(const Eigen::Vector3d &center, double half_size)
@@ -1850,11 +1853,9 @@ void GridMap::processCloudFrame(const CloudFrame &frame)
             }
       }
     }
-    else if (mp_.multilevel_)
-    {
-      // local_update_range 外的点：直接命中 coarse 格（体素内有点即占据，不膨胀）
-      markInflatedPointCoarse(p3d);
-    }
+    // 多层级下 local_update_range 外的点不标记：coarse 只允许由 fine 滚出更新，
+    // 而窗口外的点没有对应的 fine 槽位（环形寻址会回绕写坏别处）。
+    // 这些点仍参与上面的射线雕刻（clear 盒内的自由空间照常清理），只是不产生持久占据记忆
   }
 
   // 按槽位地址升序执行膨胀标记（见上面 mark_order 的说明）
@@ -1892,8 +1893,8 @@ void GridMap::processCloudFrame(const CloudFrame &frame)
     // RCLCPP_INFO(node_->get_logger(), "添加虚拟天花板: 高度=%.2f, 栅格ID=%d", mp_.virtual_ceil_height_, ceil_id);
     if (mp_.multilevel_)
     {
-      // fine：窗口滚入新层时由 coarse 播种，天花板不在 coarse 里，需在窗口首铺/滚动/重建的那帧
-      // 铺满整个窗口带；静止帧带内已有值且射线雕刻不擦带，铺一次即长期有效（按需铺）
+      // fine：天花板按需铺满整个窗口带。首帧窗口时 coarse 位图里还没有天花板，
+      // 之后滚入的新层会由 coarse 位图播种；细格重铺一遍幂等，代价只在窗口滚动的帧
       if (md_.fine_window_dirty_)
       {
         Eigen::Vector3i gmin = md_.fine_min_gidx_;
@@ -1910,17 +1911,8 @@ void GridMap::processCloudFrame(const CloudFrame &frame)
               setFineLiveG(Eigen::Vector3i(x, y, z), OCC_RAW);
       }
 
-      // coarse：只铺本帧包围盒覆盖的粗格一层（远场无规划，兜底查询够用）
-      int cr = mp_.coarse_ratio_;
-      int cceil = min(md_.coarse_voxel_num_(2) - 1,
-                      (int)floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.coarse_resolution_inv_) - 1);
-      if (cceil >= 0)
-        for (int cx = md_.local_bound_min_(0) / cr; cx <= md_.local_bound_max_(0) / cr; ++cx)
-          for (int cy = md_.local_bound_min_(1) / cr; cy <= md_.local_bound_max_(1) / cr; ++cy)
-          {
-            Eigen::Vector3i c(cx, cy, cceil);
-            setCoarseCell(c, OCC_RAW); // 界外由 setCoarseCell 自行丢弃（coarse 不覆盖范围外）
-          }
+      // coarse：不直接铺。天花板是 fine 层的 OCC_RAW，窗口滚动时会经 commitCoarseCell
+      // 自然沉淀进 coarse 位图，无需另开直写通道
     }
     else
     {
@@ -2188,12 +2180,17 @@ void GridMap::publishMapInflate(bool all_info){
         }
 
     // coarse：直接发布增量脏点缓存（持久记忆区，滚出窗口的历史占据）。
-    // 只遍历到 worker 发布的计数：容量已预留、无搬迁，计数之前的元素必然已写完
+    // 只遍历到 worker 发布的计数：容量已预留、无搬迁，计数之前的元素必然已写完。
+    // 位图可为 0（该粗格又被证明为空），脏点列表只增不减，故发布时按当前位图过滤
     const size_t ndirty = coarse_dirty_cnt_.load(std::memory_order_acquire);
     for (size_t i = 0; i < ndirty; ++i)
     {
       const Eigen::Vector3d &p = md_.coarse_dirty_pts_[i];
       if (p(2) > mp_.visualization_truncate_height_)
+        continue;
+      Eigen::Vector3i c;
+      posToCoarseIndex(p, c);
+      if (readCoarseCell(c) == 0)
         continue;
       pt.x = p(0);
       pt.y = p(1);
