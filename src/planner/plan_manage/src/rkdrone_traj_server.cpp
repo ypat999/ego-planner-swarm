@@ -94,12 +94,6 @@ double szd_damping_gain_ = 0.0;
 // world 下会漂移 0.2~0.7m，用该余量区分"定位抖动"与"任务真的改为飞往别处"。
 constexpr double SZD_EXIT_MARGIN = 1.0;
 
-// 飞行高度包线（CODE-13）：光流/测距有效上限 5m，超过后 EKF 水平辅助失效。
-// 4.5m 起告警，>5m 拒绝继续爬升（保留 xy 指令，仍可在当前高度执行/下降）。
-bool altitude_enforce_ = true;
-double altitude_warn_m_ = 4.5;
-double altitude_max_m_ = 5.0;
-
 // Safe zone descent state
 bool szd_active_ = false;
 enum SZDPhase { SZD_NONE, SZD_HORIZONTAL, SZD_VERTICAL, SZD_DONE };
@@ -376,29 +370,6 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
       RCLCPP_ERROR(rclcpp::get_logger("traj_server"), "TF变换失败: %s (从 '%s' 到 '%s')", 
                   ex.what(), msg->header.frame_id.c_str(), target_frame.c_str());
       return;
-    }
-  }
-
-  // ---- 高度包线（CODE-13）----
-  // 光流/测距的有效上限是 5m（SENS_FLOW_MAXHGT / 传感器自报），超过后
-  // EKF 水平辅助会失效（1125 事故）。4.5m 告警；>5m 钳制目标高度，
-  // 保留 xy 指令，仍允许在当前高度继续任务或下降。
-  if (altitude_enforce_)
-  {
-    static rclcpp::Clock alt_clock(RCL_STEADY_TIME);
-    const double z_cmd = transformed_msg.pose.position.z;
-    if (z_cmd > altitude_max_m_)
-    {
-      RCLCPP_WARN_THROTTLE(rclcpp::get_logger("traj_server"), alt_clock, 2000,
-                           "目标高度 %.2fm 超过包线上限 %.2fm，已钳制（光流有效上限）",
-                           z_cmd, altitude_max_m_);
-      transformed_msg.pose.position.z = altitude_max_m_;
-    }
-    else if (z_cmd > altitude_warn_m_)
-    {
-      RCLCPP_WARN_THROTTLE(rclcpp::get_logger("traj_server"), alt_clock, 2000,
-                           "目标高度 %.2fm 接近包线上限 %.2fm",
-                           z_cmd, altitude_max_m_);
     }
   }
 
@@ -1072,14 +1043,6 @@ int main(int argc, char **argv)
   // Get target frame parameter
   node->declare_parameter("traj_server/frame_id", "world");
   node->get_parameter("traj_server/frame_id", target_frame_);
-
-  // 飞行高度包线（CODE-13）
-  node->declare_parameter("traj_server/altitude_enforce", true);
-  node->get_parameter("traj_server/altitude_enforce", altitude_enforce_);
-  node->declare_parameter("traj_server/altitude_warn_m", 4.5);
-  node->get_parameter("traj_server/altitude_warn_m", altitude_warn_m_);
-  node->declare_parameter("traj_server/altitude_max_m", 5.0);
-  node->get_parameter("traj_server/altitude_max_m", altitude_max_m_);
 
   // Safe zone descent parameters
   node->declare_parameter("safe_zone_descent/enabled", false);
